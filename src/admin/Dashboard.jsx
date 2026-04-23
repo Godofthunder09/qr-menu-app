@@ -27,6 +27,7 @@ export default function Dashboard() {
   const [newOrderTables, setNewOrderTables] = useState(new Set())
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [loading, setLoading] = useState(true)
+  const [clearing, setClearing] = useState(false)
   const prevOrderIds = useRef(new Set())
   const navigate = useNavigate()
 
@@ -59,29 +60,15 @@ export default function Dashboard() {
   useEffect(() => {
     fetchAll()
 
-    // Poll every 5 seconds as backup
     const pollInterval = setInterval(() => {
       fetchAll()
     }, 5000)
 
-    // Realtime subscription
     const subscription = supabase
       .channel('dashboard-changes')
-      .on('postgres_changes', {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'orders'
-      }, () => fetchAll())
-      .on('postgres_changes', {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'order_items'
-      }, () => fetchAll())
-      .on('postgres_changes', {
-        event: 'DELETE',
-        schema: 'public',
-        table: 'orders'
-      }, () => fetchAll())
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'orders' }, () => fetchAll())
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'order_items' }, () => fetchAll())
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'orders' }, () => fetchAll())
       .subscribe()
 
     return () => {
@@ -102,18 +89,65 @@ export default function Dashboard() {
 
   const clearTable = async (tableId) => {
     if (!window.confirm('Clear all orders for this table?')) return
-    const tableOrders = orders.filter(o => o.table_id === tableId)
-    for (const order of tableOrders) {
-      await supabase.from('order_items').delete().eq('order_id', order.id)
-      await supabase.from('orders').delete().eq('id', order.id)
+    setClearing(true)
+
+    try {
+      // Step 1 — Get all order IDs for this table
+      const { data: tableOrdersData, error: fetchError } = await supabase
+        .from('orders')
+        .select('id')
+        .eq('table_id', tableId)
+
+      if (fetchError) {
+        alert('Error fetching orders: ' + fetchError.message)
+        setClearing(false)
+        return
+      }
+
+      if (!tableOrdersData || tableOrdersData.length === 0) {
+        alert('No orders found for this table!')
+        setClearing(false)
+        return
+      }
+
+      const orderIds = tableOrdersData.map(o => o.id)
+
+      // Step 2 — Delete order_items first (foreign key constraint)
+      const { error: itemsError } = await supabase
+        .from('order_items')
+        .delete()
+        .in('order_id', orderIds)
+
+      if (itemsError) {
+        alert('Error deleting items: ' + itemsError.message)
+        setClearing(false)
+        return
+      }
+
+      // Step 3 — Delete orders
+      const { error: ordersError } = await supabase
+        .from('orders')
+        .delete()
+        .eq('table_id', tableId)
+
+      if (ordersError) {
+        alert('Error deleting orders: ' + ordersError.message)
+        setClearing(false)
+        return
+      }
+
+      // Step 4 — Clear localStorage so customer can order again
+      localStorage.removeItem(`table_owner_${tableId}`)
+      localStorage.removeItem(`orders_${tableId}`)
+
+      if (selectedTable?.id === tableId) setSelectedTable(null)
+      setClearing(false)
+      fetchAll()
+
+    } catch (err) {
+      alert('Unexpected error: ' + err.message)
+      setClearing(false)
     }
-
-    // Clear localStorage for this table so customer can order again
-    localStorage.removeItem(`table_owner_${tableId}`)
-    localStorage.removeItem(`orders_${tableId}`)
-
-    if (selectedTable?.id === tableId) setSelectedTable(null)
-    fetchAll()
   }
 
   const handleLogout = async () => {
@@ -181,7 +215,7 @@ export default function Dashboard() {
 
         {/* Sidebar */}
         <div className={`
-          ${sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0 md:w-0'}
+          ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
           transition-all duration-300
           bg-white shadow-lg flex-shrink-0
           fixed md:relative
@@ -270,7 +304,6 @@ export default function Dashboard() {
         {/* Main Content */}
         <div className="flex-1 overflow-y-auto p-4 md:p-6">
 
-          {/* No table selected */}
           {!selectedTable && (
             <div className="flex flex-col items-center justify-center h-full min-h-64 text-gray-400">
               <div className="text-6xl mb-4">🍽️</div>
@@ -285,11 +318,10 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* Table Orders View */}
           {selectedTable && (
             <div className="max-w-2xl mx-auto">
 
-              {/* Table Header Card */}
+              {/* Table Header */}
               <div className="bg-white rounded-2xl shadow p-5 mb-4">
                 <div className="flex justify-between items-start">
                   <div>
@@ -298,14 +330,15 @@ export default function Dashboard() {
                     </h2>
                     <p className="text-sm text-gray-400 mt-1">
                       {tableOrders.length} order round(s) •{' '}
-                      {tableOrders.length > 0 && toISTDate(tableOrders[0].created_at)}
+                      {tableOrders.length > 0 && toISTDate(tableOrders[tableOrders.length - 1].created_at)}
                     </p>
                   </div>
                   <button
                     onClick={() => clearTable(selectedTable.id)}
-                    className="bg-red-100 text-red-500 px-4 py-2 rounded-xl text-sm font-medium hover:bg-red-200 transition"
+                    disabled={clearing}
+                    className="bg-red-100 text-red-500 px-4 py-2 rounded-xl text-sm font-medium hover:bg-red-200 transition disabled:opacity-50"
                   >
-                    🗑️ Clear Table
+                    {clearing ? '⏳ Clearing...' : '🗑️ Clear Table'}
                   </button>
                 </div>
               </div>
@@ -317,7 +350,6 @@ export default function Dashboard() {
                     key={order.id}
                     className={`bg-white rounded-2xl shadow p-5 ${index === 0 ? 'border-2 border-orange-400' : 'border border-gray-100'}`}
                   >
-                    {/* Round Header */}
                     <div className="flex justify-between items-center mb-3">
                       <div className="flex items-center gap-2">
                         <span className="bg-orange-100 text-orange-600 text-xs font-bold px-3 py-1 rounded-full">
@@ -334,7 +366,6 @@ export default function Dashboard() {
                       </span>
                     </div>
 
-                    {/* Items */}
                     <div className="space-y-2">
                       {order.items.map((item, i) => (
                         <div key={i} className="flex justify-between text-sm text-gray-700 py-1 border-b border-gray-50 last:border-0">
@@ -347,7 +378,7 @@ export default function Dashboard() {
                 ))}
               </div>
 
-              {/* Grand Total Card */}
+              {/* Grand Total */}
               <div className="bg-orange-500 rounded-2xl shadow p-5 text-white">
                 <div className="flex justify-between items-center mb-1">
                   <span className="font-bold text-lg">Grand Total</span>
@@ -358,9 +389,10 @@ export default function Dashboard() {
                 </p>
                 <button
                   onClick={() => clearTable(selectedTable.id)}
-                  className="w-full bg-white text-orange-500 py-3 rounded-xl font-bold hover:bg-orange-50 transition text-sm"
+                  disabled={clearing}
+                  className="w-full bg-white text-orange-500 py-3 rounded-xl font-bold hover:bg-orange-50 transition text-sm disabled:opacity-50"
                 >
-                  ✅ Mark as Paid & Clear Table
+                  {clearing ? '⏳ Processing...' : '✅ Mark as Paid & Clear Table'}
                 </button>
               </div>
 
