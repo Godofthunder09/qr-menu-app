@@ -137,6 +137,7 @@ export default function Dashboard() {
       }
 
       // Step 4 — Clear localStorage so customer can order again
+      await supabase.from('table_sessions').delete().eq('table_id', tableId)
       localStorage.removeItem(`table_owner_${tableId}`)
       localStorage.removeItem(`orders_${tableId}`)
 

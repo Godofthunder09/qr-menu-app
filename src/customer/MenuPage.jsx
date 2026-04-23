@@ -33,61 +33,7 @@ export default function MenuPage() {
     fetchData()
   }, [tableId])
 
-  const fetchData = async () => {
-    // Get table info
-    const { data: tableData } = await supabase
-      .from('tables').select('*').eq('id', tableId).single()
-    if (tableData) setTableName(tableData.table_name)
-
-    // Check if there are any active orders for this table in DB
-    const { data: activeOrders } = await supabase
-      .from('orders')
-      .select('id')
-      .eq('table_id', tableId)
-
-    const hasActiveOrders = activeOrders && activeOrders.length > 0
-
-    // If no active orders in DB — reset everything for fresh customer
-    if (!hasActiveOrders) {
-      localStorage.removeItem(`table_owner_${tableId}`)
-      localStorage.removeItem(`orders_${tableId}`)
-    }
-
-    // Check order eligibility
-    const ownerKey = `table_owner_${tableId}`
-    const existing = localStorage.getItem(ownerKey)
-    if (!existing) {
-      localStorage.setItem(ownerKey, 'owner')
-      setCanOrder(true)
-    } else if (existing === 'owner') {
-      setCanOrder(true)
-    } else {
-      setCanOrder(false)
-    }
-
-    // Load order history only if active orders exist
-    if (hasActiveOrders) {
-      const stored = localStorage.getItem(`orders_${tableId}`)
-      if (stored) setOrderedItems(JSON.parse(stored))
-    } else {
-      setOrderedItems([])
-    }
-
-    // Get categories
-    const { data: cats } = await supabase
-      .from('categories').select('*').order('created_at')
-    setCategories(cats || [])
-
-    // Get food items
-    const { data: items } = await supabase
-      .from('food_items').select('*, categories(name)')
-      .eq('is_available', true).order('created_at')
-    setFoodItems(items || [])
-
-    setLoading(false)
-  }
-
-  // Poll every 10 seconds to check if table was cleared
+  // Poll every 8 seconds to check if table was cleared
   useEffect(() => {
     if (!tableId) return
     const interval = setInterval(async () => {
@@ -97,18 +43,85 @@ export default function MenuPage() {
         .eq('table_id', tableId)
 
       if (!activeOrders || activeOrders.length === 0) {
-        // Table was cleared by admin — reset customer session
-        localStorage.removeItem(`table_owner_${tableId}`)
-        localStorage.removeItem(`orders_${tableId}`)
+        const mySessionId = localStorage.getItem(`session_${tableId}`)
+        if (mySessionId) {
+          await supabase
+            .from('table_sessions')
+            .delete()
+            .eq('session_id', mySessionId)
+          localStorage.removeItem(`session_${tableId}`)
+          localStorage.removeItem(`orders_${tableId}`)
+        }
         setOrderedItems([])
         setCart([])
-        setCanOrder(true)
-        localStorage.setItem(`table_owner_${tableId}`, 'owner')
+        await checkOrderEligibility()
       }
-    }, 10000)
-
+    }, 8000)
     return () => clearInterval(interval)
   }, [tableId])
+
+  const checkOrderEligibility = async () => {
+    const { data: sessions } = await supabase
+      .from('table_sessions')
+      .select('*')
+      .eq('table_id', tableId)
+
+    const mySessionId = localStorage.getItem(`session_${tableId}`)
+
+    if (!sessions || sessions.length === 0) {
+      // No session — this is the first device
+      const newSessionId = `session_${Date.now()}_${Math.random()}`
+      localStorage.setItem(`session_${tableId}`, newSessionId)
+      await supabase.from('table_sessions').insert({
+        table_id: tableId,
+        session_id: newSessionId
+      })
+      setCanOrder(true)
+    } else if (mySessionId && sessions.some(s => s.session_id === mySessionId)) {
+      // This device owns the session
+      setCanOrder(true)
+    } else {
+      // Another device has session — view only
+      setCanOrder(false)
+    }
+  }
+
+  const fetchData = async () => {
+    const { data: tableData } = await supabase
+      .from('tables').select('*').eq('id', tableId).single()
+    if (tableData) setTableName(tableData.table_name)
+
+    const { data: activeOrders } = await supabase
+      .from('orders').select('id').eq('table_id', tableId)
+
+    const hasActiveOrders = activeOrders && activeOrders.length > 0
+
+    if (!hasActiveOrders) {
+      const mySessionId = localStorage.getItem(`session_${tableId}`)
+      if (mySessionId) {
+        await supabase.from('table_sessions').delete().eq('session_id', mySessionId)
+        localStorage.removeItem(`session_${tableId}`)
+      }
+      localStorage.removeItem(`orders_${tableId}`)
+      setOrderedItems([])
+    } else {
+      const stored = localStorage.getItem(`orders_${tableId}`)
+      if (stored) setOrderedItems(JSON.parse(stored))
+    }
+
+    await checkOrderEligibility()
+
+    const { data: cats } = await supabase
+      .from('categories').select('*').order('created_at')
+    setCategories(cats || [])
+
+    const { data: items } = await supabase
+      .from('food_items').select('*, categories(name)')
+      .eq('is_available', true).order('created_at')
+    setFoodItems(items || [])
+
+    setLoading(false)
+  }
 
   const saveOrderHistory = (items) => {
     const key = `orders_${tableId}`
@@ -261,8 +274,8 @@ export default function MenuPage() {
 
       {/* View Only Banner */}
       {!canOrder && (
-        <div className="bg-yellow-400 text-yellow-900 text-center text-sm py-2 font-medium px-4">
-          👀 View only — Your group member is placing the order
+        <div className="bg-yellow-400 text-yellow-900 text-center text-sm py-3 font-medium px-4">
+          👀 View only mode — Ask your group member to place the order
         </div>
       )}
 
@@ -378,7 +391,7 @@ export default function MenuPage() {
                 )}
                 <p className="text-orange-500 font-bold mt-1">₹{item.price}</p>
 
-                {canOrder && (
+                {canOrder ? (
                   <div className="mt-2">
                     {qty === 0 ? (
                       <button
@@ -401,9 +414,8 @@ export default function MenuPage() {
                       </div>
                     )}
                   </div>
-                )}
-                {!canOrder && (
-                  <p className="text-xs text-gray-300 mt-2">View only</p>
+                ) : (
+                  <p className="text-xs text-gray-300 mt-2 italic">View only</p>
                 )}
               </div>
             </div>
