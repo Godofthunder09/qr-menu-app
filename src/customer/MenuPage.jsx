@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 
@@ -16,14 +16,12 @@ export default function MenuPage() {
   const [searchQuery, setSearchQuery] = useState('')
   const [suggestions, setSuggestions] = useState([])
   const [zoomedImage, setZoomedImage] = useState(null)
-  const [showWelcome, setShowWelcome] = useState(true)
-  const [showLogo, setShowLogo] = useState(false)
   const [canOrder, setCanOrder] = useState(false)
   const [orderedItems, setOrderedItems] = useState([])
-  const [phase, setPhase] = useState('welcome') // welcome | logo | menu
+  const [phase, setPhase] = useState('welcome')
   const navigate = useNavigate()
 
-  // Welcome animation sequence
+  // Welcome animation
   useEffect(() => {
     const t1 = setTimeout(() => setPhase('logo'), 2000)
     const t2 = setTimeout(() => setPhase('menu'), 4000)
@@ -33,29 +31,84 @@ export default function MenuPage() {
   useEffect(() => {
     if (!tableId) return
     fetchData()
-    checkOrderEligibility()
-    loadOrderHistory()
   }, [tableId])
 
-  const checkOrderEligibility = () => {
-    const key = `table_owner_${tableId}`
-    const existing = localStorage.getItem(key)
+  const fetchData = async () => {
+    // Get table info
+    const { data: tableData } = await supabase
+      .from('tables').select('*').eq('id', tableId).single()
+    if (tableData) setTableName(tableData.table_name)
+
+    // Check if there are any active orders for this table in DB
+    const { data: activeOrders } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('table_id', tableId)
+
+    const hasActiveOrders = activeOrders && activeOrders.length > 0
+
+    // If no active orders in DB — reset everything for fresh customer
+    if (!hasActiveOrders) {
+      localStorage.removeItem(`table_owner_${tableId}`)
+      localStorage.removeItem(`orders_${tableId}`)
+    }
+
+    // Check order eligibility
+    const ownerKey = `table_owner_${tableId}`
+    const existing = localStorage.getItem(ownerKey)
     if (!existing) {
-      // First scanner — give order rights
-      localStorage.setItem(key, 'owner')
+      localStorage.setItem(ownerKey, 'owner')
       setCanOrder(true)
     } else if (existing === 'owner') {
       setCanOrder(true)
     } else {
       setCanOrder(false)
     }
+
+    // Load order history only if active orders exist
+    if (hasActiveOrders) {
+      const stored = localStorage.getItem(`orders_${tableId}`)
+      if (stored) setOrderedItems(JSON.parse(stored))
+    } else {
+      setOrderedItems([])
+    }
+
+    // Get categories
+    const { data: cats } = await supabase
+      .from('categories').select('*').order('created_at')
+    setCategories(cats || [])
+
+    // Get food items
+    const { data: items } = await supabase
+      .from('food_items').select('*, categories(name)')
+      .eq('is_available', true).order('created_at')
+    setFoodItems(items || [])
+
+    setLoading(false)
   }
 
-  const loadOrderHistory = () => {
-    const key = `orders_${tableId}`
-    const stored = localStorage.getItem(key)
-    if (stored) setOrderedItems(JSON.parse(stored))
-  }
+  // Poll every 10 seconds to check if table was cleared
+  useEffect(() => {
+    if (!tableId) return
+    const interval = setInterval(async () => {
+      const { data: activeOrders } = await supabase
+        .from('orders')
+        .select('id')
+        .eq('table_id', tableId)
+
+      if (!activeOrders || activeOrders.length === 0) {
+        // Table was cleared by admin — reset customer session
+        localStorage.removeItem(`table_owner_${tableId}`)
+        localStorage.removeItem(`orders_${tableId}`)
+        setOrderedItems([])
+        setCart([])
+        setCanOrder(true)
+        localStorage.setItem(`table_owner_${tableId}`, 'owner')
+      }
+    }, 10000)
+
+    return () => clearInterval(interval)
+  }, [tableId])
 
   const saveOrderHistory = (items) => {
     const key = `orders_${tableId}`
@@ -63,22 +116,6 @@ export default function MenuPage() {
     const merged = [...existing, ...items]
     localStorage.setItem(key, JSON.stringify(merged))
     setOrderedItems(merged)
-  }
-
-  const fetchData = async () => {
-    const { data: tableData } = await supabase
-      .from('tables').select('*').eq('id', tableId).single()
-    if (tableData) setTableName(tableData.table_name)
-
-    const { data: cats } = await supabase
-      .from('categories').select('*').order('created_at')
-    setCategories(cats || [])
-
-    const { data: items } = await supabase
-      .from('food_items').select('*, categories(name)')
-      .eq('is_available', true).order('created_at')
-    setFoodItems(items || [])
-    setLoading(false)
   }
 
   const handleSearch = (query) => {
@@ -216,9 +253,7 @@ export default function MenuPage() {
             <button
               onClick={() => setZoomedImage(null)}
               className="absolute top-2 right-2 bg-white text-gray-700 rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg"
-            >
-              ×
-            </button>
+            >×</button>
             <p className="text-white text-center text-xs mt-2 opacity-60">Tap anywhere to close</p>
           </div>
         </div>
@@ -265,10 +300,7 @@ export default function MenuPage() {
               {suggestions.map((item) => (
                 <div
                   key={item.id}
-                  onClick={() => {
-                    setSearchQuery(item.name)
-                    setSuggestions([])
-                  }}
+                  onClick={() => { setSearchQuery(item.name); setSuggestions([]) }}
                   className="px-4 py-2 text-sm text-gray-700 hover:bg-orange-50 cursor-pointer flex items-center gap-2"
                 >
                   <span>🍴</span> {item.name}
@@ -333,7 +365,6 @@ export default function MenuPage() {
                   alt={item.name}
                   onClick={() => setZoomedImage(item.image_url)}
                   className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer hover:opacity-90 active:scale-95 transition"
-                  title="Tap to zoom"
                 />
               ) : (
                 <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">
@@ -361,21 +392,16 @@ export default function MenuPage() {
                         <button
                           onClick={() => updateQuantity(item.id, qty - 1)}
                           className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold text-lg flex items-center justify-center"
-                        >
-                          −
-                        </button>
+                        >−</button>
                         <span className="font-semibold text-gray-700">{qty}</span>
                         <button
                           onClick={() => updateQuantity(item.id, qty + 1)}
                           className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold text-lg flex items-center justify-center"
-                        >
-                          +
-                        </button>
+                        >+</button>
                       </div>
                     )}
                   </div>
                 )}
-
                 {!canOrder && (
                   <p className="text-xs text-gray-300 mt-2">View only</p>
                 )}
