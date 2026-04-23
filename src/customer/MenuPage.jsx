@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 
@@ -19,6 +19,8 @@ export default function MenuPage() {
   const [canOrder, setCanOrder] = useState(false)
   const [orderedItems, setOrderedItems] = useState([])
   const [phase, setPhase] = useState('welcome')
+  const [viewOnlyReason, setViewOnlyReason] = useState('')
+  const sessionChecked = useRef(false)
   const navigate = useNavigate()
 
   // Welcome animation
@@ -30,95 +32,164 @@ export default function MenuPage() {
 
   useEffect(() => {
     if (!tableId) return
-    fetchData()
+    initializePage()
   }, [tableId])
 
-  // Poll every 8 seconds to check if table was cleared
+  // Poll every 6 seconds
   useEffect(() => {
     if (!tableId) return
     const interval = setInterval(async () => {
-      const { data: activeOrders } = await supabase
-        .from('orders')
-        .select('id')
-        .eq('table_id', tableId)
-
-      if (!activeOrders || activeOrders.length === 0) {
-        const mySessionId = localStorage.getItem(`session_${tableId}`)
-        if (mySessionId) {
-          await supabase
-            .from('table_sessions')
-            .delete()
-            .eq('session_id', mySessionId)
-          localStorage.removeItem(`session_${tableId}`)
-          localStorage.removeItem(`orders_${tableId}`)
-        }
-        setOrderedItems([])
-        setCart([])
-        await checkOrderEligibility()
-      }
-    }, 8000)
+      await checkAndSync()
+    }, 6000)
     return () => clearInterval(interval)
   }, [tableId])
 
-  const checkOrderEligibility = async () => {
+  const generateSessionId = () => {
+    return `sess_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+  }
+
+  const getMySessionId = () => {
+    return localStorage.getItem(`session_${tableId}`)
+  }
+
+  const setMySessionId = (id) => {
+    localStorage.setItem(`session_${tableId}`, id)
+  }
+
+  const clearMySession = () => {
+    localStorage.removeItem(`session_${tableId}`)
+    localStorage.removeItem(`orders_${tableId}`)
+  }
+
+  const checkAndSync = async () => {
+    // Check active orders
+    const { data: activeOrders } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('table_id', tableId)
+
+    const hasActiveOrders = activeOrders && activeOrders.length > 0
+
+    // Check active sessions
     const { data: sessions } = await supabase
       .from('table_sessions')
       .select('*')
       .eq('table_id', tableId)
 
-    const mySessionId = localStorage.getItem(`session_${tableId}`)
+    const mySessionId = getMySessionId()
+    const hasAnySessions = sessions && sessions.length > 0
+    const iAmOwner = mySessionId && sessions && sessions.some(s => s.session_id === mySessionId)
 
-    if (!sessions || sessions.length === 0) {
-      // No session — this is the first device
-      const newSessionId = `session_${Date.now()}_${Math.random()}`
-      localStorage.setItem(`session_${tableId}`, newSessionId)
+    // Case 1: Table cleared (no orders, no sessions) — reset everything
+    if (!hasActiveOrders && !hasAnySessions) {
+      clearMySession()
+      setCart([])
+      setOrderedItems([])
+
+      // Give this device fresh order rights
+      const newSessionId = generateSessionId()
+      setMySessionId(newSessionId)
+      const { error } = await supabase.from('table_sessions').insert({
+        table_id: tableId,
+        session_id: newSessionId
+      })
+      if (!error) {
+        setCanOrder(true)
+        setViewOnlyReason('')
+      }
+      return
+    }
+
+    // Case 2: I was owner but session got deleted (table cleared while I was on view only)
+    if (mySessionId && !iAmOwner && !hasAnySessions) {
+      clearMySession()
+      const newSessionId = generateSessionId()
+      setMySessionId(newSessionId)
       await supabase.from('table_sessions').insert({
         table_id: tableId,
         session_id: newSessionId
       })
       setCanOrder(true)
-    } else if (mySessionId && sessions.some(s => s.session_id === mySessionId)) {
-      // This device owns the session
+      setViewOnlyReason('')
+      setOrderedItems([])
+      setCart([])
+      return
+    }
+
+    // Case 3: I am owner — stay as owner
+    if (iAmOwner) {
       setCanOrder(true)
-    } else {
-      // Another device has session — view only
+      setViewOnlyReason('')
+      return
+    }
+
+    // Case 4: Someone else is owner — view only
+    if (hasAnySessions && !iAmOwner) {
       setCanOrder(false)
+      setViewOnlyReason('Another device is managing orders for this table.')
+      return
     }
   }
 
-  const fetchData = async () => {
+  const initializePage = async () => {
+    // Fetch table name
     const { data: tableData } = await supabase
       .from('tables').select('*').eq('id', tableId).single()
     if (tableData) setTableName(tableData.table_name)
 
-    const { data: activeOrders } = await supabase
-      .from('orders').select('id').eq('table_id', tableId)
-
-    const hasActiveOrders = activeOrders && activeOrders.length > 0
-
-    if (!hasActiveOrders) {
-      const mySessionId = localStorage.getItem(`session_${tableId}`)
-      if (mySessionId) {
-        await supabase.from('table_sessions').delete().eq('session_id', mySessionId)
-        localStorage.removeItem(`session_${tableId}`)
-      }
-      localStorage.removeItem(`orders_${tableId}`)
-      setOrderedItems([])
-    } else {
-      const stored = localStorage.getItem(`orders_${tableId}`)
-      if (stored) setOrderedItems(JSON.parse(stored))
-    }
-
-    await checkOrderEligibility()
-
+    // Fetch categories
     const { data: cats } = await supabase
       .from('categories').select('*').order('created_at')
     setCategories(cats || [])
 
+    // Fetch food items
     const { data: items } = await supabase
       .from('food_items').select('*, categories(name)')
       .eq('is_available', true).order('created_at')
     setFoodItems(items || [])
+
+    // Check active orders
+    const { data: activeOrders } = await supabase
+      .from('orders').select('id').eq('table_id', tableId)
+    const hasActiveOrders = activeOrders && activeOrders.length > 0
+
+    // Check existing sessions
+    const { data: sessions } = await supabase
+      .from('table_sessions').select('*').eq('table_id', tableId)
+    const hasAnySessions = sessions && sessions.length > 0
+
+    const mySessionId = getMySessionId()
+    const iAmOwner = mySessionId && sessions && sessions.some(s => s.session_id === mySessionId)
+
+    // Load order history if I am owner and there are active orders
+    if (hasActiveOrders && iAmOwner) {
+      const stored = localStorage.getItem(`orders_${tableId}`)
+      if (stored) setOrderedItems(JSON.parse(stored))
+    }
+
+    // Determine eligibility
+    if (!hasAnySessions) {
+      // No session exists — first device gets order rights
+      clearMySession()
+      const newSessionId = generateSessionId()
+      setMySessionId(newSessionId)
+      const { error } = await supabase.from('table_sessions').insert({
+        table_id: tableId,
+        session_id: newSessionId
+      })
+      if (!error) {
+        setCanOrder(true)
+        setViewOnlyReason('')
+      }
+    } else if (iAmOwner) {
+      // This device is the owner
+      setCanOrder(true)
+      setViewOnlyReason('')
+    } else {
+      // Another device is the owner
+      setCanOrder(false)
+      setViewOnlyReason('Another device is managing orders for this table.')
+    }
 
     setLoading(false)
   }
@@ -144,7 +215,9 @@ export default function MenuPage() {
     if (!canOrder) return
     setCart((prev) => {
       const existing = prev.find((c) => c.id === item.id)
-      if (existing) return prev.map((c) => c.id === item.id ? { ...c, quantity: c.quantity + 1 } : c)
+      if (existing) return prev.map((c) =>
+        c.id === item.id ? { ...c, quantity: c.quantity + 1 } : c
+      )
       return [...prev, { ...item, quantity: 1 }]
     })
   }
@@ -155,7 +228,9 @@ export default function MenuPage() {
 
   const updateQuantity = (itemId, qty) => {
     if (qty < 1) { removeFromCart(itemId); return }
-    setCart((prev) => prev.map((c) => c.id === itemId ? { ...c, quantity: qty } : c))
+    setCart((prev) => prev.map((c) =>
+      c.id === itemId ? { ...c, quantity: qty } : c
+    ))
   }
 
   const getQuantityInCart = (itemId) => {
@@ -166,7 +241,9 @@ export default function MenuPage() {
   const totalItems = cart.reduce((sum, item) => sum + item.quantity, 0)
 
   const filteredItems = searchQuery.trim()
-    ? foodItems.filter(item => item.name.toLowerCase().includes(searchQuery.toLowerCase()))
+    ? foodItems.filter(item =>
+        item.name.toLowerCase().includes(searchQuery.toLowerCase())
+      )
     : activeCategory === 'all'
       ? foodItems
       : foodItems.filter((item) => item.category_id === activeCategory)
@@ -190,7 +267,8 @@ export default function MenuPage() {
       price_at_order: item.price,
     }))
 
-    const { error: itemsError } = await supabase.from('order_items').insert(orderItems)
+    const { error: itemsError } = await supabase
+      .from('order_items').insert(orderItems)
     if (itemsError) { alert('Error: ' + itemsError.message); setPlacing(false); return }
 
     saveOrderHistory(cart.map(i => ({ name: i.name, quantity: i.quantity })))
@@ -267,7 +345,9 @@ export default function MenuPage() {
               onClick={() => setZoomedImage(null)}
               className="absolute top-2 right-2 bg-white text-gray-700 rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg"
             >×</button>
-            <p className="text-white text-center text-xs mt-2 opacity-60">Tap anywhere to close</p>
+            <p className="text-white text-center text-xs mt-2 opacity-60">
+              Tap anywhere to close
+            </p>
           </div>
         </div>
       )}
@@ -275,7 +355,7 @@ export default function MenuPage() {
       {/* View Only Banner */}
       {!canOrder && (
         <div className="bg-yellow-400 text-yellow-900 text-center text-sm py-3 font-medium px-4">
-          👀 View only mode — Ask your group member to place the order
+          👀 View only — Ask your group member to place the order
         </div>
       )}
 
@@ -329,7 +409,9 @@ export default function MenuPage() {
             <button
               onClick={() => setActiveCategory('all')}
               className={`px-4 py-1 rounded-full text-sm font-medium whitespace-nowrap transition
-                ${activeCategory === 'all' ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}
+                ${activeCategory === 'all'
+                  ? 'bg-orange-500 text-white'
+                  : 'bg-orange-100 text-orange-600'}`}
             >
               All
             </button>
@@ -338,7 +420,9 @@ export default function MenuPage() {
                 key={cat.id}
                 onClick={() => setActiveCategory(cat.id)}
                 className={`px-4 py-1 rounded-full text-sm font-medium whitespace-nowrap transition
-                  ${activeCategory === cat.id ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}
+                  ${activeCategory === cat.id
+                    ? 'bg-orange-500 text-white'
+                    : 'bg-orange-100 text-orange-600'}`}
               >
                 {cat.name}
               </button>
@@ -348,12 +432,16 @@ export default function MenuPage() {
       </div>
 
       {/* Previously Ordered */}
-      {orderedItems.length > 0 && (
+      {orderedItems.length > 0 && canOrder && (
         <div className="mx-4 mt-4 bg-green-50 border border-green-200 rounded-2xl p-4">
-          <p className="text-green-700 font-semibold text-sm mb-2">✅ Your Previous Orders</p>
+          <p className="text-green-700 font-semibold text-sm mb-2">
+            ✅ Your Previous Orders
+          </p>
           <div className="space-y-1">
             {orderedItems.map((item, i) => (
-              <p key={i} className="text-green-600 text-xs">• {item.name} x{item.quantity}</p>
+              <p key={i} className="text-green-600 text-xs">
+                • {item.name} x{item.quantity}
+              </p>
             ))}
           </div>
         </div>
@@ -429,7 +517,10 @@ export default function MenuPage() {
           <div className="bg-white rounded-t-3xl p-5 max-h-[80vh] overflow-y-auto">
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-lg font-bold text-gray-800">🛒 Your Order</h2>
-              <button onClick={() => setShowCart(false)} className="text-gray-400 text-2xl font-bold">×</button>
+              <button
+                onClick={() => setShowCart(false)}
+                className="text-gray-400 text-2xl font-bold"
+              >×</button>
             </div>
 
             {cart.length === 0 && (
@@ -447,7 +538,9 @@ export default function MenuPage() {
                       onClick={() => updateQuantity(item.id, item.quantity - 1)}
                       className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center"
                     >−</button>
-                    <span className="font-semibold w-4 text-center">{item.quantity}</span>
+                    <span className="font-semibold w-4 text-center">
+                      {item.quantity}
+                    </span>
                     <button
                       onClick={() => updateQuantity(item.id, item.quantity + 1)}
                       className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center"

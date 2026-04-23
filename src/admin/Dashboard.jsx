@@ -92,7 +92,7 @@ export default function Dashboard() {
     setClearing(true)
 
     try {
-      // Step 1 — Get all order IDs for this table
+      // Step 1 — Get all order IDs
       const { data: tableOrdersData, error: fetchError } = await supabase
         .from('orders')
         .select('id')
@@ -104,42 +104,44 @@ export default function Dashboard() {
         return
       }
 
-      if (!tableOrdersData || tableOrdersData.length === 0) {
-        alert('No orders found for this table!')
-        setClearing(false)
-        return
+      // Step 2 — Delete order_items first
+      if (tableOrdersData && tableOrdersData.length > 0) {
+        const orderIds = tableOrdersData.map(o => o.id)
+
+        const { error: itemsError } = await supabase
+          .from('order_items')
+          .delete()
+          .in('order_id', orderIds)
+
+        if (itemsError) {
+          alert('Error deleting items: ' + itemsError.message)
+          setClearing(false)
+          return
+        }
+
+        // Step 3 — Delete orders
+        const { error: ordersError } = await supabase
+          .from('orders')
+          .delete()
+          .eq('table_id', tableId)
+
+        if (ordersError) {
+          alert('Error deleting orders: ' + ordersError.message)
+          setClearing(false)
+          return
+        }
       }
 
-      const orderIds = tableOrdersData.map(o => o.id)
-
-      // Step 2 — Delete order_items first (foreign key constraint)
-      const { error: itemsError } = await supabase
-        .from('order_items')
-        .delete()
-        .in('order_id', orderIds)
-
-      if (itemsError) {
-        alert('Error deleting items: ' + itemsError.message)
-        setClearing(false)
-        return
-      }
-
-      // Step 3 — Delete orders
-      const { error: ordersError } = await supabase
-        .from('orders')
+      // Step 4 — Delete ALL sessions for this table
+      // This allows next customer to get fresh order rights
+      const { error: sessionError } = await supabase
+        .from('table_sessions')
         .delete()
         .eq('table_id', tableId)
 
-      if (ordersError) {
-        alert('Error deleting orders: ' + ordersError.message)
-        setClearing(false)
-        return
+      if (sessionError) {
+        console.error('Session delete error:', sessionError.message)
       }
-
-      // Step 4 — Clear localStorage so customer can order again
-      await supabase.from('table_sessions').delete().eq('table_id', tableId)
-      localStorage.removeItem(`table_owner_${tableId}`)
-      localStorage.removeItem(`orders_${tableId}`)
 
       if (selectedTable?.id === tableId) setSelectedTable(null)
       setClearing(false)
