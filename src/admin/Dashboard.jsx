@@ -2,6 +2,24 @@ import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 
+const toIST = (dateStr) => {
+  return new Date(dateStr).toLocaleTimeString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true
+  })
+}
+
+const toISTDate = (dateStr) => {
+  return new Date(dateStr).toLocaleDateString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric'
+  })
+}
+
 export default function Dashboard() {
   const [tables, setTables] = useState([])
   const [orders, setOrders] = useState([])
@@ -23,8 +41,6 @@ export default function Dashboard() {
       .order('created_at', { ascending: false })
 
     if (ordersData) {
-      // Detect new orders
-      const newIds = new Set(ordersData.map(o => o.id))
       const addedTableIds = new Set()
       ordersData.forEach(o => {
         if (!prevOrderIds.current.has(o.id) && prevOrderIds.current.size > 0) {
@@ -34,7 +50,7 @@ export default function Dashboard() {
       if (addedTableIds.size > 0) {
         setNewOrderTables(prev => new Set([...prev, ...addedTableIds]))
       }
-      prevOrderIds.current = newIds
+      prevOrderIds.current = new Set(ordersData.map(o => o.id))
       setOrders(ordersData)
     }
     setLoading(false)
@@ -42,12 +58,36 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchAll()
+
+    // Poll every 5 seconds as backup
+    const pollInterval = setInterval(() => {
+      fetchAll()
+    }, 5000)
+
+    // Realtime subscription
     const subscription = supabase
-      .channel('dashboard')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'orders' }, fetchAll)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'order_items' }, fetchAll)
+      .channel('dashboard-changes')
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'orders'
+      }, () => fetchAll())
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'order_items'
+      }, () => fetchAll())
+      .on('postgres_changes', {
+        event: 'DELETE',
+        schema: 'public',
+        table: 'orders'
+      }, () => fetchAll())
       .subscribe()
-    return () => supabase.removeChannel(subscription)
+
+    return () => {
+      clearInterval(pollInterval)
+      supabase.removeChannel(subscription)
+    }
   }, [])
 
   const selectTable = (table) => {
@@ -67,6 +107,11 @@ export default function Dashboard() {
       await supabase.from('order_items').delete().eq('order_id', order.id)
       await supabase.from('orders').delete().eq('id', order.id)
     }
+
+    // Clear localStorage for this table so customer can order again
+    localStorage.removeItem(`table_owner_${tableId}`)
+    localStorage.removeItem(`orders_${tableId}`)
+
     if (selectedTable?.id === tableId) setSelectedTable(null)
     fetchAll()
   }
@@ -76,17 +121,14 @@ export default function Dashboard() {
     navigate('/')
   }
 
-  // Get orders for selected table
   const tableOrders = selectedTable
     ? orders.filter(o => o.table_id === selectedTable.id)
     : []
 
-  // Get all items across all orders for selected table
   const allItems = tableOrders.flatMap(o =>
     (o.order_items || []).map(i => ({ ...i, orderId: o.id, createdAt: o.created_at }))
   )
 
-  // Group items by order
   const groupedByOrder = tableOrders.map(order => ({
     ...order,
     items: order.order_items || []
@@ -94,7 +136,6 @@ export default function Dashboard() {
 
   const grandTotal = allItems.reduce((sum, i) => sum + i.price_at_order * i.quantity, 0)
 
-  // Tables that have active orders
   const activeTables = tables.filter(t => orders.some(o => o.table_id === t.id))
 
   return (
@@ -110,7 +151,9 @@ export default function Dashboard() {
             ☰
           </button>
           <span className="text-xl">🍽️</span>
-          <h1 className="text-lg font-bold text-orange-500 hidden sm:block">QR Menu Dashboard</h1>
+          <h1 className="text-lg font-bold text-orange-500 hidden sm:block">
+            QR Menu Dashboard
+          </h1>
         </div>
         <div className="flex gap-2">
           <button
@@ -138,25 +181,36 @@ export default function Dashboard() {
 
         {/* Sidebar */}
         <div className={`
-          ${sidebarOpen ? 'w-64' : 'w-0'}
-          transition-all duration-300 overflow-hidden
+          ${sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0 md:w-0'}
+          transition-all duration-300
           bg-white shadow-lg flex-shrink-0
-          fixed md:relative h-full md:h-auto z-20
-          top-0 md:top-auto
+          fixed md:relative
+          h-[calc(100vh-56px)] w-64
+          z-20 top-14 md:top-0
+          overflow-hidden
         `}>
           <div className="w-64 h-full flex flex-col">
-            <div className="p-4 border-b">
+
+            {/* Sidebar Header */}
+            <div className="p-4 border-b bg-orange-50">
               <h2 className="font-bold text-gray-700 text-sm uppercase tracking-wide">
-                Active Tables
+                🪑 Active Tables
               </h2>
-              <p className="text-xs text-gray-400 mt-1">{activeTables.length} table(s) with orders</p>
+              <p className="text-xs text-gray-400 mt-1">
+                {activeTables.length} table(s) with orders
+              </p>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-2">
-              {activeTables.length === 0 && (
+            {/* Table List */}
+            <div className="flex-1 overflow-y-auto p-3 space-y-2">
+              {loading && (
+                <p className="text-xs text-gray-400 text-center py-4">Loading...</p>
+              )}
+
+              {!loading && activeTables.length === 0 && (
                 <div className="text-center py-8 text-gray-400">
                   <div className="text-3xl mb-2">🪑</div>
-                  <p className="text-xs">No active orders</p>
+                  <p className="text-xs">No active orders yet</p>
                 </div>
               )}
 
@@ -164,39 +218,48 @@ export default function Dashboard() {
                 const isNew = newOrderTables.has(table.id)
                 const isSelected = selectedTable?.id === table.id
                 const tableOrderCount = orders.filter(o => o.table_id === table.id).length
+                const latestOrder = orders.find(o => o.table_id === table.id)
 
                 return (
                   <button
                     key={table.id}
                     onClick={() => selectTable(table)}
                     className={`
-                      w-full text-left px-4 py-3 rounded-xl mb-2 transition-all
+                      w-full text-left px-4 py-3 rounded-xl transition-all border
                       ${isSelected
-                        ? 'bg-orange-500 text-white'
+                        ? 'bg-orange-500 text-white border-orange-500 shadow-md'
                         : isNew
-                          ? 'bg-yellow-400 text-yellow-900 animate-pulse'
-                          : 'bg-gray-50 text-gray-700 hover:bg-orange-50'}
+                          ? 'bg-yellow-400 text-yellow-900 border-yellow-400 animate-pulse'
+                          : 'bg-gray-50 text-gray-700 border-gray-100 hover:bg-orange-50 hover:border-orange-200'}
                     `}
                   >
                     <div className="flex justify-between items-center">
                       <span className="font-semibold text-sm">{table.table_name}</span>
                       {isNew && !isSelected && (
-                        <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full">
+                        <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-bold">
                           New!
                         </span>
                       )}
                     </div>
-                    <p className={`text-xs mt-0.5 ${isSelected ? 'text-orange-100' : 'text-gray-400'}`}>
-                      {tableOrderCount} order(s)
-                    </p>
+                    <div className={`flex justify-between mt-1 text-xs ${isSelected ? 'text-orange-100' : 'text-gray-400'}`}>
+                      <span>{tableOrderCount} order(s)</span>
+                      {latestOrder && (
+                        <span>{toIST(latestOrder.created_at)}</span>
+                      )}
+                    </div>
                   </button>
                 )
               })}
             </div>
+
+            {/* Sidebar Footer */}
+            <div className="p-3 border-t text-center">
+              <p className="text-xs text-gray-300">Auto-refreshes every 5s</p>
+            </div>
           </div>
         </div>
 
-        {/* Overlay for mobile sidebar */}
+        {/* Mobile Overlay */}
         {sidebarOpen && (
           <div
             className="fixed inset-0 bg-black bg-opacity-30 z-10 md:hidden"
@@ -214,39 +277,47 @@ export default function Dashboard() {
               <h2 className="text-xl font-semibold text-gray-500 mb-2">
                 {activeTables.length > 0 ? 'Select a table' : 'No active orders'}
               </h2>
-              <p className="text-sm text-center">
+              <p className="text-sm text-center text-gray-400">
                 {activeTables.length > 0
-                  ? 'Click a table from the sidebar to see orders'
+                  ? 'Click any table from the sidebar to view orders'
                   : 'Waiting for customers to place orders...'}
               </p>
             </div>
           )}
 
-          {/* Table Orders */}
+          {/* Table Orders View */}
           {selectedTable && (
             <div className="max-w-2xl mx-auto">
 
-              {/* Table Header */}
-              <div className="bg-white rounded-2xl shadow p-5 mb-4 flex justify-between items-center">
-                <div>
-                  <h2 className="text-2xl font-bold text-orange-500">{selectedTable.table_name}</h2>
-                  <p className="text-sm text-gray-400">{tableOrders.length} order round(s)</p>
+              {/* Table Header Card */}
+              <div className="bg-white rounded-2xl shadow p-5 mb-4">
+                <div className="flex justify-between items-start">
+                  <div>
+                    <h2 className="text-2xl font-bold text-orange-500">
+                      {selectedTable.table_name}
+                    </h2>
+                    <p className="text-sm text-gray-400 mt-1">
+                      {tableOrders.length} order round(s) •{' '}
+                      {tableOrders.length > 0 && toISTDate(tableOrders[0].created_at)}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => clearTable(selectedTable.id)}
+                    className="bg-red-100 text-red-500 px-4 py-2 rounded-xl text-sm font-medium hover:bg-red-200 transition"
+                  >
+                    🗑️ Clear Table
+                  </button>
                 </div>
-                <button
-                  onClick={() => clearTable(selectedTable.id)}
-                  className="bg-red-100 text-red-500 px-4 py-2 rounded-xl text-sm font-medium hover:bg-red-200 transition"
-                >
-                  🗑️ Clear Table
-                </button>
               </div>
 
-              {/* Orders by Round */}
+              {/* Order Rounds */}
               <div className="space-y-4 mb-4">
                 {groupedByOrder.map((order, index) => (
                   <div
                     key={order.id}
-                    className={`bg-white rounded-2xl shadow p-5 ${index === 0 ? 'border-2 border-orange-400' : ''}`}
+                    className={`bg-white rounded-2xl shadow p-5 ${index === 0 ? 'border-2 border-orange-400' : 'border border-gray-100'}`}
                   >
+                    {/* Round Header */}
                     <div className="flex justify-between items-center mb-3">
                       <div className="flex items-center gap-2">
                         <span className="bg-orange-100 text-orange-600 text-xs font-bold px-3 py-1 rounded-full">
@@ -258,16 +329,17 @@ export default function Dashboard() {
                           </span>
                         )}
                       </div>
-                      <span className="text-xs text-gray-400">
-                        {new Date(order.created_at).toLocaleTimeString()}
+                      <span className="text-xs text-gray-400 font-medium">
+                        🕐 {toIST(order.created_at)}
                       </span>
                     </div>
 
+                    {/* Items */}
                     <div className="space-y-2">
                       {order.items.map((item, i) => (
-                        <div key={i} className="flex justify-between text-sm text-gray-700">
-                          <span>{item.food_items?.name} × {item.quantity}</span>
-                          <span className="text-gray-400">₹{item.price_at_order * item.quantity}</span>
+                        <div key={i} className="flex justify-between text-sm text-gray-700 py-1 border-b border-gray-50 last:border-0">
+                          <span className="font-medium">{item.food_items?.name}</span>
+                          <span className="text-gray-500">× {item.quantity}</span>
                         </div>
                       ))}
                     </div>
@@ -275,22 +347,23 @@ export default function Dashboard() {
                 ))}
               </div>
 
-              {/* Grand Total */}
+              {/* Grand Total Card */}
               <div className="bg-orange-500 rounded-2xl shadow p-5 text-white">
-                <div className="flex justify-between items-center mb-2">
+                <div className="flex justify-between items-center mb-1">
                   <span className="font-bold text-lg">Grand Total</span>
                   <span className="font-bold text-2xl">₹{grandTotal}</span>
                 </div>
-                <p className="text-orange-100 text-xs">
-                  * Final bill may include service charges
+                <p className="text-orange-100 text-xs mb-4">
+                  * Final bill may include service charges & taxes
                 </p>
                 <button
                   onClick={() => clearTable(selectedTable.id)}
-                  className="mt-4 w-full bg-white text-orange-500 py-3 rounded-xl font-bold hover:bg-orange-50 transition"
+                  className="w-full bg-white text-orange-500 py-3 rounded-xl font-bold hover:bg-orange-50 transition text-sm"
                 >
                   ✅ Mark as Paid & Clear Table
                 </button>
               </div>
+
             </div>
           )}
         </div>
