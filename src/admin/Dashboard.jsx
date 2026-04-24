@@ -132,16 +132,25 @@ export default function Dashboard() {
         }
       }
 
-      // Step 4 — Delete ALL sessions for this table
-      // This allows next customer to get fresh order rights
-      const { error: sessionError } = await supabase
+      // Step 4 — Get current version and increment it
+      const { data: tableData } = await supabase
+        .from('tables')
+        .select('session_version')
+        .eq('id', tableId)
+        .single()
+
+      const newVersion = (tableData?.session_version || 1) + 1
+
+      await supabase
+        .from('tables')
+        .update({ session_version: newVersion })
+        .eq('id', tableId)
+
+      // Step 5 — Delete all sessions for this table
+      await supabase
         .from('table_sessions')
         .delete()
         .eq('table_id', tableId)
-
-      if (sessionError) {
-        console.error('Session delete error:', sessionError.message)
-      }
 
       if (selectedTable?.id === tableId) setSelectedTable(null)
       setClearing(false)
