@@ -19,6 +19,7 @@ export default function MenuPage() {
   const [canOrder, setCanOrder] = useState(false)
   const [orderedItems, setOrderedItems] = useState([])
   const [phase, setPhase] = useState('welcome')
+  const [myDeviceId, setMyDeviceId] = useState(null)
   const navigate = useNavigate()
 
   // Welcome animation
@@ -33,130 +34,125 @@ export default function MenuPage() {
     initializePage()
   }, [tableId])
 
-  // Poll every 6 seconds to detect version change
+  // Poll every 5 seconds
   useEffect(() => {
-    if (!tableId) return
+    if (!tableId || !myDeviceId) return
     const interval = setInterval(async () => {
-      await syncSession()
-    }, 6000)
+      await checkMyStatus(myDeviceId)
+    }, 5000)
     return () => clearInterval(interval)
-  }, [tableId])
+  }, [tableId, myDeviceId])
 
-  const getMyVersionKey = () => `table_version_${tableId}`
-  const getMySessionKey = () => `table_session_${tableId}`
-  const getMyOrdersKey = () => `table_orders_${tableId}`
-
-  const syncSession = async () => {
-    // Get current table version from DB
-    const { data: tableData } = await supabase
-      .from('tables')
-      .select('session_version')
-      .eq('id', tableId)
-      .single()
-
-    if (!tableData) return
-
-    const dbVersion = tableData.session_version
-    const myVersion = parseInt(localStorage.getItem(getMyVersionKey()) || '0')
-
-    // If DB version is newer — table was cleared, reset this device
-    if (dbVersion > myVersion) {
-      localStorage.removeItem(getMySessionKey())
-      localStorage.removeItem(getMyOrdersKey())
-      localStorage.setItem(getMyVersionKey(), dbVersion.toString())
-      setCart([])
-      setOrderedItems([])
-
-      // Try to become the owner for new version
-      await tryBecomeOwner(dbVersion)
-      return
+  const getOrCreateDeviceId = () => {
+    // Device ID is permanent per browser - never changes
+    let deviceId = localStorage.getItem('device_id')
+    if (!deviceId) {
+      deviceId = `device_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+      localStorage.setItem('device_id', deviceId)
     }
-
-    // Version matches — check if still owner
-    const mySession = localStorage.getItem(getMySessionKey())
-    if (!mySession) {
-      setCanOrder(false)
-      return
-    }
-
-    const { data: sessions } = await supabase
-      .from('table_sessions')
-      .select('session_id')
-      .eq('table_id', tableId)
-
-    const iAmOwner = sessions && sessions.some(s => s.session_id === mySession)
-    setCanOrder(iAmOwner)
+    return deviceId
   }
 
-  const tryBecomeOwner = async (version) => {
-    // Check if anyone else already owns this version
+  const checkMyStatus = async (deviceId) => {
+    // Check if table has any active orders
+    const { data: activeOrders } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('table_id', tableId)
+
+    const hasOrders = activeOrders && activeOrders.length > 0
+
+    // Check sessions for this table
     const { data: sessions } = await supabase
       .from('table_sessions')
       .select('*')
       .eq('table_id', tableId)
 
-    if (!sessions || sessions.length === 0) {
-      // No owner yet — claim it
-      const newSession = `sess_${Date.now()}_${Math.random().toString(36).substr(2,9)}`
-      const { error } = await supabase.from('table_sessions').insert({
-        table_id: tableId,
-        session_id: newSession
-      })
+    const noSessions = !sessions || sessions.length === 0
+    const iAmOwner = sessions && sessions.some(s => s.session_id === deviceId)
+
+    // Table was cleared — no orders AND no sessions
+    if (!hasOrders && noSessions) {
+      // Table is fresh — first device to check becomes owner
+      const { error } = await supabase
+        .from('table_sessions')
+        .insert({ table_id: tableId, session_id: deviceId })
+
       if (!error) {
-        localStorage.setItem(getMySessionKey(), newSession)
         setCanOrder(true)
         setOrderedItems([])
+        setCart([])
       }
-    } else {
-      // Someone else already claimed it
-      localStorage.removeItem(getMySessionKey())
+      return
+    }
+
+    // I am the owner
+    if (iAmOwner) {
+      setCanOrder(true)
+      return
+    }
+
+    // Sessions exist but I am not owner
+    if (!noSessions && !iAmOwner) {
       setCanOrder(false)
+      return
     }
   }
 
   const initializePage = async () => {
-    // Get table info + version
+    const deviceId = getOrCreateDeviceId()
+    setMyDeviceId(deviceId)
+
+    // Get table info
     const { data: tableData } = await supabase
       .from('tables').select('*').eq('id', tableId).single()
     if (!tableData) { setLoading(false); return }
     setTableName(tableData.table_name)
 
-    const dbVersion = tableData.session_version
-    const myVersion = parseInt(localStorage.getItem(getMyVersionKey()) || '0')
-    const mySession = localStorage.getItem(getMySessionKey())
-
-    // If version mismatch — old customer, reset
-    if (dbVersion > myVersion) {
-      localStorage.removeItem(getMySessionKey())
-      localStorage.removeItem(getMyOrdersKey())
-      localStorage.setItem(getMyVersionKey(), dbVersion.toString())
-    }
-
-    // Load categories and food items
+    // Get categories
     const { data: cats } = await supabase
       .from('categories').select('*').order('created_at')
     setCategories(cats || [])
 
+    // Get food items
     const { data: items } = await supabase
       .from('food_items').select('*, categories(name)')
       .eq('is_available', true).order('created_at')
     setFoodItems(items || [])
 
-    // Check sessions
+    // Check active orders for this table
+    const { data: activeOrders } = await supabase
+      .from('orders').select('id').eq('table_id', tableId)
+    const hasOrders = activeOrders && activeOrders.length > 0
+
+    // Check existing sessions
     const { data: sessions } = await supabase
       .from('table_sessions').select('*').eq('table_id', tableId)
+    const noSessions = !sessions || sessions.length === 0
+    const iAmOwner = sessions && sessions.some(s => s.session_id === deviceId)
 
-    const updatedSession = localStorage.getItem(getMySessionKey())
-    const iAmOwner = updatedSession && sessions && sessions.some(s => s.session_id === updatedSession)
+    if (noSessions) {
+      // No session exists — first device claims it
+      const { error } = await supabase
+        .from('table_sessions')
+        .insert({ table_id: tableId, session_id: deviceId })
 
-    if (!sessions || sessions.length === 0) {
-      // No owner — claim it
-      await tryBecomeOwner(dbVersion)
+      if (!error) {
+        setCanOrder(true)
+        setOrderedItems([])
+      }
     } else if (iAmOwner) {
+      // I am the owner
       setCanOrder(true)
-      const stored = localStorage.getItem(getMyOrdersKey())
-      if (stored) setOrderedItems(JSON.parse(stored))
+      // Load order history
+      if (hasOrders) {
+        const stored = localStorage.getItem(`orders_${tableId}_${deviceId}`)
+        if (stored) setOrderedItems(JSON.parse(stored))
+      } else {
+        setOrderedItems([])
+      }
     } else {
+      // Someone else is owner
       setCanOrder(false)
     }
 
@@ -164,7 +160,8 @@ export default function MenuPage() {
   }
 
   const saveOrderHistory = (items) => {
-    const key = getMyOrdersKey()
+    const deviceId = getOrCreateDeviceId()
+    const key = `orders_${tableId}_${deviceId}`
     const existing = JSON.parse(localStorage.getItem(key) || '[]')
     const merged = [...existing, ...items]
     localStorage.setItem(key, JSON.stringify(merged))
@@ -232,7 +229,8 @@ export default function MenuPage() {
       price_at_order: item.price,
     }))
 
-    const { error: itemsError } = await supabase.from('order_items').insert(orderItems)
+    const { error: itemsError } = await supabase
+      .from('order_items').insert(orderItems)
     if (itemsError) { alert('Error: ' + itemsError.message); setPlacing(false); return }
 
     saveOrderHistory(cart.map(i => ({ name: i.name, quantity: i.quantity })))
@@ -242,7 +240,6 @@ export default function MenuPage() {
     navigate(`/order-confirmation?table=${tableId}&name=${tableName}`)
   }
 
-  // Screens
   if (phase === 'welcome') {
     return (
       <div className="min-h-screen bg-orange-500 flex items-center justify-center">
@@ -292,7 +289,7 @@ export default function MenuPage() {
   return (
     <div className="min-h-screen bg-orange-50 pb-32">
 
-      {/* Zoom Image Modal */}
+      {/* Zoom Modal */}
       {zoomedImage && (
         <div
           className="fixed inset-0 z-50 bg-black bg-opacity-80 flex items-center justify-center p-4"
@@ -302,8 +299,12 @@ export default function MenuPage() {
             <img src={zoomedImage} alt="Food"
               className="w-full rounded-2xl object-contain max-h-96" />
             <button onClick={() => setZoomedImage(null)}
-              className="absolute top-2 right-2 bg-white text-gray-700 rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg">×</button>
-            <p className="text-white text-center text-xs mt-2 opacity-60">Tap anywhere to close</p>
+              className="absolute top-2 right-2 bg-white text-gray-700 rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg">
+              ×
+            </button>
+            <p className="text-white text-center text-xs mt-2 opacity-60">
+              Tap anywhere to close
+            </p>
           </div>
         </div>
       )}
@@ -338,7 +339,8 @@ export default function MenuPage() {
           <input type="text" value={searchQuery}
             onChange={(e) => handleSearch(e.target.value)}
             placeholder="🔍 Search food items..."
-            className="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50" />
+            className="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50"
+          />
           {suggestions.length > 0 && (
             <div className="absolute top-full left-0 right-0 bg-white border border-gray-100 rounded-xl shadow-lg z-20 mt-1">
               {suggestions.map((item) => (
@@ -371,7 +373,7 @@ export default function MenuPage() {
         )}
       </div>
 
-      {/* Previously Ordered */}
+      {/* Previous Orders */}
       {orderedItems.length > 0 && canOrder && (
         <div className="mx-4 mt-4 bg-green-50 border border-green-200 rounded-2xl p-4">
           <p className="text-green-700 font-semibold text-sm mb-2">✅ Your Previous Orders</p>
@@ -391,6 +393,7 @@ export default function MenuPage() {
             <p>No items found</p>
           </div>
         )}
+
         {filteredItems.map((item) => {
           const qty = getQuantityInCart(item.id)
           return (
@@ -408,6 +411,7 @@ export default function MenuPage() {
                   <p className="text-xs text-gray-400 mt-1">{item.description}</p>
                 )}
                 <p className="text-orange-500 font-bold mt-1">₹{item.price}</p>
+
                 {canOrder ? (
                   <div className="mt-2">
                     {qty === 0 ? (
@@ -440,9 +444,14 @@ export default function MenuPage() {
           <div className="bg-white rounded-t-3xl p-5 max-h-[80vh] overflow-y-auto">
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-lg font-bold text-gray-800">🛒 Your Order</h2>
-              <button onClick={() => setShowCart(false)} className="text-gray-400 text-2xl font-bold">×</button>
+              <button onClick={() => setShowCart(false)}
+                className="text-gray-400 text-2xl font-bold">×</button>
             </div>
-            {cart.length === 0 && <p className="text-gray-400 text-center py-8">Cart is empty!</p>}
+
+            {cart.length === 0 && (
+              <p className="text-gray-400 text-center py-8">Cart is empty!</p>
+            )}
+
             <div className="space-y-3 mb-4">
               {cart.map((item) => (
                 <div key={item.id} className="flex items-center gap-3 border-b pb-3">
@@ -461,6 +470,7 @@ export default function MenuPage() {
                 </div>
               ))}
             </div>
+
             {cart.length > 0 && (
               <button onClick={placeOrder} disabled={placing}
                 className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg hover:bg-orange-600 transition disabled:opacity-50">
