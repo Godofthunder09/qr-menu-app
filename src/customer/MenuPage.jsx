@@ -19,7 +19,6 @@ export default function MenuPage() {
   const [canOrder, setCanOrder] = useState(false)
   const [orderedItems, setOrderedItems] = useState([])
   const [phase, setPhase] = useState('welcome')
-  const [myDeviceId, setMyDeviceId] = useState(null)
   const navigate = useNavigate()
 
   // Welcome animation
@@ -34,171 +33,215 @@ export default function MenuPage() {
     initializePage()
   }, [tableId])
 
-  // Poll every 5 seconds
+  // Poll every 6 seconds
   useEffect(() => {
-    if (!tableId || !myDeviceId) return
+    if (!tableId) return
     const interval = setInterval(async () => {
-      await checkMyStatus(myDeviceId)
-    }, 5000)
+      await syncSession()
+    }, 6000)
     return () => clearInterval(interval)
-  }, [tableId, myDeviceId])
+  }, [tableId])
 
-  const getOrCreateDeviceId = () => {
-    // Device ID is permanent per browser - never changes
-    let deviceId = localStorage.getItem('device_id')
-    if (!deviceId) {
-      deviceId = `device_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-      localStorage.setItem('device_id', deviceId)
-    }
-    return deviceId
+  // ─── LocalStorage helpers ───────────────────────────────
+  const versionKey = () => `table_version_${tableId}`
+  const sessionKey = () => `table_session_${tableId}`
+  const ordersKey  = () => `table_orders_${tableId}`
+
+  const wipeMyTableData = () => {
+    localStorage.removeItem(versionKey())
+    localStorage.removeItem(sessionKey())
+    localStorage.removeItem(ordersKey())
   }
 
-  const checkMyStatus = async (deviceId) => {
-    // Check if table has any active orders
+  const getMyVersion  = () => parseInt(localStorage.getItem(versionKey()) || '0')
+  const getMySession  = () => localStorage.getItem(sessionKey())
+  const setMyVersion  = (v) => localStorage.setItem(versionKey(), v.toString())
+  const setMySession  = (s) => localStorage.setItem(sessionKey(), s)
+
+  // ─── Try to claim order ownership ───────────────────────
+  const tryBecomeOwner = async (dbVersion) => {
+    const { data: sessions } = await supabase
+      .from('table_sessions')
+      .select('session_id')
+      .eq('table_id', tableId)
+
+    if (!sessions || sessions.length === 0) {
+      const newSession = `sess_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+      const { error } = await supabase.from('table_sessions').insert({
+        table_id: tableId,
+        session_id: newSession
+      })
+      if (!error) {
+        setMySession(newSession)
+        setMyVersion(dbVersion)
+        setCanOrder(true)
+        setOrderedItems([])
+        localStorage.removeItem(ordersKey())
+      }
+    } else {
+      setCanOrder(false)
+    }
+  }
+
+  // ─── Sync every 6s ──────────────────────────────────────
+  const syncSession = async () => {
+    const { data: tableData } = await supabase
+      .from('tables')
+      .select('session_version')
+      .eq('id', tableId)
+      .single()
+
+    if (!tableData) return
+
+    const dbVersion  = tableData.session_version
+    const myVersion  = getMyVersion()
+    const mySession  = getMySession()
+
+    // Version mismatch — table was cleared by admin
+    if (dbVersion > myVersion) {
+      wipeMyTableData()
+      setCart([])
+      setOrderedItems([])
+      setMyVersion(dbVersion)
+      await tryBecomeOwner(dbVersion)
+      return
+    }
+
+    // Version matches — verify session still exists in DB
+    if (!mySession) {
+      setCanOrder(false)
+      return
+    }
+
+    const { data: sessions } = await supabase
+      .from('table_sessions')
+      .select('session_id')
+      .eq('table_id', tableId)
+
+    const iAmOwner = sessions && sessions.some(s => s.session_id === mySession)
+
+    if (!iAmOwner) {
+      // Session was removed — view only
+      localStorage.removeItem(sessionKey())
+      setCanOrder(false)
+      return
+    }
+
+    // I am still owner — verify order history matches DB
     const { data: activeOrders } = await supabase
       .from('orders')
       .select('id')
       .eq('table_id', tableId)
 
-    const hasOrders = activeOrders && activeOrders.length > 0
-
-    // Check sessions for this table
-    const { data: sessions } = await supabase
-      .from('table_sessions')
-      .select('*')
-      .eq('table_id', tableId)
-
-    const noSessions = !sessions || sessions.length === 0
-    const iAmOwner = sessions && sessions.some(s => s.session_id === deviceId)
-
-    // Table was cleared — no orders AND no sessions
-    if (!hasOrders && noSessions) {
-      // Table is fresh — first device to check becomes owner
-      const { error } = await supabase
-        .from('table_sessions')
-        .insert({ table_id: tableId, session_id: deviceId })
-
-      if (!error) {
-        setCanOrder(true)
-        setOrderedItems([])
-        setCart([])
-      }
-      return
+    if (!activeOrders || activeOrders.length === 0) {
+      // No orders in DB — clear local history
+      localStorage.removeItem(ordersKey())
+      setOrderedItems([])
     }
 
-    // I am the owner
-    if (iAmOwner) {
-      setCanOrder(true)
-      return
-    }
-
-    // Sessions exist but I am not owner
-    if (!noSessions && !iAmOwner) {
-      setCanOrder(false)
-      return
-    }
+    setCanOrder(true)
   }
 
+  // ─── Initialize on page load ─────────────────────────────
   const initializePage = async () => {
-    const deviceId = getOrCreateDeviceId()
-    setMyDeviceId(deviceId)
-
-    // Get table info
+    // Fetch table
     const { data: tableData } = await supabase
       .from('tables').select('*').eq('id', tableId).single()
     if (!tableData) { setLoading(false); return }
     setTableName(tableData.table_name)
 
-    // Get categories
+    const dbVersion = tableData.session_version
+    const myVersion = getMyVersion()
+    const mySession = getMySession()
+
+    // Version mismatch — wipe everything
+    if (dbVersion > myVersion) {
+      wipeMyTableData()
+      setMyVersion(dbVersion)
+    }
+
+    // Fetch menu data
     const { data: cats } = await supabase
       .from('categories').select('*').order('created_at')
     setCategories(cats || [])
 
-    // Get food items
     const { data: items } = await supabase
       .from('food_items').select('*, categories(name)')
       .eq('is_available', true).order('created_at')
     setFoodItems(items || [])
 
-    // Check active orders for this table
+    // Check active orders in DB
     const { data: activeOrders } = await supabase
       .from('orders').select('id').eq('table_id', tableId)
-    const hasOrders = activeOrders && activeOrders.length > 0
+    const hasActiveOrders = activeOrders && activeOrders.length > 0
 
-    // Check existing sessions
+    // Check sessions
     const { data: sessions } = await supabase
-      .from('table_sessions').select('*').eq('table_id', tableId)
-    const noSessions = !sessions || sessions.length === 0
-    const iAmOwner = sessions && sessions.some(s => s.session_id === deviceId)
+      .from('table_sessions').select('session_id').eq('table_id', tableId)
 
-    if (noSessions) {
-      // No session exists — first device claims it
-      const { error } = await supabase
-        .from('table_sessions')
-        .insert({ table_id: tableId, session_id: deviceId })
+    const updatedSession = getMySession()
+    const iAmOwner = updatedSession && sessions &&
+      sessions.some(s => s.session_id === updatedSession)
 
-      if (!error) {
-        setCanOrder(true)
-        setOrderedItems([])
-      }
+    if (!sessions || sessions.length === 0) {
+      // No owner — claim it
+      await tryBecomeOwner(dbVersion)
     } else if (iAmOwner) {
-      // I am the owner
       setCanOrder(true)
-      // Load order history
-      if (hasOrders) {
-        const stored = localStorage.getItem(`orders_${tableId}_${deviceId}`)
+      // Only load order history if DB has active orders
+      if (hasActiveOrders) {
+        const stored = localStorage.getItem(ordersKey())
         if (stored) setOrderedItems(JSON.parse(stored))
       } else {
+        localStorage.removeItem(ordersKey())
         setOrderedItems([])
       }
     } else {
-      // Someone else is owner
       setCanOrder(false)
     }
 
     setLoading(false)
   }
 
+  // ─── Save order history ──────────────────────────────────
   const saveOrderHistory = (items) => {
-    const deviceId = getOrCreateDeviceId()
-    const key = `orders_${tableId}_${deviceId}`
-    const existing = JSON.parse(localStorage.getItem(key) || '[]')
+    const existing = JSON.parse(localStorage.getItem(ordersKey()) || '[]')
     const merged = [...existing, ...items]
-    localStorage.setItem(key, JSON.stringify(merged))
+    localStorage.setItem(ordersKey(), JSON.stringify(merged))
     setOrderedItems(merged)
   }
 
+  // ─── Search ──────────────────────────────────────────────
   const handleSearch = (query) => {
     setSearchQuery(query)
     if (query.trim().length < 2) { setSuggestions([]); return }
-    const filtered = foodItems.filter(item =>
-      item.name.toLowerCase().includes(query.toLowerCase())
+    setSuggestions(
+      foodItems
+        .filter(item => item.name.toLowerCase().includes(query.toLowerCase()))
+        .slice(0, 5)
     )
-    setSuggestions(filtered.slice(0, 5))
   }
 
+  // ─── Cart ────────────────────────────────────────────────
   const addToCart = (item) => {
     if (!canOrder) return
-    setCart((prev) => {
-      const existing = prev.find((c) => c.id === item.id)
-      if (existing) return prev.map((c) =>
+    setCart(prev => {
+      const existing = prev.find(c => c.id === item.id)
+      if (existing) return prev.map(c =>
         c.id === item.id ? { ...c, quantity: c.quantity + 1 } : c)
       return [...prev, { ...item, quantity: 1 }]
     })
   }
 
-  const removeFromCart = (itemId) => {
-    setCart((prev) => prev.filter((c) => c.id !== itemId))
-  }
+  const removeFromCart = (itemId) => setCart(prev => prev.filter(c => c.id !== itemId))
 
   const updateQuantity = (itemId, qty) => {
     if (qty < 1) { removeFromCart(itemId); return }
-    setCart((prev) => prev.map((c) =>
-      c.id === itemId ? { ...c, quantity: qty } : c))
+    setCart(prev => prev.map(c => c.id === itemId ? { ...c, quantity: qty } : c))
   }
 
   const getQuantityInCart = (itemId) => {
-    const item = cart.find((c) => c.id === itemId)
+    const item = cart.find(c => c.id === itemId)
     return item ? item.quantity : 0
   }
 
@@ -209,8 +252,9 @@ export default function MenuPage() {
         item.name.toLowerCase().includes(searchQuery.toLowerCase()))
     : activeCategory === 'all'
       ? foodItems
-      : foodItems.filter((item) => item.category_id === activeCategory)
+      : foodItems.filter(item => item.category_id === activeCategory)
 
+  // ─── Place Order ─────────────────────────────────────────
   const placeOrder = async () => {
     if (cart.length === 0) { alert('Add items to cart first!'); return }
     setPlacing(true)
@@ -222,15 +266,14 @@ export default function MenuPage() {
 
     if (error) { alert('Error: ' + error.message); setPlacing(false); return }
 
-    const orderItems = cart.map((item) => ({
+    const orderItems = cart.map(item => ({
       order_id: order.id,
       food_item_id: item.id,
       quantity: item.quantity,
       price_at_order: item.price,
     }))
 
-    const { error: itemsError } = await supabase
-      .from('order_items').insert(orderItems)
+    const { error: itemsError } = await supabase.from('order_items').insert(orderItems)
     if (itemsError) { alert('Error: ' + itemsError.message); setPlacing(false); return }
 
     saveOrderHistory(cart.map(i => ({ name: i.name, quantity: i.quantity })))
@@ -240,6 +283,7 @@ export default function MenuPage() {
     navigate(`/order-confirmation?table=${tableId}&name=${tableName}`)
   }
 
+  // ─── Screens ─────────────────────────────────────────────
   if (phase === 'welcome') {
     return (
       <div className="min-h-screen bg-orange-500 flex items-center justify-center">
@@ -286,6 +330,7 @@ export default function MenuPage() {
     )
   }
 
+  // ─── Main UI ─────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-orange-50 pb-32">
 
@@ -334,16 +379,18 @@ export default function MenuPage() {
           )}
         </div>
 
-        {/* Search */}
+        {/* Search Bar */}
         <div className="relative mb-3">
-          <input type="text" value={searchQuery}
+          <input
+            type="text"
+            value={searchQuery}
             onChange={(e) => handleSearch(e.target.value)}
             placeholder="🔍 Search food items..."
             className="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50"
           />
           {suggestions.length > 0 && (
             <div className="absolute top-full left-0 right-0 bg-white border border-gray-100 rounded-xl shadow-lg z-20 mt-1">
-              {suggestions.map((item) => (
+              {suggestions.map(item => (
                 <div key={item.id}
                   onClick={() => { setSearchQuery(item.name); setSuggestions([]) }}
                   className="px-4 py-2 text-sm text-gray-700 hover:bg-orange-50 cursor-pointer flex items-center gap-2">
@@ -362,7 +409,7 @@ export default function MenuPage() {
                 ${activeCategory === 'all' ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
               All
             </button>
-            {categories.map((cat) => (
+            {categories.map(cat => (
               <button key={cat.id} onClick={() => setActiveCategory(cat.id)}
                 className={`px-4 py-1 rounded-full text-sm font-medium whitespace-nowrap transition
                   ${activeCategory === cat.id ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
@@ -373,13 +420,17 @@ export default function MenuPage() {
         )}
       </div>
 
-      {/* Previous Orders */}
-      {orderedItems.length > 0 && canOrder && (
+      {/* Previous Orders — only show if canOrder AND has items */}
+      {canOrder && orderedItems.length > 0 && (
         <div className="mx-4 mt-4 bg-green-50 border border-green-200 rounded-2xl p-4">
-          <p className="text-green-700 font-semibold text-sm mb-2">✅ Your Previous Orders</p>
+          <p className="text-green-700 font-semibold text-sm mb-2">
+            ✅ Your Previous Orders This Session
+          </p>
           <div className="space-y-1">
             {orderedItems.map((item, i) => (
-              <p key={i} className="text-green-600 text-xs">• {item.name} x{item.quantity}</p>
+              <p key={i} className="text-green-600 text-xs">
+                • {item.name} x{item.quantity}
+              </p>
             ))}
           </div>
         </div>
@@ -394,7 +445,7 @@ export default function MenuPage() {
           </div>
         )}
 
-        {filteredItems.map((item) => {
+        {filteredItems.map(item => {
           const qty = getQuantityInCart(item.id)
           return (
             <div key={item.id} className="bg-white rounded-2xl shadow p-4 flex gap-3">
@@ -403,7 +454,9 @@ export default function MenuPage() {
                   onClick={() => setZoomedImage(item.image_url)}
                   className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer hover:opacity-90 transition" />
               ) : (
-                <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">🍴</div>
+                <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">
+                  🍴
+                </div>
               )}
               <div className="flex-1">
                 <h3 className="font-semibold text-gray-800">{item.name}</h3>
@@ -422,10 +475,14 @@ export default function MenuPage() {
                     ) : (
                       <div className="flex items-center gap-2">
                         <button onClick={() => updateQuantity(item.id, qty - 1)}
-                          className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold text-lg flex items-center justify-center">−</button>
+                          className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold text-lg flex items-center justify-center">
+                          −
+                        </button>
                         <span className="font-semibold text-gray-700">{qty}</span>
                         <button onClick={() => updateQuantity(item.id, qty + 1)}
-                          className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold text-lg flex items-center justify-center">+</button>
+                          className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold text-lg flex items-center justify-center">
+                          +
+                        </button>
                       </div>
                     )}
                   </div>
@@ -453,17 +510,21 @@ export default function MenuPage() {
             )}
 
             <div className="space-y-3 mb-4">
-              {cart.map((item) => (
+              {cart.map(item => (
                 <div key={item.id} className="flex items-center gap-3 border-b pb-3">
                   <div className="flex-1">
                     <p className="font-medium text-gray-700">{item.name}</p>
                   </div>
                   <div className="flex items-center gap-2">
                     <button onClick={() => updateQuantity(item.id, item.quantity - 1)}
-                      className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
+                      className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">
+                      −
+                    </button>
                     <span className="font-semibold w-4 text-center">{item.quantity}</span>
                     <button onClick={() => updateQuantity(item.id, item.quantity + 1)}
-                      className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
+                      className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">
+                      +
+                    </button>
                     <button onClick={() => removeFromCart(item.id)}
                       className="text-red-400 text-sm ml-2">✕</button>
                   </div>
@@ -481,7 +542,7 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* Sticky Bottom */}
+      {/* Sticky Bottom Bar */}
       {totalItems > 0 && !showCart && canOrder && (
         <div className="fixed bottom-0 left-0 right-0 p-4 bg-white border-t shadow-lg">
           <button onClick={() => setShowCart(true)}
