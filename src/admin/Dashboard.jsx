@@ -20,7 +20,6 @@ const toISTDate = (dateStr) => {
   })
 }
 
-// 🔔 Loud order sound — works on mobile + laptop
 const playOrderSound = () => {
   try {
     const AudioContext = window.AudioContext || window.webkitAudioContext
@@ -40,7 +39,6 @@ const playOrderSound = () => {
       oscillator.stop(ctx.currentTime + start + duration)
     }
 
-    // Play 3 loud beeps
     beep(880, 0, 0.3, 1)
     beep(880, 0.35, 0.3, 1)
     beep(1100, 0.7, 0.5, 1)
@@ -60,16 +58,15 @@ export default function Dashboard() {
   const [clearing, setClearing] = useState(false)
   const [soundEnabled, setSoundEnabled] = useState(false)
   const prevOrderIds = useRef(new Set())
+  const isFirstFetch = useRef(true)   // ✅ NEW: tracks first load
   const navigate = useNavigate()
 
-  // User must tap once to enable sound on mobile
   const enableSound = () => {
     try {
       const AudioContext = window.AudioContext || window.webkitAudioContext
       const ctx = new AudioContext()
       ctx.resume().then(() => {
         setSoundEnabled(true)
-        // Play a tiny silent beep to unlock audio
         const o = ctx.createOscillator()
         const g = ctx.createGain()
         o.connect(g)
@@ -96,20 +93,23 @@ export default function Dashboard() {
     if (ordersData) {
       const addedTableIds = new Set()
       ordersData.forEach(o => {
-        if (!prevOrderIds.current.has(o.id) && prevOrderIds.current.size > 0) {
+        // ✅ CHANGED: use isFirstFetch instead of prevOrderIds.current.size > 0
+        // This ensures sound fires for both new tables AND existing tables getting new orders
+        // while skipping the very first page load
+        if (!prevOrderIds.current.has(o.id) && !isFirstFetch.current) {
           addedTableIds.add(o.table_id)
         }
       })
 
       if (addedTableIds.size > 0) {
         setNewOrderTables(prev => new Set([...prev, ...addedTableIds]))
-        // 🔔 Play sound on every new order
         if (soundEnabled) {
           playOrderSound()
         }
       }
 
       prevOrderIds.current = new Set(ordersData.map(o => o.id))
+      isFirstFetch.current = false   // ✅ NEW: mark first fetch as done
       setOrders(ordersData)
     }
     setLoading(false)
@@ -239,7 +239,6 @@ export default function Dashboard() {
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col">
 
-      {/* Sound Enable Banner — shows until user taps */}
       {!soundEnabled && (
         <div
           className="bg-orange-500 text-white text-center py-2 px-4 text-sm cursor-pointer hover:bg-orange-600 transition"
@@ -255,7 +254,6 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Top Navbar */}
       <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30">
         <div className="flex items-center gap-3">
           <button
@@ -293,7 +291,6 @@ export default function Dashboard() {
 
       <div className="flex flex-1 overflow-hidden relative">
 
-        {/* Sidebar */}
         <div className={`
           ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
           transition-all duration-300
@@ -369,7 +366,6 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Mobile Overlay */}
         {sidebarOpen && (
           <div
             className="fixed inset-0 bg-black bg-opacity-30 z-10 md:hidden"
@@ -377,7 +373,6 @@ export default function Dashboard() {
           />
         )}
 
-        {/* Mobile New Order Alert */}
         {newOrderTables.size > 0 && (
           <div className="fixed bottom-4 right-4 z-50 md:hidden">
             <div className="bg-red-500 text-white px-4 py-3 rounded-2xl shadow-lg flex items-center gap-2 animate-bounce">
@@ -398,7 +393,6 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* Main Content */}
         <div className="flex-1 overflow-y-auto p-4 md:p-6">
 
           {!selectedTable && (
