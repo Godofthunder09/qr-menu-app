@@ -19,8 +19,9 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [clearing, setClearing] = useState(false)
   const [soundEnabled, setSoundEnabled] = useState(false)
+  const [showDeleteAll, setShowDeleteAll] = useState(false)
+  const [deletingAll, setDeletingAll] = useState(false)
   const prevOrderIds = useRef(new Set())
-  const audioRef = useRef(null)
   const navigate = useNavigate()
 
   const playSound = () => {
@@ -81,35 +82,24 @@ export default function Dashboard() {
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
-  // ── NUCLEAR CLEAR — deletes everything for a table ───────
+  // Clear table orders but keep table
   const clearTable = async (tableId) => {
-    if (!window.confirm('Clear ALL orders and reset this table completely?')) return
+    if (!window.confirm('Clear all orders and reset this table?')) return
     setClearing(true)
-
     try {
-      // 1. Get order IDs
       const { data: ords } = await supabase
         .from('orders').select('id').eq('table_id', tableId)
-
-      // 2. Delete order_items
       if (ords && ords.length > 0) {
         await supabase.from('order_items')
           .delete().in('order_id', ords.map(o => o.id))
       }
-
-      // 3. Delete orders
       await supabase.from('orders').delete().eq('table_id', tableId)
-
-      // 4. Delete all sessions
       await supabase.from('table_sessions').delete().eq('table_id', tableId)
-
-      // 5. Increment version — this is the KEY that resets customer phones
       const { data: tbl } = await supabase
         .from('tables').select('session_version').eq('id', tableId).single()
       await supabase.from('tables')
         .update({ session_version: (tbl?.session_version || 1) + 1 })
         .eq('id', tableId)
-
       if (selectedTable?.id === tableId) setSelectedTable(null)
       setClearing(false)
       fetchAll()
@@ -119,35 +109,49 @@ export default function Dashboard() {
     }
   }
 
-  // ── NUCLEAR DELETE — deletes the table itself ─────────────
+  // Delete table permanently
   const deleteTableEntirely = async (tableId, tableName) => {
-    if (!window.confirm(`DELETE TABLE "${tableName}" PERMANENTLY? This cannot be undone!`)) return
+    if (!window.confirm(`DELETE TABLE "${tableName}" PERMANENTLY?`)) return
     setClearing(true)
-
     try {
-      // Delete order_items
       const { data: ords } = await supabase
         .from('orders').select('id').eq('table_id', tableId)
       if (ords && ords.length > 0) {
         await supabase.from('order_items')
           .delete().in('order_id', ords.map(o => o.id))
       }
-
-      // Delete orders
       await supabase.from('orders').delete().eq('table_id', tableId)
-
-      // Delete sessions
       await supabase.from('table_sessions').delete().eq('table_id', tableId)
-
-      // Delete the table itself
       await supabase.from('tables').delete().eq('id', tableId)
-
       if (selectedTable?.id === tableId) setSelectedTable(null)
       setClearing(false)
       fetchAll()
     } catch (err) {
       alert('Error: ' + err.message)
       setClearing(false)
+    }
+  }
+
+  // Delete ALL tables and ALL data
+  const deleteAllTables = async () => {
+    if (!window.confirm('DELETE ALL TABLES AND ALL DATA PERMANENTLY? This cannot be undone!')) return
+    setDeletingAll(true)
+    try {
+      // Delete all order_items
+      await supabase.from('order_items').delete().neq('id', '00000000-0000-0000-0000-000000000000')
+      // Delete all orders
+      await supabase.from('orders').delete().neq('id', '00000000-0000-0000-0000-000000000000')
+      // Delete all sessions
+      await supabase.from('table_sessions').delete().neq('id', '00000000-0000-0000-0000-000000000000')
+      // Delete all tables
+      await supabase.from('tables').delete().neq('id', '00000000-0000-0000-0000-000000000000')
+      setSelectedTable(null)
+      setShowDeleteAll(false)
+      setDeletingAll(false)
+      fetchAll()
+    } catch (err) {
+      alert('Error: ' + err.message)
+      setDeletingAll(false)
     }
   }
 
@@ -160,24 +164,46 @@ export default function Dashboard() {
     ? orders.filter(o => o.table_id === selectedTable.id)
     : []
 
-  const allItems = tableOrders.flatMap(o =>
-    (o.order_items || []).map(i => ({ ...i }))
-  )
-
-  const groupedByOrder = tableOrders.map(o => ({
-    ...o, items: o.order_items || []
-  }))
-
+  const allItems = tableOrders.flatMap(o => (o.order_items || []).map(i => ({ ...i })))
+  const groupedByOrder = tableOrders.map(o => ({ ...o, items: o.order_items || [] }))
   const grandTotal = allItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
   const activeTables = tables.filter(t => orders.some(o => o.table_id === t.id))
 
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col">
 
-      {/* Sound enable banner */}
+      {/* Delete All Confirmation Modal */}
+      {showDeleteAll && (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-xl p-6 max-w-sm w-full">
+            <div className="text-center mb-4">
+              <div className="text-5xl mb-3">⚠️</div>
+              <h2 className="text-xl font-bold text-red-600">Delete Everything?</h2>
+              <p className="text-gray-500 text-sm mt-2">
+                This will permanently delete ALL tables, ALL orders, and ALL sessions.
+                This cannot be undone!
+              </p>
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowDeleteAll(false)}
+                className="flex-1 bg-gray-100 text-gray-600 py-3 rounded-xl font-semibold hover:bg-gray-200">
+                Cancel
+              </button>
+              <button
+                onClick={deleteAllTables}
+                disabled={deletingAll}
+                className="flex-1 bg-red-500 text-white py-3 rounded-xl font-semibold hover:bg-red-600 disabled:opacity-50">
+                {deletingAll ? '⏳ Deleting...' : '💥 Delete All'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sound Banner */}
       {!soundEnabled && (
-        <div
-          onClick={() => setSoundEnabled(true)}
+        <div onClick={() => setSoundEnabled(true)}
           className="bg-orange-500 text-white text-center text-sm py-2 cursor-pointer font-medium">
           🔔 Tap here to enable order notification sounds
         </div>
@@ -199,6 +225,10 @@ export default function Dashboard() {
           <button onClick={() => navigate('/admin/tables')}
             className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">
             Tables
+          </button>
+          <button onClick={() => setShowDeleteAll(true)}
+            className="bg-red-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-600">
+            💥 Delete All
           </button>
           <button onClick={handleLogout}
             className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200">
@@ -228,14 +258,12 @@ export default function Dashboard() {
 
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
               {loading && <p className="text-xs text-gray-400 text-center py-4">Loading...</p>}
-
               {!loading && activeTables.length === 0 && (
                 <div className="text-center py-8 text-gray-400">
                   <div className="text-3xl mb-2">🪑</div>
                   <p className="text-xs">No active orders yet</p>
                 </div>
               )}
-
               {activeTables.map(table => {
                 const isNew = newOrderTables.has(table.id)
                 const isSelected = selectedTable?.id === table.id
@@ -252,9 +280,7 @@ export default function Dashboard() {
                     <div className="flex justify-between items-center">
                       <span className="font-semibold text-sm">{table.table_name}</span>
                       {isNew && !isSelected && (
-                        <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-bold">
-                          New!
-                        </span>
+                        <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-bold">New!</span>
                       )}
                     </div>
                     <div className={`flex justify-between mt-1 text-xs ${isSelected ? 'text-orange-100' : 'text-gray-400'}`}>
@@ -280,7 +306,6 @@ export default function Dashboard() {
 
         {/* Main Content */}
         <div className="flex-1 overflow-y-auto p-4 md:p-6">
-
           {!selectedTable && (
             <div className="flex flex-col items-center justify-center h-full min-h-64 text-gray-400">
               <div className="text-6xl mb-4">🍽️</div>
@@ -311,14 +336,12 @@ export default function Dashboard() {
                     </p>
                   </div>
                   <div className="flex gap-2 flex-wrap">
-                    {/* Clear Table — keeps table but resets orders */}
                     <button
                       onClick={() => clearTable(selectedTable.id)}
                       disabled={clearing}
-                      className="bg-red-100 text-red-500 px-4 py-2 rounded-xl text-sm font-medium hover:bg-red-200 transition disabled:opacity-50">
+                      className="bg-orange-100 text-orange-600 px-4 py-2 rounded-xl text-sm font-medium hover:bg-orange-200 transition disabled:opacity-50">
                       {clearing ? '⏳...' : '🗑️ Clear & Reset'}
                     </button>
-                    {/* Delete Table — removes table permanently */}
                     <button
                       onClick={() => deleteTableEntirely(selectedTable.id, selectedTable.table_name)}
                       disabled={clearing}

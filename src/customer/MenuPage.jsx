@@ -19,9 +19,12 @@ export default function MenuPage() {
   const [canOrder, setCanOrder] = useState(false)
   const [orderedItems, setOrderedItems] = useState([])
   const [phase, setPhase] = useState('welcome')
+  const [showCustomize, setShowCustomize] = useState(false)
+  const [customNote, setCustomNote] = useState('')
+  const [selectedItem, setSelectedItem] = useState(null)
+  const [itemNotes, setItemNotes] = useState({})
   const navigate = useNavigate()
 
-  // ── Keys ──────────────────────────────────────────────────
   const KEY_VERSION = `v_${tableId}`
   const KEY_SESSION = `s_${tableId}`
   const KEY_ORDERS  = `o_${tableId}`
@@ -38,31 +41,25 @@ export default function MenuPage() {
     setCanOrder(false)
   }
 
-  // ── Welcome animation ─────────────────────────────────────
   useEffect(() => {
     const t1 = setTimeout(() => setPhase('logo'), 2000)
     const t2 = setTimeout(() => setPhase('menu'), 4000)
     return () => { clearTimeout(t1); clearTimeout(t2) }
   }, [])
 
-  // ── Init ──────────────────────────────────────────────────
   useEffect(() => {
     if (!tableId || phase !== 'menu') return
     init()
   }, [tableId, phase])
 
-  // ── Poll every 5s ─────────────────────────────────────────
   useEffect(() => {
     if (!tableId) return
     const t = setInterval(poll, 5000)
     return () => clearInterval(t)
   }, [tableId])
 
-  // ── Core init ─────────────────────────────────────────────
   const init = async () => {
     setLoading(true)
-
-    // Fetch table
     const { data: tbl } = await supabase
       .from('tables').select('*').eq('id', tableId).single()
     if (!tbl) { setLoading(false); return }
@@ -70,11 +67,8 @@ export default function MenuPage() {
 
     const dbVersion = tbl.session_version || 1
     const myVersion = getVersion()
-
-    // Version mismatch = table was cleared, full wipe
     if (dbVersion !== myVersion) wipeAll()
 
-    // Fetch menu
     const { data: cats } = await supabase
       .from('categories').select('*').order('created_at')
     setCategories(cats || [])
@@ -84,24 +78,19 @@ export default function MenuPage() {
       .eq('is_available', true).order('created_at')
     setFoodItems(items || [])
 
-    // Determine session
     await determineSession(dbVersion)
     setLoading(false)
   }
 
-  // ── Determine if this device can order ───────────────────
   const determineSession = async (dbVersion) => {
     const { data: sessions } = await supabase
-      .from('table_sessions')
-      .select('*')
-      .eq('table_id', tableId)
+      .from('table_sessions').select('*').eq('table_id', tableId)
 
     const mySession = getSession()
-    const iAmOwner  = mySession && sessions?.some(s => s.session_id === mySession)
+    const iAmOwner = mySession && sessions?.some(s => s.session_id === mySession)
 
     if (!sessions || sessions.length === 0) {
-      // Nobody owns this table — claim it
-      const newSess = `s_${Date.now()}_${Math.random().toString(36).substr(2,8)}`
+      const newSess = `s_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`
       const { error } = await supabase.from('table_sessions').insert({
         table_id: tableId, session_id: newSess
       })
@@ -109,8 +98,6 @@ export default function MenuPage() {
         localStorage.setItem(KEY_SESSION, newSess)
         localStorage.setItem(KEY_VERSION, dbVersion.toString())
         setCanOrder(true)
-
-        // Load order history only if active orders exist
         const { data: activeOrders } = await supabase
           .from('orders').select('id').eq('table_id', tableId)
         if (activeOrders && activeOrders.length > 0) {
@@ -121,7 +108,6 @@ export default function MenuPage() {
         }
       }
     } else if (iAmOwner) {
-      // I own this session
       localStorage.setItem(KEY_VERSION, dbVersion.toString())
       setCanOrder(true)
       const { data: activeOrders } = await supabase
@@ -134,15 +120,12 @@ export default function MenuPage() {
         setOrderedItems([])
       }
     } else {
-      // Someone else owns it
       setCanOrder(false)
     }
   }
 
-  // ── Poll: detect table clear ──────────────────────────────
   const poll = async () => {
     if (!tableId) return
-
     const { data: tbl } = await supabase
       .from('tables').select('session_version').eq('id', tableId).single()
     if (!tbl) return
@@ -151,38 +134,29 @@ export default function MenuPage() {
     const myVersion = getVersion()
 
     if (dbVersion !== myVersion) {
-      // Table was cleared — full wipe and re-claim
       wipeAll()
       await determineSession(dbVersion)
       return
     }
 
-    // Check if my session still exists
     const mySession = getSession()
     if (!mySession) return
 
     const { data: sessions } = await supabase
-      .from('table_sessions')
-      .select('session_id')
-      .eq('table_id', tableId)
+      .from('table_sessions').select('session_id').eq('table_id', tableId)
 
     const iAmOwner = sessions?.some(s => s.session_id === mySession)
 
     if (!iAmOwner && canOrder) {
-      // Lost ownership
       localStorage.removeItem(KEY_SESSION)
       setCanOrder(false)
       setOrderedItems([])
       localStorage.removeItem(KEY_ORDERS)
-    } else if (!iAmOwner && !canOrder) {
-      // Check if table is free now
-      if (!sessions || sessions.length === 0) {
-        await determineSession(dbVersion)
-      }
+    } else if (!sessions || sessions.length === 0) {
+      await determineSession(dbVersion)
     }
   }
 
-  // ── Save order history ────────────────────────────────────
   const saveHistory = (items) => {
     const prev = JSON.parse(localStorage.getItem(KEY_ORDERS) || '[]')
     const merged = [...prev, ...items]
@@ -190,7 +164,6 @@ export default function MenuPage() {
     setOrderedItems(merged)
   }
 
-  // ── Search ────────────────────────────────────────────────
   const handleSearch = (q) => {
     setSearchQuery(q)
     if (q.trim().length < 2) { setSuggestions([]); return }
@@ -198,12 +171,11 @@ export default function MenuPage() {
       i.name.toLowerCase().includes(q.toLowerCase())).slice(0, 5))
   }
 
-  // ── Cart ──────────────────────────────────────────────────
   const addToCart = (item) => {
     if (!canOrder) return
     setCart(prev => {
       const ex = prev.find(c => c.id === item.id)
-      if (ex) return prev.map(c => c.id === item.id ? {...c, quantity: c.quantity+1} : c)
+      if (ex) return prev.map(c => c.id === item.id ? {...c, quantity: c.quantity + 1} : c)
       return [...prev, {...item, quantity: 1}]
     })
   }
@@ -215,6 +187,21 @@ export default function MenuPage() {
     setCart(prev => prev.map(c => c.id === id ? {...c, quantity: qty} : c))
   }
 
+  const openCustomize = (item) => {
+    setSelectedItem(item)
+    setCustomNote(itemNotes[item.id] || '')
+    setShowCustomize(true)
+  }
+
+  const saveCustomNote = () => {
+    if (selectedItem) {
+      setItemNotes(prev => ({...prev, [selectedItem.id]: customNote}))
+    }
+    setShowCustomize(false)
+    setCustomNote('')
+    setSelectedItem(null)
+  }
+
   const getQty = (id) => cart.find(c => c.id === id)?.quantity || 0
   const totalItems = cart.reduce((s, i) => s + i.quantity, 0)
 
@@ -224,7 +211,6 @@ export default function MenuPage() {
       ? foodItems
       : foodItems.filter(i => i.category_id === activeCategory)
 
-  // ── Place order ───────────────────────────────────────────
   const placeOrder = async () => {
     if (!cart.length) { alert('Add items first!'); return }
     setPlacing(true)
@@ -241,20 +227,26 @@ export default function MenuPage() {
         order_id: order.id,
         food_item_id: i.id,
         quantity: i.quantity,
-        price_at_order: i.price
+        price_at_order: i.price,
+        note: itemNotes[i.id] || null
       }))
     )
 
     if (e2) { alert('Error: ' + e2.message); setPlacing(false); return }
 
-    saveHistory(cart.map(i => ({ name: i.name, quantity: i.quantity })))
+    saveHistory(cart.map(i => ({
+      name: i.name,
+      quantity: i.quantity,
+      note: itemNotes[i.id] || null
+    })))
+
     setCart([])
+    setItemNotes({})
     setShowCart(false)
     setPlacing(false)
     navigate(`/order-confirmation?table=${tableId}&name=${tableName}`)
   }
 
-  // ── Screens ───────────────────────────────────────────────
   if (phase === 'welcome') return (
     <div className="min-h-screen bg-orange-500 flex items-center justify-center">
       <div className="text-center animate-pulse">
@@ -293,9 +285,41 @@ export default function MenuPage() {
     </div>
   )
 
-  // ── Main UI ───────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-orange-50 pb-32">
+
+      {/* Customize Modal */}
+      {showCustomize && selectedItem && (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-end justify-center">
+          <div className="bg-white rounded-t-3xl p-6 w-full max-w-lg">
+            <h3 className="text-lg font-bold text-gray-800 mb-1">
+              ✏️ Customize — {selectedItem.name}
+            </h3>
+            <p className="text-xs text-gray-400 mb-4">
+              Add special instructions (e.g. less spicy, no onion, extra sauce)
+            </p>
+            <textarea
+              value={customNote}
+              onChange={e => setCustomNote(e.target.value)}
+              placeholder="e.g. No onion, extra spicy, less oil..."
+              rows={3}
+              className="w-full border border-gray-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 resize-none mb-4"
+            />
+            <div className="flex gap-3">
+              <button
+                onClick={() => { setShowCustomize(false); setSelectedItem(null) }}
+                className="flex-1 bg-gray-100 text-gray-600 py-3 rounded-xl font-semibold hover:bg-gray-200">
+                Cancel
+              </button>
+              <button
+                onClick={saveCustomNote}
+                className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-semibold hover:bg-orange-600">
+                Save Note ✅
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Zoom Modal */}
       {zoomedImage && (
@@ -305,7 +329,7 @@ export default function MenuPage() {
             <img src={zoomedImage} alt="zoom"
               className="w-full rounded-2xl object-contain max-h-96" />
             <button onClick={() => setZoomedImage(null)}
-              className="absolute top-2 right-2 bg-white rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg">×</button>
+              className="absolute top-2 right-2 bg-white rounded-full w-8 h-8 flex items-center justify-center font-bold">×</button>
           </div>
         </div>
       )}
@@ -378,7 +402,10 @@ export default function MenuPage() {
         <div className="mx-4 mt-4 bg-green-50 border border-green-200 rounded-2xl p-4">
           <p className="text-green-700 font-semibold text-sm mb-2">✅ Your Orders This Session</p>
           {orderedItems.map((item, i) => (
-            <p key={i} className="text-green-600 text-xs">• {item.name} ×{item.quantity}</p>
+            <div key={i} className="text-green-600 text-xs">
+              • {item.name} ×{item.quantity}
+              {item.note && <span className="text-gray-400 italic"> — {item.note}</span>}
+            </div>
           ))}
         </div>
       )}
@@ -391,35 +418,52 @@ export default function MenuPage() {
             <p>No items found</p>
           </div>
         )}
+
         {filtered.map(item => {
           const qty = getQty(item.id)
+          const note = itemNotes[item.id]
           return (
             <div key={item.id} className="bg-white rounded-2xl shadow p-4 flex gap-3">
               {item.image_url
                 ? <img src={item.image_url} alt={item.name}
                     onClick={() => setZoomedImage(item.image_url)}
-                    className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer" />
+                    className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer hover:opacity-90" />
                 : <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">🍴</div>
               }
               <div className="flex-1">
                 <h3 className="font-semibold text-gray-800">{item.name}</h3>
-                {item.description && <p className="text-xs text-gray-400 mt-1">{item.description}</p>}
+                {item.description && (
+                  <p className="text-xs text-gray-400 mt-1">{item.description}</p>
+                )}
                 <p className="text-orange-500 font-bold mt-1">₹{item.price}</p>
+
+                {/* Custom note display */}
+                {note && canOrder && (
+                  <p className="text-xs text-blue-500 mt-1 italic">📝 {note}</p>
+                )}
+
                 {canOrder ? (
-                  <div className="mt-2">
+                  <div className="mt-2 flex items-center gap-2 flex-wrap">
                     {qty === 0
                       ? <button onClick={() => addToCart(item)}
                           className="bg-orange-500 text-white px-4 py-1 rounded-full text-sm font-medium">
                           + Add
                         </button>
                       : <div className="flex items-center gap-2">
-                          <button onClick={() => updateQty(item.id, qty-1)}
+                          <button onClick={() => updateQty(item.id, qty - 1)}
                             className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
                           <span className="font-semibold">{qty}</span>
-                          <button onClick={() => updateQty(item.id, qty+1)}
+                          <button onClick={() => updateQty(item.id, qty + 1)}
                             className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
                         </div>
                     }
+                    {/* Customize button */}
+                    {qty > 0 && (
+                      <button onClick={() => openCustomize(item)}
+                        className="text-xs text-blue-500 border border-blue-200 px-2 py-1 rounded-full hover:bg-blue-50">
+                        ✏️ Customize
+                      </button>
+                    )}
                   </div>
                 ) : (
                   <p className="text-xs text-gray-300 mt-2 italic">View only</p>
@@ -436,26 +480,38 @@ export default function MenuPage() {
           <div className="bg-white rounded-t-3xl p-5 max-h-[80vh] overflow-y-auto">
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-lg font-bold">🛒 Your Order</h2>
-              <button onClick={() => setShowCart(false)} className="text-gray-400 text-2xl font-bold">×</button>
+              <button onClick={() => setShowCart(false)}
+                className="text-gray-400 text-2xl font-bold">×</button>
             </div>
+
             <div className="space-y-3 mb-4">
               {cart.map(item => (
-                <div key={item.id} className="flex items-center gap-3 border-b pb-3">
-                  <div className="flex-1">
-                    <p className="font-medium text-gray-700">{item.name}</p>
+                <div key={item.id} className="border-b pb-3">
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1">
+                      <p className="font-medium text-gray-700">{item.name}</p>
+                      {itemNotes[item.id] && (
+                        <p className="text-xs text-blue-500 italic mt-0.5">📝 {itemNotes[item.id]}</p>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => updateQty(item.id, item.quantity - 1)}
+                        className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
+                      <span className="font-semibold w-4 text-center">{item.quantity}</span>
+                      <button onClick={() => updateQty(item.id, item.quantity + 1)}
+                        className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
+                      <button onClick={() => removeFromCart(item.id)}
+                        className="text-red-400 text-sm ml-1">✕</button>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <button onClick={() => updateQty(item.id, item.quantity-1)}
-                      className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
-                    <span className="font-semibold w-4 text-center">{item.quantity}</span>
-                    <button onClick={() => updateQty(item.id, item.quantity+1)}
-                      className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
-                    <button onClick={() => removeFromCart(item.id)}
-                      className="text-red-400 text-sm ml-1">✕</button>
-                  </div>
+                  <button onClick={() => openCustomize(item)}
+                    className="text-xs text-blue-500 mt-1 underline">
+                    ✏️ {itemNotes[item.id] ? 'Edit note' : 'Add special note'}
+                  </button>
                 </div>
               ))}
             </div>
+
             {cart.length > 0 && (
               <button onClick={placeOrder} disabled={placing}
                 className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg disabled:opacity-50">
