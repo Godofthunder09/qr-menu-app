@@ -10,6 +10,20 @@ const toISTDate = (d) => new Date(d).toLocaleDateString('en-IN', {
   timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric'
 })
 
+const playNotification = () => {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)()
+    const o = ctx.createOscillator()
+    const g = ctx.createGain()
+    o.connect(g)
+    g.connect(ctx.destination)
+    o.frequency.value = 880
+    g.gain.value = 0.3
+    o.start()
+    setTimeout(() => o.stop(), 300)
+  } catch (e) {}
+}
+
 export default function Dashboard() {
   const [tables, setTables] = useState([])
   const [orders, setOrders] = useState([])
@@ -18,26 +32,9 @@ export default function Dashboard() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [loading, setLoading] = useState(true)
   const [clearing, setClearing] = useState(false)
-  const [soundEnabled, setSoundEnabled] = useState(false)
-  const [showDeleteAll, setShowDeleteAll] = useState(false)
-  const [deletingAll, setDeletingAll] = useState(false)
+  const [showClearAllConfirm, setShowClearAllConfirm] = useState(false)
   const prevOrderIds = useRef(new Set())
   const navigate = useNavigate()
-
-  const playSound = () => {
-    if (!soundEnabled) return
-    try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)()
-      const o = ctx.createOscillator()
-      const g = ctx.createGain()
-      o.connect(g)
-      g.connect(ctx.destination)
-      o.frequency.value = 880
-      g.gain.value = 0.3
-      o.start()
-      setTimeout(() => o.stop(), 300)
-    } catch (e) {}
-  }
 
   const fetchAll = async () => {
     const { data: tablesData } = await supabase
@@ -46,7 +43,16 @@ export default function Dashboard() {
 
     const { data: ordersData } = await supabase
       .from('orders')
-      .select(`*, tables(table_name), order_items(quantity, price_at_order, food_items(name))`)
+      .select(`
+        *,
+        tables(table_name),
+        order_items(
+          quantity,
+          price_at_order,
+          note,
+          food_items(name)
+        )
+      `)
       .order('created_at', { ascending: false })
 
     if (ordersData) {
@@ -54,7 +60,7 @@ export default function Dashboard() {
       ordersData.forEach(o => {
         if (!prevOrderIds.current.has(o.id) && prevOrderIds.current.size > 0) {
           addedTableIds.add(o.table_id)
-          playSound()
+          playNotification()
         }
       })
       if (addedTableIds.size > 0) {
@@ -82,24 +88,63 @@ export default function Dashboard() {
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
-  // Clear table orders but keep table
+  // Clear all ACTIVE orders across ALL tables (keeps tables)
+  const clearAllActiveTables = async () => {
+    setShowClearAllConfirm(false)
+    setClearing(true)
+    try {
+      const activeTables = tables.filter(t => orders.some(o => o.table_id === t.id))
+
+      for (const table of activeTables) {
+        const { data: ords } = await supabase
+          .from('orders').select('id').eq('table_id', table.id)
+
+        if (ords && ords.length > 0) {
+          await supabase.from('order_items')
+            .delete().in('order_id', ords.map(o => o.id))
+          await supabase.from('orders').delete().eq('table_id', table.id)
+        }
+
+        await supabase.from('table_sessions').delete().eq('table_id', table.id)
+
+        const { data: tbl } = await supabase
+          .from('tables').select('session_version').eq('id', table.id).single()
+        await supabase.from('tables')
+          .update({ session_version: (tbl?.session_version || 1) + 1 })
+          .eq('id', table.id)
+      }
+
+      setSelectedTable(null)
+      setClearing(false)
+      fetchAll()
+    } catch (err) {
+      alert('Error: ' + err.message)
+      setClearing(false)
+    }
+  }
+
+  // Clear single table orders (keeps table)
   const clearTable = async (tableId) => {
     if (!window.confirm('Clear all orders and reset this table?')) return
     setClearing(true)
     try {
       const { data: ords } = await supabase
         .from('orders').select('id').eq('table_id', tableId)
+
       if (ords && ords.length > 0) {
         await supabase.from('order_items')
           .delete().in('order_id', ords.map(o => o.id))
+        await supabase.from('orders').delete().eq('table_id', tableId)
       }
-      await supabase.from('orders').delete().eq('table_id', tableId)
+
       await supabase.from('table_sessions').delete().eq('table_id', tableId)
+
       const { data: tbl } = await supabase
         .from('tables').select('session_version').eq('id', tableId).single()
       await supabase.from('tables')
         .update({ session_version: (tbl?.session_version || 1) + 1 })
         .eq('id', tableId)
+
       if (selectedTable?.id === tableId) setSelectedTable(null)
       setClearing(false)
       fetchAll()
@@ -123,35 +168,13 @@ export default function Dashboard() {
       await supabase.from('orders').delete().eq('table_id', tableId)
       await supabase.from('table_sessions').delete().eq('table_id', tableId)
       await supabase.from('tables').delete().eq('id', tableId)
+
       if (selectedTable?.id === tableId) setSelectedTable(null)
       setClearing(false)
       fetchAll()
     } catch (err) {
       alert('Error: ' + err.message)
       setClearing(false)
-    }
-  }
-
-  // Delete ALL tables and ALL data
-  const deleteAllTables = async () => {
-    if (!window.confirm('DELETE ALL TABLES AND ALL DATA PERMANENTLY? This cannot be undone!')) return
-    setDeletingAll(true)
-    try {
-      // Delete all order_items
-      await supabase.from('order_items').delete().neq('id', '00000000-0000-0000-0000-000000000000')
-      // Delete all orders
-      await supabase.from('orders').delete().neq('id', '00000000-0000-0000-0000-000000000000')
-      // Delete all sessions
-      await supabase.from('table_sessions').delete().neq('id', '00000000-0000-0000-0000-000000000000')
-      // Delete all tables
-      await supabase.from('tables').delete().neq('id', '00000000-0000-0000-0000-000000000000')
-      setSelectedTable(null)
-      setShowDeleteAll(false)
-      setDeletingAll(false)
-      fetchAll()
-    } catch (err) {
-      alert('Error: ' + err.message)
-      setDeletingAll(false)
     }
   }
 
@@ -172,40 +195,28 @@ export default function Dashboard() {
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col">
 
-      {/* Delete All Confirmation Modal */}
-      {showDeleteAll && (
-        <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl shadow-xl p-6 max-w-sm w-full">
-            <div className="text-center mb-4">
-              <div className="text-5xl mb-3">⚠️</div>
-              <h2 className="text-xl font-bold text-red-600">Delete Everything?</h2>
-              <p className="text-gray-500 text-sm mt-2">
-                This will permanently delete ALL tables, ALL orders, and ALL sessions.
-                This cannot be undone!
-              </p>
-            </div>
+      {/* Clear All Confirm Modal */}
+      {showClearAllConfirm && (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl">
+            <h2 className="text-xl font-bold text-red-500 mb-2">⚠️ Clear All Active Tables?</h2>
+            <p className="text-gray-600 text-sm mb-4">
+              This will clear ALL orders from ALL active tables ({activeTables.length} tables).
+              The tables themselves will NOT be deleted — only the orders and sessions will be reset.
+            </p>
             <div className="flex gap-3">
               <button
-                onClick={() => setShowDeleteAll(false)}
-                className="flex-1 bg-gray-100 text-gray-600 py-3 rounded-xl font-semibold hover:bg-gray-200">
+                onClick={() => setShowClearAllConfirm(false)}
+                className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium hover:bg-gray-200">
                 Cancel
               </button>
               <button
-                onClick={deleteAllTables}
-                disabled={deletingAll}
-                className="flex-1 bg-red-500 text-white py-3 rounded-xl font-semibold hover:bg-red-600 disabled:opacity-50">
-                {deletingAll ? '⏳ Deleting...' : '💥 Delete All'}
+                onClick={clearAllActiveTables}
+                className="flex-1 bg-red-500 text-white py-2 rounded-xl font-medium hover:bg-red-600">
+                Yes, Clear All
               </button>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* Sound Banner */}
-      {!soundEnabled && (
-        <div onClick={() => setSoundEnabled(true)}
-          className="bg-orange-500 text-white text-center text-sm py-2 cursor-pointer font-medium">
-          🔔 Tap here to enable order notification sounds
         </div>
       )}
 
@@ -217,7 +228,15 @@ export default function Dashboard() {
           <span className="text-xl">🍽️</span>
           <h1 className="text-lg font-bold text-orange-500 hidden sm:block">QR Menu Dashboard</h1>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap justify-end">
+          {activeTables.length > 0 && (
+            <button
+              onClick={() => setShowClearAllConfirm(true)}
+              disabled={clearing}
+              className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200 disabled:opacity-50">
+              🧹 Clear All Tables
+            </button>
+          )}
           <button onClick={() => navigate('/admin/menu')}
             className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">
             Menu
@@ -225,10 +244,6 @@ export default function Dashboard() {
           <button onClick={() => navigate('/admin/tables')}
             className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">
             Tables
-          </button>
-          <button onClick={() => setShowDeleteAll(true)}
-            className="bg-red-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-600">
-            💥 Delete All
           </button>
           <button onClick={handleLogout}
             className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200">
@@ -258,12 +273,14 @@ export default function Dashboard() {
 
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
               {loading && <p className="text-xs text-gray-400 text-center py-4">Loading...</p>}
+
               {!loading && activeTables.length === 0 && (
                 <div className="text-center py-8 text-gray-400">
                   <div className="text-3xl mb-2">🪑</div>
                   <p className="text-xs">No active orders yet</p>
                 </div>
               )}
+
               {activeTables.map(table => {
                 const isNew = newOrderTables.has(table.id)
                 const isSelected = selectedTable?.id === table.id
@@ -280,7 +297,9 @@ export default function Dashboard() {
                     <div className="flex justify-between items-center">
                       <span className="font-semibold text-sm">{table.table_name}</span>
                       {isNew && !isSelected && (
-                        <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-bold">New!</span>
+                        <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-bold">
+                          New!
+                        </span>
                       )}
                     </div>
                     <div className={`flex justify-between mt-1 text-xs ${isSelected ? 'text-orange-100' : 'text-gray-400'}`}>
@@ -306,6 +325,7 @@ export default function Dashboard() {
 
         {/* Main Content */}
         <div className="flex-1 overflow-y-auto p-4 md:p-6">
+
           {!selectedTable && (
             <div className="flex flex-col items-center justify-center h-full min-h-64 text-gray-400">
               <div className="text-6xl mb-4">🍽️</div>
@@ -339,7 +359,7 @@ export default function Dashboard() {
                     <button
                       onClick={() => clearTable(selectedTable.id)}
                       disabled={clearing}
-                      className="bg-orange-100 text-orange-600 px-4 py-2 rounded-xl text-sm font-medium hover:bg-orange-200 transition disabled:opacity-50">
+                      className="bg-red-100 text-red-500 px-4 py-2 rounded-xl text-sm font-medium hover:bg-red-200 transition disabled:opacity-50">
                       {clearing ? '⏳...' : '🗑️ Clear & Reset'}
                     </button>
                     <button
@@ -373,11 +393,22 @@ export default function Dashboard() {
                         🕐 {toIST(order.created_at)}
                       </span>
                     </div>
-                    <div className="space-y-2">
+
+                    <div className="space-y-3">
                       {order.items.map((item, i) => (
-                        <div key={i} className="flex justify-between text-sm text-gray-700 py-1 border-b border-gray-50 last:border-0">
-                          <span className="font-medium">{item.food_items?.name}</span>
-                          <span className="text-gray-500">× {item.quantity}</span>
+                        <div key={i} className="py-2 border-b border-gray-50 last:border-0">
+                          <div className="flex justify-between text-sm text-gray-700">
+                            <span className="font-medium">{item.food_items?.name}</span>
+                            <span className="text-gray-500">× {item.quantity}</span>
+                          </div>
+                          {item.note && item.note.trim() !== '' && (
+                            <div className="mt-1 flex items-start gap-1">
+                              <span className="text-xs">📝</span>
+                              <p className="text-xs text-orange-600 font-medium italic">
+                                "{item.note}"
+                              </p>
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -401,7 +432,6 @@ export default function Dashboard() {
                   {clearing ? '⏳ Processing...' : '✅ Mark as Paid & Clear Table'}
                 </button>
               </div>
-
             </div>
           )}
         </div>

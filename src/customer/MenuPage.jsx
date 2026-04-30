@@ -19,10 +19,8 @@ export default function MenuPage() {
   const [canOrder, setCanOrder] = useState(false)
   const [orderedItems, setOrderedItems] = useState([])
   const [phase, setPhase] = useState('welcome')
-  const [showCustomize, setShowCustomize] = useState(false)
-  const [customNote, setCustomNote] = useState('')
-  const [selectedItem, setSelectedItem] = useState(null)
-  const [itemNotes, setItemNotes] = useState({})
+  const [noteItem, setNoteItem] = useState(null) // item for customization modal
+  const [noteText, setNoteText] = useState('')
   const navigate = useNavigate()
 
   const KEY_VERSION = `v_${tableId}`
@@ -87,10 +85,10 @@ export default function MenuPage() {
       .from('table_sessions').select('*').eq('table_id', tableId)
 
     const mySession = getSession()
-    const iAmOwner = mySession && sessions?.some(s => s.session_id === mySession)
+    const iAmOwner  = mySession && sessions?.some(s => s.session_id === mySession)
 
     if (!sessions || sessions.length === 0) {
-      const newSess = `s_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`
+      const newSess = `s_${Date.now()}_${Math.random().toString(36).substr(2,8)}`
       const { error } = await supabase.from('table_sessions').insert({
         table_id: tableId, session_id: newSess
       })
@@ -144,7 +142,6 @@ export default function MenuPage() {
 
     const { data: sessions } = await supabase
       .from('table_sessions').select('session_id').eq('table_id', tableId)
-
     const iAmOwner = sessions?.some(s => s.session_id === mySession)
 
     if (!iAmOwner && canOrder) {
@@ -152,8 +149,10 @@ export default function MenuPage() {
       setCanOrder(false)
       setOrderedItems([])
       localStorage.removeItem(KEY_ORDERS)
-    } else if (!sessions || sessions.length === 0) {
-      await determineSession(dbVersion)
+    } else if (!iAmOwner && !canOrder) {
+      if (!sessions || sessions.length === 0) {
+        await determineSession(dbVersion)
+      }
     }
   }
 
@@ -171,12 +170,13 @@ export default function MenuPage() {
       i.name.toLowerCase().includes(q.toLowerCase())).slice(0, 5))
   }
 
-  const addToCart = (item) => {
+  const addToCart = (item, note = '') => {
     if (!canOrder) return
     setCart(prev => {
       const ex = prev.find(c => c.id === item.id)
-      if (ex) return prev.map(c => c.id === item.id ? {...c, quantity: c.quantity + 1} : c)
-      return [...prev, {...item, quantity: 1}]
+      if (ex) return prev.map(c =>
+        c.id === item.id ? { ...c, quantity: c.quantity + 1 } : c)
+      return [...prev, { ...item, quantity: 1, note }]
     })
   }
 
@@ -184,22 +184,11 @@ export default function MenuPage() {
 
   const updateQty = (id, qty) => {
     if (qty < 1) { removeFromCart(id); return }
-    setCart(prev => prev.map(c => c.id === id ? {...c, quantity: qty} : c))
+    setCart(prev => prev.map(c => c.id === id ? { ...c, quantity: qty } : c))
   }
 
-  const openCustomize = (item) => {
-    setSelectedItem(item)
-    setCustomNote(itemNotes[item.id] || '')
-    setShowCustomize(true)
-  }
-
-  const saveCustomNote = () => {
-    if (selectedItem) {
-      setItemNotes(prev => ({...prev, [selectedItem.id]: customNote}))
-    }
-    setShowCustomize(false)
-    setCustomNote('')
-    setSelectedItem(null)
+  const updateNote = (id, note) => {
+    setCart(prev => prev.map(c => c.id === id ? { ...c, note } : c))
   }
 
   const getQty = (id) => cart.find(c => c.id === id)?.quantity || 0
@@ -228,7 +217,7 @@ export default function MenuPage() {
         food_item_id: i.id,
         quantity: i.quantity,
         price_at_order: i.price,
-        note: itemNotes[i.id] || null
+        note: i.note || ''
       }))
     )
 
@@ -237,16 +226,15 @@ export default function MenuPage() {
     saveHistory(cart.map(i => ({
       name: i.name,
       quantity: i.quantity,
-      note: itemNotes[i.id] || null
+      note: i.note || ''
     })))
-
     setCart([])
-    setItemNotes({})
     setShowCart(false)
     setPlacing(false)
     navigate(`/order-confirmation?table=${tableId}&name=${tableName}`)
   }
 
+  // Screens
   if (phase === 'welcome') return (
     <div className="min-h-screen bg-orange-500 flex items-center justify-center">
       <div className="text-center animate-pulse">
@@ -288,39 +276,6 @@ export default function MenuPage() {
   return (
     <div className="min-h-screen bg-orange-50 pb-32">
 
-      {/* Customize Modal */}
-      {showCustomize && selectedItem && (
-        <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-end justify-center">
-          <div className="bg-white rounded-t-3xl p-6 w-full max-w-lg">
-            <h3 className="text-lg font-bold text-gray-800 mb-1">
-              ✏️ Customize — {selectedItem.name}
-            </h3>
-            <p className="text-xs text-gray-400 mb-4">
-              Add special instructions (e.g. less spicy, no onion, extra sauce)
-            </p>
-            <textarea
-              value={customNote}
-              onChange={e => setCustomNote(e.target.value)}
-              placeholder="e.g. No onion, extra spicy, less oil..."
-              rows={3}
-              className="w-full border border-gray-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 resize-none mb-4"
-            />
-            <div className="flex gap-3">
-              <button
-                onClick={() => { setShowCustomize(false); setSelectedItem(null) }}
-                className="flex-1 bg-gray-100 text-gray-600 py-3 rounded-xl font-semibold hover:bg-gray-200">
-                Cancel
-              </button>
-              <button
-                onClick={saveCustomNote}
-                className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-semibold hover:bg-orange-600">
-                Save Note ✅
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Zoom Modal */}
       {zoomedImage && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-80 flex items-center justify-center p-4"
@@ -329,7 +284,46 @@ export default function MenuPage() {
             <img src={zoomedImage} alt="zoom"
               className="w-full rounded-2xl object-contain max-h-96" />
             <button onClick={() => setZoomedImage(null)}
-              className="absolute top-2 right-2 bg-white rounded-full w-8 h-8 flex items-center justify-center font-bold">×</button>
+              className="absolute top-2 right-2 bg-white rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg">×</button>
+            <p className="text-white text-center text-xs mt-2 opacity-60">Tap to close</p>
+          </div>
+        </div>
+      )}
+
+      {/* Note/Customization Modal */}
+      {noteItem && (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-5 w-full max-w-sm shadow-xl">
+            <h3 className="font-bold text-gray-800 mb-1">📝 Customize Your Order</h3>
+            <p className="text-sm text-orange-500 font-medium mb-3">{noteItem.name}</p>
+            <textarea
+              value={noteText}
+              onChange={e => setNoteText(e.target.value)}
+              placeholder="e.g. Less spicy, no onion, extra sauce..."
+              rows={3}
+              className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 mb-4"
+            />
+            <div className="flex gap-3">
+              <button
+                onClick={() => { setNoteItem(null); setNoteText('') }}
+                className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium text-sm hover:bg-gray-200">
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  const inCart = cart.find(c => c.id === noteItem.id)
+                  if (inCart) {
+                    updateNote(noteItem.id, noteText)
+                  } else {
+                    addToCart(noteItem, noteText)
+                  }
+                  setNoteItem(null)
+                  setNoteText('')
+                }}
+                className="flex-1 bg-orange-500 text-white py-2 rounded-xl font-medium text-sm hover:bg-orange-600">
+                {cart.find(c => c.id === noteItem.id) ? 'Update Note' : 'Add to Cart'}
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -403,8 +397,8 @@ export default function MenuPage() {
           <p className="text-green-700 font-semibold text-sm mb-2">✅ Your Orders This Session</p>
           {orderedItems.map((item, i) => (
             <div key={i} className="text-green-600 text-xs">
-              • {item.name} ×{item.quantity}
-              {item.note && <span className="text-gray-400 italic"> — {item.note}</span>}
+              <span>• {item.name} ×{item.quantity}</span>
+              {item.note && <span className="italic text-green-500"> — "{item.note}"</span>}
             </div>
           ))}
         </div>
@@ -418,51 +412,62 @@ export default function MenuPage() {
             <p>No items found</p>
           </div>
         )}
-
         {filtered.map(item => {
           const qty = getQty(item.id)
-          const note = itemNotes[item.id]
+          const cartItem = cart.find(c => c.id === item.id)
           return (
             <div key={item.id} className="bg-white rounded-2xl shadow p-4 flex gap-3">
               {item.image_url
                 ? <img src={item.image_url} alt={item.name}
                     onClick={() => setZoomedImage(item.image_url)}
-                    className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer hover:opacity-90" />
+                    className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer" />
                 : <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">🍴</div>
               }
               <div className="flex-1">
                 <h3 className="font-semibold text-gray-800">{item.name}</h3>
-                {item.description && (
-                  <p className="text-xs text-gray-400 mt-1">{item.description}</p>
-                )}
+                {item.description && <p className="text-xs text-gray-400 mt-1">{item.description}</p>}
                 <p className="text-orange-500 font-bold mt-1">₹{item.price}</p>
 
-                {/* Custom note display */}
-                {note && canOrder && (
-                  <p className="text-xs text-blue-500 mt-1 italic">📝 {note}</p>
+                {/* Note preview */}
+                {cartItem?.note && (
+                  <p className="text-xs text-orange-400 italic mt-1">📝 "{cartItem.note}"</p>
                 )}
 
                 {canOrder ? (
                   <div className="mt-2 flex items-center gap-2 flex-wrap">
-                    {qty === 0
-                      ? <button onClick={() => addToCart(item)}
+                    {qty === 0 ? (
+                      <>
+                        <button onClick={() => addToCart(item)}
                           className="bg-orange-500 text-white px-4 py-1 rounded-full text-sm font-medium">
                           + Add
                         </button>
-                      : <div className="flex items-center gap-2">
-                          <button onClick={() => updateQty(item.id, qty - 1)}
+                        <button
+                          onClick={() => {
+                            setNoteItem(item)
+                            setNoteText('')
+                          }}
+                          className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
+                          📝 Customize
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <div className="flex items-center gap-2">
+                          <button onClick={() => updateQty(item.id, qty-1)}
                             className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
                           <span className="font-semibold">{qty}</span>
-                          <button onClick={() => updateQty(item.id, qty + 1)}
+                          <button onClick={() => updateQty(item.id, qty+1)}
                             className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
                         </div>
-                    }
-                    {/* Customize button */}
-                    {qty > 0 && (
-                      <button onClick={() => openCustomize(item)}
-                        className="text-xs text-blue-500 border border-blue-200 px-2 py-1 rounded-full hover:bg-blue-50">
-                        ✏️ Customize
-                      </button>
+                        <button
+                          onClick={() => {
+                            setNoteItem(item)
+                            setNoteText(cartItem?.note || '')
+                          }}
+                          className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
+                          📝 {cartItem?.note ? 'Edit Note' : 'Add Note'}
+                        </button>
+                      </>
                     )}
                   </div>
                 ) : (
@@ -477,41 +482,43 @@ export default function MenuPage() {
       {/* Cart Drawer */}
       {showCart && canOrder && (
         <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black bg-opacity-40">
-          <div className="bg-white rounded-t-3xl p-5 max-h-[80vh] overflow-y-auto">
+          <div className="bg-white rounded-t-3xl p-5 max-h-[85vh] overflow-y-auto">
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-lg font-bold">🛒 Your Order</h2>
-              <button onClick={() => setShowCart(false)}
-                className="text-gray-400 text-2xl font-bold">×</button>
+              <button onClick={() => setShowCart(false)} className="text-gray-400 text-2xl font-bold">×</button>
             </div>
-
             <div className="space-y-3 mb-4">
               {cart.map(item => (
                 <div key={item.id} className="border-b pb-3">
                   <div className="flex items-center gap-3">
                     <div className="flex-1">
                       <p className="font-medium text-gray-700">{item.name}</p>
-                      {itemNotes[item.id] && (
-                        <p className="text-xs text-blue-500 italic mt-0.5">📝 {itemNotes[item.id]}</p>
+                      {item.note && (
+                        <p className="text-xs text-orange-500 italic mt-0.5">📝 "{item.note}"</p>
                       )}
                     </div>
                     <div className="flex items-center gap-2">
-                      <button onClick={() => updateQty(item.id, item.quantity - 1)}
+                      <button onClick={() => updateQty(item.id, item.quantity-1)}
                         className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
                       <span className="font-semibold w-4 text-center">{item.quantity}</span>
-                      <button onClick={() => updateQty(item.id, item.quantity + 1)}
+                      <button onClick={() => updateQty(item.id, item.quantity+1)}
                         className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
                       <button onClick={() => removeFromCart(item.id)}
                         className="text-red-400 text-sm ml-1">✕</button>
                     </div>
                   </div>
-                  <button onClick={() => openCustomize(item)}
-                    className="text-xs text-blue-500 mt-1 underline">
-                    ✏️ {itemNotes[item.id] ? 'Edit note' : 'Add special note'}
+                  <button
+                    onClick={() => {
+                      setNoteItem(item)
+                      setNoteText(item.note || '')
+                      setShowCart(false)
+                    }}
+                    className="mt-2 text-xs text-orange-400 underline">
+                    {item.note ? '✏️ Edit customization' : '📝 Add customization'}
                   </button>
                 </div>
               ))}
             </div>
-
             {cart.length > 0 && (
               <button onClick={placeOrder} disabled={placing}
                 className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg disabled:opacity-50">
