@@ -17,28 +17,25 @@ export default function MenuPage() {
   const [suggestions, setSuggestions] = useState([])
   const [zoomedImage, setZoomedImage] = useState(null)
   const [canOrder, setCanOrder] = useState(false)
-  const [orderedItems, setOrderedItems] = useState([])
   const [phase, setPhase] = useState('welcome')
-  const [noteItem, setNoteItem] = useState(null) // item for customization modal
+  const [noteItem, setNoteItem] = useState(null)
   const [noteText, setNoteText] = useState('')
   const navigate = useNavigate()
 
-  const KEY_VERSION = `v_${tableId}`
-  const KEY_SESSION = `s_${tableId}`
-  const KEY_ORDERS  = `o_${tableId}`
+  // Simple keys
+  const DEVICE_KEY = `device_${tableId}`
+  const VERSION_KEY = `ver_${tableId}`
 
-  const getVersion = () => parseInt(localStorage.getItem(KEY_VERSION) || '0')
-  const getSession = () => localStorage.getItem(KEY_SESSION)
-
-  const wipeAll = () => {
-    localStorage.removeItem(KEY_VERSION)
-    localStorage.removeItem(KEY_SESSION)
-    localStorage.removeItem(KEY_ORDERS)
-    setOrderedItems([])
-    setCart([])
-    setCanOrder(false)
+  const getDeviceId = () => {
+    let id = localStorage.getItem('device_id')
+    if (!id) {
+      id = `d_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+      localStorage.setItem('device_id', id)
+    }
+    return id
   }
 
+  // Welcome animation
   useEffect(() => {
     const t1 = setTimeout(() => setPhase('logo'), 2000)
     const t2 = setTimeout(() => setPhase('menu'), 4000)
@@ -46,27 +43,56 @@ export default function MenuPage() {
   }, [])
 
   useEffect(() => {
-    if (!tableId || phase !== 'menu') return
-    init()
-  }, [tableId, phase])
+    if (phase === 'menu' && tableId) init()
+  }, [phase, tableId])
 
+  // Poll every 5s to detect table clear
   useEffect(() => {
     if (!tableId) return
-    const t = setInterval(poll, 5000)
+    const t = setInterval(checkVersion, 5000)
     return () => clearInterval(t)
   }, [tableId])
 
+  const checkVersion = async () => {
+    const { data: tbl } = await supabase
+      .from('tables')
+      .select('session_version')
+      .eq('id', tableId)
+      .single()
+    if (!tbl) return
+
+    const dbVer = tbl.session_version
+    const myVer = parseInt(localStorage.getItem(VERSION_KEY) || '0')
+
+    if (dbVer !== myVer) {
+      // Table was cleared — wipe local data and re-init
+      localStorage.removeItem(VERSION_KEY)
+      localStorage.removeItem(DEVICE_KEY)
+      setCart([])
+      setCanOrder(false)
+      await claimSession(dbVer)
+    }
+  }
+
   const init = async () => {
     setLoading(true)
+
+    // Get table info
     const { data: tbl } = await supabase
       .from('tables').select('*').eq('id', tableId).single()
     if (!tbl) { setLoading(false); return }
     setTableName(tbl.table_name)
 
-    const dbVersion = tbl.session_version || 1
-    const myVersion = getVersion()
-    if (dbVersion !== myVersion) wipeAll()
+    const dbVer = tbl.session_version || 1
+    const myVer = parseInt(localStorage.getItem(VERSION_KEY) || '0')
 
+    // If version mismatch wipe local
+    if (dbVer !== myVer) {
+      localStorage.removeItem(VERSION_KEY)
+      localStorage.removeItem(DEVICE_KEY)
+    }
+
+    // Load menu
     const { data: cats } = await supabase
       .from('categories').select('*').order('created_at')
     setCategories(cats || [])
@@ -76,106 +102,56 @@ export default function MenuPage() {
       .eq('is_available', true).order('created_at')
     setFoodItems(items || [])
 
-    await determineSession(dbVersion)
+    await claimSession(dbVer)
     setLoading(false)
   }
 
-  const determineSession = async (dbVersion) => {
-    const { data: sessions } = await supabase
-      .from('table_sessions').select('*').eq('table_id', tableId)
+  const claimSession = async (dbVer) => {
+    const deviceId = getDeviceId()
 
-    const mySession = getSession()
-    const iAmOwner  = mySession && sessions?.some(s => s.session_id === mySession)
+    // Check existing sessions for this table
+    const { data: sessions } = await supabase
+      .from('table_sessions')
+      .select('*')
+      .eq('table_id', tableId)
+
+    const mySession = sessions?.find(s => s.device_id === deviceId)
 
     if (!sessions || sessions.length === 0) {
-      const newSess = `s_${Date.now()}_${Math.random().toString(36).substr(2,8)}`
+      // No one owns this table — claim it
       const { error } = await supabase.from('table_sessions').insert({
-        table_id: tableId, session_id: newSess
+        table_id: tableId,
+        device_id: deviceId
       })
       if (!error) {
-        localStorage.setItem(KEY_SESSION, newSess)
-        localStorage.setItem(KEY_VERSION, dbVersion.toString())
+        localStorage.setItem(VERSION_KEY, dbVer.toString())
+        localStorage.setItem(DEVICE_KEY, deviceId)
         setCanOrder(true)
-        const { data: activeOrders } = await supabase
-          .from('orders').select('id').eq('table_id', tableId)
-        if (activeOrders && activeOrders.length > 0) {
-          const stored = localStorage.getItem(KEY_ORDERS)
-          if (stored) setOrderedItems(JSON.parse(stored))
-        } else {
-          localStorage.removeItem(KEY_ORDERS)
-        }
       }
-    } else if (iAmOwner) {
-      localStorage.setItem(KEY_VERSION, dbVersion.toString())
+    } else if (mySession) {
+      // I already own this session
+      localStorage.setItem(VERSION_KEY, dbVer.toString())
+      localStorage.setItem(DEVICE_KEY, deviceId)
       setCanOrder(true)
-      const { data: activeOrders } = await supabase
-        .from('orders').select('id').eq('table_id', tableId)
-      if (activeOrders && activeOrders.length > 0) {
-        const stored = localStorage.getItem(KEY_ORDERS)
-        if (stored) setOrderedItems(JSON.parse(stored))
-      } else {
-        localStorage.removeItem(KEY_ORDERS)
-        setOrderedItems([])
-      }
     } else {
+      // Someone else owns it
       setCanOrder(false)
     }
-  }
-
-  const poll = async () => {
-    if (!tableId) return
-    const { data: tbl } = await supabase
-      .from('tables').select('session_version').eq('id', tableId).single()
-    if (!tbl) return
-
-    const dbVersion = tbl.session_version || 1
-    const myVersion = getVersion()
-
-    if (dbVersion !== myVersion) {
-      wipeAll()
-      await determineSession(dbVersion)
-      return
-    }
-
-    const mySession = getSession()
-    if (!mySession) return
-
-    const { data: sessions } = await supabase
-      .from('table_sessions').select('session_id').eq('table_id', tableId)
-    const iAmOwner = sessions?.some(s => s.session_id === mySession)
-
-    if (!iAmOwner && canOrder) {
-      localStorage.removeItem(KEY_SESSION)
-      setCanOrder(false)
-      setOrderedItems([])
-      localStorage.removeItem(KEY_ORDERS)
-    } else if (!iAmOwner && !canOrder) {
-      if (!sessions || sessions.length === 0) {
-        await determineSession(dbVersion)
-      }
-    }
-  }
-
-  const saveHistory = (items) => {
-    const prev = JSON.parse(localStorage.getItem(KEY_ORDERS) || '[]')
-    const merged = [...prev, ...items]
-    localStorage.setItem(KEY_ORDERS, JSON.stringify(merged))
-    setOrderedItems(merged)
   }
 
   const handleSearch = (q) => {
     setSearchQuery(q)
     if (q.trim().length < 2) { setSuggestions([]); return }
-    setSuggestions(foodItems.filter(i =>
-      i.name.toLowerCase().includes(q.toLowerCase())).slice(0, 5))
+    setSuggestions(
+      foodItems.filter(i => i.name.toLowerCase().includes(q.toLowerCase())).slice(0, 5)
+    )
   }
 
   const addToCart = (item, note = '') => {
     if (!canOrder) return
     setCart(prev => {
       const ex = prev.find(c => c.id === item.id)
-      if (ex) return prev.map(c =>
-        c.id === item.id ? { ...c, quantity: c.quantity + 1 } : c)
+      if (ex) return prev.map(c => c.id === item.id ? { ...c, quantity: c.quantity + 1 } : c)
       return [...prev, { ...item, quantity: 1, note }]
     })
   }
@@ -223,11 +199,6 @@ export default function MenuPage() {
 
     if (e2) { alert('Error: ' + e2.message); setPlacing(false); return }
 
-    saveHistory(cart.map(i => ({
-      name: i.name,
-      quantity: i.quantity,
-      note: i.note || ''
-    })))
     setCart([])
     setShowCart(false)
     setPlacing(false)
@@ -284,17 +255,17 @@ export default function MenuPage() {
             <img src={zoomedImage} alt="zoom"
               className="w-full rounded-2xl object-contain max-h-96" />
             <button onClick={() => setZoomedImage(null)}
-              className="absolute top-2 right-2 bg-white rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg">×</button>
+              className="absolute top-2 right-2 bg-white rounded-full w-8 h-8 flex items-center justify-center font-bold">×</button>
             <p className="text-white text-center text-xs mt-2 opacity-60">Tap to close</p>
           </div>
         </div>
       )}
 
-      {/* Note/Customization Modal */}
+      {/* Customization Modal */}
       {noteItem && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-5 w-full max-w-sm shadow-xl">
-            <h3 className="font-bold text-gray-800 mb-1">📝 Customize Your Order</h3>
+            <h3 className="font-bold text-gray-800 mb-1">📝 Customize Order</h3>
             <p className="text-sm text-orange-500 font-medium mb-3">{noteItem.name}</p>
             <textarea
               value={noteText}
@@ -304,23 +275,18 @@ export default function MenuPage() {
               className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 mb-4"
             />
             <div className="flex gap-3">
-              <button
-                onClick={() => { setNoteItem(null); setNoteText('') }}
-                className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium text-sm hover:bg-gray-200">
+              <button onClick={() => { setNoteItem(null); setNoteText('') }}
+                className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium text-sm">
                 Cancel
               </button>
-              <button
-                onClick={() => {
-                  const inCart = cart.find(c => c.id === noteItem.id)
-                  if (inCart) {
-                    updateNote(noteItem.id, noteText)
-                  } else {
-                    addToCart(noteItem, noteText)
-                  }
-                  setNoteItem(null)
-                  setNoteText('')
-                }}
-                className="flex-1 bg-orange-500 text-white py-2 rounded-xl font-medium text-sm hover:bg-orange-600">
+              <button onClick={() => {
+                const inCart = cart.find(c => c.id === noteItem.id)
+                if (inCart) updateNote(noteItem.id, noteText)
+                else addToCart(noteItem, noteText)
+                setNoteItem(null)
+                setNoteText('')
+              }}
+                className="flex-1 bg-orange-500 text-white py-2 rounded-xl font-medium text-sm">
                 {cart.find(c => c.id === noteItem.id) ? 'Update Note' : 'Add to Cart'}
               </button>
             </div>
@@ -331,7 +297,7 @@ export default function MenuPage() {
       {/* View Only Banner */}
       {!canOrder && (
         <div className="bg-yellow-400 text-yellow-900 text-center text-sm py-3 font-medium px-4">
-          👀 View only — Ask your group member to place the order
+          👀 View only — Order is being managed by another device on this table
         </div>
       )}
 
@@ -391,19 +357,6 @@ export default function MenuPage() {
         )}
       </div>
 
-      {/* Previous Orders */}
-      {canOrder && orderedItems.length > 0 && (
-        <div className="mx-4 mt-4 bg-green-50 border border-green-200 rounded-2xl p-4">
-          <p className="text-green-700 font-semibold text-sm mb-2">✅ Your Orders This Session</p>
-          {orderedItems.map((item, i) => (
-            <div key={i} className="text-green-600 text-xs">
-              <span>• {item.name} ×{item.quantity}</span>
-              {item.note && <span className="italic text-green-500"> — "{item.note}"</span>}
-            </div>
-          ))}
-        </div>
-      )}
-
       {/* Food Items */}
       <div className="p-4 space-y-3">
         {filtered.length === 0 && (
@@ -412,6 +365,7 @@ export default function MenuPage() {
             <p>No items found</p>
           </div>
         )}
+
         {filtered.map(item => {
           const qty = getQty(item.id)
           const cartItem = cart.find(c => c.id === item.id)
@@ -420,7 +374,7 @@ export default function MenuPage() {
               {item.image_url
                 ? <img src={item.image_url} alt={item.name}
                     onClick={() => setZoomedImage(item.image_url)}
-                    className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer" />
+                    className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer hover:opacity-90 transition" />
                 : <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">🍴</div>
               }
               <div className="flex-1">
@@ -428,7 +382,6 @@ export default function MenuPage() {
                 {item.description && <p className="text-xs text-gray-400 mt-1">{item.description}</p>}
                 <p className="text-orange-500 font-bold mt-1">₹{item.price}</p>
 
-                {/* Note preview */}
                 {cartItem?.note && (
                   <p className="text-xs text-orange-400 italic mt-1">📝 "{cartItem.note}"</p>
                 )}
@@ -441,11 +394,7 @@ export default function MenuPage() {
                           className="bg-orange-500 text-white px-4 py-1 rounded-full text-sm font-medium">
                           + Add
                         </button>
-                        <button
-                          onClick={() => {
-                            setNoteItem(item)
-                            setNoteText('')
-                          }}
+                        <button onClick={() => { setNoteItem(item); setNoteText('') }}
                           className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
                           📝 Customize
                         </button>
@@ -453,17 +402,13 @@ export default function MenuPage() {
                     ) : (
                       <>
                         <div className="flex items-center gap-2">
-                          <button onClick={() => updateQty(item.id, qty-1)}
+                          <button onClick={() => updateQty(item.id, qty - 1)}
                             className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
                           <span className="font-semibold">{qty}</span>
-                          <button onClick={() => updateQty(item.id, qty+1)}
+                          <button onClick={() => updateQty(item.id, qty + 1)}
                             className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
                         </div>
-                        <button
-                          onClick={() => {
-                            setNoteItem(item)
-                            setNoteText(cartItem?.note || '')
-                          }}
+                        <button onClick={() => { setNoteItem(item); setNoteText(cartItem?.note || '') }}
                           className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
                           📝 {cartItem?.note ? 'Edit Note' : 'Add Note'}
                         </button>
@@ -485,8 +430,10 @@ export default function MenuPage() {
           <div className="bg-white rounded-t-3xl p-5 max-h-[85vh] overflow-y-auto">
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-lg font-bold">🛒 Your Order</h2>
-              <button onClick={() => setShowCart(false)} className="text-gray-400 text-2xl font-bold">×</button>
+              <button onClick={() => setShowCart(false)}
+                className="text-gray-400 text-2xl font-bold">×</button>
             </div>
+
             <div className="space-y-3 mb-4">
               {cart.map(item => (
                 <div key={item.id} className="border-b pb-3">
@@ -498,27 +445,27 @@ export default function MenuPage() {
                       )}
                     </div>
                     <div className="flex items-center gap-2">
-                      <button onClick={() => updateQty(item.id, item.quantity-1)}
+                      <button onClick={() => updateQty(item.id, item.quantity - 1)}
                         className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
                       <span className="font-semibold w-4 text-center">{item.quantity}</span>
-                      <button onClick={() => updateQty(item.id, item.quantity+1)}
+                      <button onClick={() => updateQty(item.id, item.quantity + 1)}
                         className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
                       <button onClick={() => removeFromCart(item.id)}
                         className="text-red-400 text-sm ml-1">✕</button>
                     </div>
                   </div>
-                  <button
-                    onClick={() => {
-                      setNoteItem(item)
-                      setNoteText(item.note || '')
-                      setShowCart(false)
-                    }}
-                    className="mt-2 text-xs text-orange-400 underline">
+                  <button onClick={() => {
+                    setNoteItem(item)
+                    setNoteText(item.note || '')
+                    setShowCart(false)
+                  }}
+                    className="mt-1 text-xs text-orange-400 underline">
                     {item.note ? '✏️ Edit customization' : '📝 Add customization'}
                   </button>
                 </div>
               ))}
             </div>
+
             {cart.length > 0 && (
               <button onClick={placeOrder} disabled={placing}
                 className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg disabled:opacity-50">

@@ -10,7 +10,7 @@ const toISTDate = (d) => new Date(d).toLocaleDateString('en-IN', {
   timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric'
 })
 
-const playNotification = () => {
+const playSound = () => {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)()
     const o = ctx.createOscillator()
@@ -20,7 +20,7 @@ const playNotification = () => {
     o.frequency.value = 880
     g.gain.value = 0.3
     o.start()
-    setTimeout(() => o.stop(), 300)
+    setTimeout(() => { g.gain.setTargetAtTime(0, ctx.currentTime, 0.1); o.stop(ctx.currentTime + 0.3) }, 200)
   } catch (e) {}
 }
 
@@ -60,7 +60,7 @@ export default function Dashboard() {
       ordersData.forEach(o => {
         if (!prevOrderIds.current.has(o.id) && prevOrderIds.current.size > 0) {
           addedTableIds.add(o.table_id)
-          playNotification()
+          playSound()
         }
       })
       if (addedTableIds.size > 0) {
@@ -88,94 +88,71 @@ export default function Dashboard() {
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
-  // Clear all ACTIVE orders across ALL tables (keeps tables)
-  const clearAllActiveTables = async () => {
-    setShowClearAllConfirm(false)
-    setClearing(true)
+  // ── Core clear function — wipes orders + sessions + increments version
+  const nukeClearTable = async (tableId) => {
     try {
-      const activeTables = tables.filter(t => orders.some(o => o.table_id === t.id))
-
-      for (const table of activeTables) {
-        const { data: ords } = await supabase
-          .from('orders').select('id').eq('table_id', table.id)
-
-        if (ords && ords.length > 0) {
-          await supabase.from('order_items')
-            .delete().in('order_id', ords.map(o => o.id))
-          await supabase.from('orders').delete().eq('table_id', table.id)
-        }
-
-        await supabase.from('table_sessions').delete().eq('table_id', table.id)
-
-        const { data: tbl } = await supabase
-          .from('tables').select('session_version').eq('id', table.id).single()
-        await supabase.from('tables')
-          .update({ session_version: (tbl?.session_version || 1) + 1 })
-          .eq('id', table.id)
-      }
-
-      setSelectedTable(null)
-      setClearing(false)
-      fetchAll()
-    } catch (err) {
-      alert('Error: ' + err.message)
-      setClearing(false)
-    }
-  }
-
-  // Clear single table orders (keeps table)
-  const clearTable = async (tableId) => {
-    if (!window.confirm('Clear all orders and reset this table?')) return
-    setClearing(true)
-    try {
+      // 1. Get all order IDs
       const { data: ords } = await supabase
         .from('orders').select('id').eq('table_id', tableId)
 
+      // 2. Delete order items first
       if (ords && ords.length > 0) {
         await supabase.from('order_items')
           .delete().in('order_id', ords.map(o => o.id))
-        await supabase.from('orders').delete().eq('table_id', tableId)
       }
 
+      // 3. Delete orders
+      await supabase.from('orders').delete().eq('table_id', tableId)
+
+      // 4. Delete session — so next scanner gets fresh access
       await supabase.from('table_sessions').delete().eq('table_id', tableId)
 
+      // 5. Increment version — this resets all customer phones
       const { data: tbl } = await supabase
         .from('tables').select('session_version').eq('id', tableId).single()
       await supabase.from('tables')
         .update({ session_version: (tbl?.session_version || 1) + 1 })
         .eq('id', tableId)
 
-      if (selectedTable?.id === tableId) setSelectedTable(null)
-      setClearing(false)
-      fetchAll()
+      return true
     } catch (err) {
-      alert('Error: ' + err.message)
-      setClearing(false)
+      return false
     }
   }
 
-  // Delete table permanently
-  const deleteTableEntirely = async (tableId, tableName) => {
-    if (!window.confirm(`DELETE TABLE "${tableName}" PERMANENTLY?`)) return
+  // Clear single table
+  const clearTable = async (tableId) => {
+    if (!window.confirm('Mark as paid and clear this table?')) return
     setClearing(true)
-    try {
-      const { data: ords } = await supabase
-        .from('orders').select('id').eq('table_id', tableId)
-      if (ords && ords.length > 0) {
-        await supabase.from('order_items')
-          .delete().in('order_id', ords.map(o => o.id))
-      }
-      await supabase.from('orders').delete().eq('table_id', tableId)
-      await supabase.from('table_sessions').delete().eq('table_id', tableId)
-      await supabase.from('tables').delete().eq('id', tableId)
+    const ok = await nukeClearTable(tableId)
+    if (!ok) alert('Something went wrong. Try again.')
+    if (selectedTable?.id === tableId) setSelectedTable(null)
+    setClearing(false)
+    fetchAll()
+  }
 
-      if (selectedTable?.id === tableId) setSelectedTable(null)
-      setClearing(false)
-      fetchAll()
-    } catch (err) {
-      alert('Error: ' + err.message)
-      setClearing(false)
+  // Clear ALL active tables
+  const clearAllTables = async () => {
+    setShowClearAllConfirm(false)
+    setClearing(true)
+    const activeTables = tables.filter(t => orders.some(o => o.table_id === t.id))
+    for (const table of activeTables) {
+      await nukeClearTable(table.id)
     }
+    setSelectedTable(null)
+    setClearing(false)
+    fetchAll()
+  }
+
+  // Delete table permanently (removes QR reference too)
+  const deleteTable = async (tableId, tableName) => {
+    if (!window.confirm(`Permanently DELETE table "${tableName}"? The QR code for this table will stop working.`)) return
+    setClearing(true)
+    await nukeClearTable(tableId)
+    await supabase.from('tables').delete().eq('id', tableId)
+    if (selectedTable?.id === tableId) setSelectedTable(null)
+    setClearing(false)
+    fetchAll()
   }
 
   const handleLogout = async () => {
@@ -187,7 +164,7 @@ export default function Dashboard() {
     ? orders.filter(o => o.table_id === selectedTable.id)
     : []
 
-  const allItems = tableOrders.flatMap(o => (o.order_items || []).map(i => ({ ...i })))
+  const allItems = tableOrders.flatMap(o => (o.order_items || []))
   const groupedByOrder = tableOrders.map(o => ({ ...o, items: o.order_items || [] }))
   const grandTotal = allItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
   const activeTables = tables.filter(t => orders.some(o => o.table_id === t.id))
@@ -201,18 +178,16 @@ export default function Dashboard() {
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl">
             <h2 className="text-xl font-bold text-red-500 mb-2">⚠️ Clear All Active Tables?</h2>
             <p className="text-gray-600 text-sm mb-4">
-              This will clear ALL orders from ALL active tables ({activeTables.length} tables).
-              The tables themselves will NOT be deleted — only the orders and sessions will be reset.
+              This will clear orders from all {activeTables.length} active tables.
+              Tables themselves will NOT be deleted.
             </p>
             <div className="flex gap-3">
-              <button
-                onClick={() => setShowClearAllConfirm(false)}
-                className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium hover:bg-gray-200">
+              <button onClick={() => setShowClearAllConfirm(false)}
+                className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium">
                 Cancel
               </button>
-              <button
-                onClick={clearAllActiveTables}
-                className="flex-1 bg-red-500 text-white py-2 rounded-xl font-medium hover:bg-red-600">
+              <button onClick={clearAllTables}
+                className="flex-1 bg-red-500 text-white py-2 rounded-xl font-medium">
                 Yes, Clear All
               </button>
             </div>
@@ -230,11 +205,9 @@ export default function Dashboard() {
         </div>
         <div className="flex gap-2 flex-wrap justify-end">
           {activeTables.length > 0 && (
-            <button
-              onClick={() => setShowClearAllConfirm(true)}
-              disabled={clearing}
+            <button onClick={() => setShowClearAllConfirm(true)} disabled={clearing}
               className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200 disabled:opacity-50">
-              🧹 Clear All Tables
+              🧹 Clear All
             </button>
           )}
           <button onClick={() => navigate('/admin/menu')}
@@ -302,7 +275,8 @@ export default function Dashboard() {
                         </span>
                       )}
                     </div>
-                    <div className={`flex justify-between mt-1 text-xs ${isSelected ? 'text-orange-100' : 'text-gray-400'}`}>
+                    <div className={`flex justify-between mt-1 text-xs
+                      ${isSelected ? 'text-orange-100' : 'text-gray-400'}`}>
                       <span>{count} order(s)</span>
                       {latest && <span>{toIST(latest.created_at)}</span>}
                     </div>
@@ -356,15 +330,11 @@ export default function Dashboard() {
                     </p>
                   </div>
                   <div className="flex gap-2 flex-wrap">
-                    <button
-                      onClick={() => clearTable(selectedTable.id)}
-                      disabled={clearing}
-                      className="bg-red-100 text-red-500 px-4 py-2 rounded-xl text-sm font-medium hover:bg-red-200 transition disabled:opacity-50">
-                      {clearing ? '⏳...' : '🗑️ Clear & Reset'}
+                    <button onClick={() => clearTable(selectedTable.id)} disabled={clearing}
+                      className="bg-green-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-green-600 transition disabled:opacity-50">
+                      {clearing ? '⏳...' : '✅ Mark Paid & Clear'}
                     </button>
-                    <button
-                      onClick={() => deleteTableEntirely(selectedTable.id, selectedTable.table_name)}
-                      disabled={clearing}
+                    <button onClick={() => deleteTable(selectedTable.id, selectedTable.table_name)} disabled={clearing}
                       className="bg-red-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-red-600 transition disabled:opacity-50">
                       {clearing ? '⏳...' : '💥 Delete Table'}
                     </button>
@@ -402,12 +372,9 @@ export default function Dashboard() {
                             <span className="text-gray-500">× {item.quantity}</span>
                           </div>
                           {item.note && item.note.trim() !== '' && (
-                            <div className="mt-1 flex items-start gap-1">
-                              <span className="text-xs">📝</span>
-                              <p className="text-xs text-orange-600 font-medium italic">
-                                "{item.note}"
-                              </p>
-                            </div>
+                            <p className="text-xs text-orange-500 italic mt-1">
+                              📝 "{item.note}"
+                            </p>
                           )}
                         </div>
                       ))}
@@ -417,7 +384,7 @@ export default function Dashboard() {
               </div>
 
               {/* Grand Total */}
-              <div className="bg-orange-500 rounded-2xl shadow p-5 text-white">
+              <div className="bg-orange-500 rounded-2xl shadow p-5 text-white mb-4">
                 <div className="flex justify-between items-center mb-1">
                   <span className="font-bold text-lg">Grand Total</span>
                   <span className="font-bold text-2xl">₹{grandTotal}</span>
@@ -425,13 +392,12 @@ export default function Dashboard() {
                 <p className="text-orange-100 text-xs mb-4">
                   * Final bill may include service charges & taxes
                 </p>
-                <button
-                  onClick={() => clearTable(selectedTable.id)}
-                  disabled={clearing}
+                <button onClick={() => clearTable(selectedTable.id)} disabled={clearing}
                   className="w-full bg-white text-orange-500 py-3 rounded-xl font-bold hover:bg-orange-50 transition text-sm disabled:opacity-50">
                   {clearing ? '⏳ Processing...' : '✅ Mark as Paid & Clear Table'}
                 </button>
               </div>
+
             </div>
           )}
         </div>
