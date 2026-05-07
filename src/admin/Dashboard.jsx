@@ -13,14 +13,23 @@ const toISTDate = (d) => new Date(d).toLocaleDateString('en-IN', {
 const playSound = () => {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)()
-    const o = ctx.createOscillator()
-    const g = ctx.createGain()
-    o.connect(g)
-    g.connect(ctx.destination)
-    o.frequency.value = 880
-    g.gain.value = 0.3
-    o.start()
-    setTimeout(() => { g.gain.setTargetAtTime(0, ctx.currentTime, 0.1); o.stop(ctx.currentTime + 0.3) }, 200)
+
+    const bell = (startTime) => {
+      const o = ctx.createOscillator()
+      const g = ctx.createGain()
+      o.connect(g)
+      g.connect(ctx.destination)
+      o.type = 'sine'
+      o.frequency.value = 880
+      g.gain.setValueAtTime(0.4, startTime)
+      g.gain.exponentialRampToValueAtTime(0.001, startTime + 0.8)
+      o.start(startTime)
+      o.stop(startTime + 0.8)
+    }
+
+    // Ting - Ting (two bells with gap)
+    bell(ctx.currentTime)
+    bell(ctx.currentTime + 0.5)
   } catch (e) {}
 }
 
@@ -29,11 +38,13 @@ export default function Dashboard() {
   const [orders, setOrders] = useState([])
   const [selectedTable, setSelectedTable] = useState(null)
   const [newOrderTables, setNewOrderTables] = useState(new Set())
+  const [newOrderIds, setNewOrderIds] = useState(new Set()) // track new order IDs
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [loading, setLoading] = useState(true)
   const [clearing, setClearing] = useState(false)
   const [showClearAllConfirm, setShowClearAllConfirm] = useState(false)
   const prevOrderIds = useRef(new Set())
+  const isFirstLoad = useRef(true)
   const navigate = useNavigate()
 
   const fetchAll = async () => {
@@ -57,16 +68,27 @@ export default function Dashboard() {
 
     if (ordersData) {
       const addedTableIds = new Set()
+      const addedOrderIds = new Set()
+
       ordersData.forEach(o => {
-        if (!prevOrderIds.current.has(o.id) && prevOrderIds.current.size > 0) {
-          addedTableIds.add(o.table_id)
-          playSound()
+        if (!prevOrderIds.current.has(o.id)) {
+          if (!isFirstLoad.current) {
+            // New order detected — flag it
+            addedTableIds.add(o.table_id)
+            addedOrderIds.add(o.id)
+          }
         }
       })
-      if (addedTableIds.size > 0) {
+
+      // Play sound for any new orders (including first order on a table)
+      if (addedOrderIds.size > 0) {
+        playSound()
         setNewOrderTables(prev => new Set([...prev, ...addedTableIds]))
+        setNewOrderIds(prev => new Set([...prev, ...addedOrderIds]))
       }
+
       prevOrderIds.current = new Set(ordersData.map(o => o.id))
+      isFirstLoad.current = false
       setOrders(ordersData)
     }
     setLoading(false)
@@ -84,30 +106,28 @@ export default function Dashboard() {
 
   const selectTable = (table) => {
     setSelectedTable(table)
-    setNewOrderTables(prev => { const n = new Set(prev); n.delete(table.id); return n })
+    // Remove table highlight when selected
+    setNewOrderTables(prev => {
+      const n = new Set(prev)
+      n.delete(table.id)
+      return n
+    })
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
-  // ── Core clear function — wipes orders + sessions + increments version
   const nukeClearTable = async (tableId) => {
     try {
-      // 1. Get all order IDs
       const { data: ords } = await supabase
         .from('orders').select('id').eq('table_id', tableId)
 
-      // 2. Delete order items first
       if (ords && ords.length > 0) {
         await supabase.from('order_items')
           .delete().in('order_id', ords.map(o => o.id))
       }
 
-      // 3. Delete orders
       await supabase.from('orders').delete().eq('table_id', tableId)
-
-      // 4. Delete session — so next scanner gets fresh access
       await supabase.from('table_sessions').delete().eq('table_id', tableId)
 
-      // 5. Increment version — this resets all customer phones
       const { data: tbl } = await supabase
         .from('tables').select('session_version').eq('id', tableId).single()
       await supabase.from('tables')
@@ -120,18 +140,21 @@ export default function Dashboard() {
     }
   }
 
-  // Clear single table
   const clearTable = async (tableId) => {
     if (!window.confirm('Mark as paid and clear this table?')) return
     setClearing(true)
-    const ok = await nukeClearTable(tableId)
-    if (!ok) alert('Something went wrong. Try again.')
+    await nukeClearTable(tableId)
+    // Clear new order flags for this table
+    setNewOrderIds(prev => {
+      const n = new Set(prev)
+      orders.filter(o => o.table_id === tableId).forEach(o => n.delete(o.id))
+      return n
+    })
     if (selectedTable?.id === tableId) setSelectedTable(null)
     setClearing(false)
     fetchAll()
   }
 
-  // Clear ALL active tables
   const clearAllTables = async () => {
     setShowClearAllConfirm(false)
     setClearing(true)
@@ -139,14 +162,15 @@ export default function Dashboard() {
     for (const table of activeTables) {
       await nukeClearTable(table.id)
     }
+    setNewOrderIds(new Set())
+    setNewOrderTables(new Set())
     setSelectedTable(null)
     setClearing(false)
     fetchAll()
   }
 
-  // Delete table permanently (removes QR reference too)
   const deleteTable = async (tableId, tableName) => {
-    if (!window.confirm(`Permanently DELETE table "${tableName}"? The QR code for this table will stop working.`)) return
+    if (!window.confirm(`Permanently DELETE table "${tableName}"?\nThe QR code will stop working.`)) return
     setClearing(true)
     await nukeClearTable(tableId)
     await supabase.from('tables').delete().eq('id', tableId)
@@ -245,7 +269,9 @@ export default function Dashboard() {
             </div>
 
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
-              {loading && <p className="text-xs text-gray-400 text-center py-4">Loading...</p>}
+              {loading && (
+                <p className="text-xs text-gray-400 text-center py-4">Loading...</p>
+              )}
 
               {!loading && activeTables.length === 0 && (
                 <div className="text-center py-8 text-gray-400">
@@ -257,8 +283,13 @@ export default function Dashboard() {
               {activeTables.map(table => {
                 const isNew = newOrderTables.has(table.id)
                 const isSelected = selectedTable?.id === table.id
-                const count = orders.filter(o => o.table_id === table.id).length
-                const latest = orders.find(o => o.table_id === table.id)
+                const tableOrderList = orders.filter(o => o.table_id === table.id)
+                const count = tableOrderList.length
+                const latest = tableOrderList[0]
+
+                // Count new unread orders for this table
+                const newCount = tableOrderList.filter(o => newOrderIds.has(o.id)).length
+
                 return (
                   <button key={table.id} onClick={() => selectTable(table)}
                     className={`w-full text-left px-4 py-3 rounded-xl transition-all border
@@ -269,9 +300,9 @@ export default function Dashboard() {
                           : 'bg-gray-50 text-gray-700 border-gray-100 hover:bg-orange-50'}`}>
                     <div className="flex justify-between items-center">
                       <span className="font-semibold text-sm">{table.table_name}</span>
-                      {isNew && !isSelected && (
+                      {newCount > 0 && !isSelected && (
                         <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-bold">
-                          New!
+                          {newCount} New!
                         </span>
                       )}
                     </div>
@@ -330,11 +361,15 @@ export default function Dashboard() {
                     </p>
                   </div>
                   <div className="flex gap-2 flex-wrap">
-                    <button onClick={() => clearTable(selectedTable.id)} disabled={clearing}
+                    <button
+                      onClick={() => clearTable(selectedTable.id)}
+                      disabled={clearing}
                       className="bg-green-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-green-600 transition disabled:opacity-50">
                       {clearing ? '⏳...' : '✅ Mark Paid & Clear'}
                     </button>
-                    <button onClick={() => deleteTable(selectedTable.id, selectedTable.table_name)} disabled={clearing}
+                    <button
+                      onClick={() => deleteTable(selectedTable.id, selectedTable.table_name)}
+                      disabled={clearing}
                       className="bg-red-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-red-600 transition disabled:opacity-50">
                       {clearing ? '⏳...' : '💥 Delete Table'}
                     </button>
@@ -344,43 +379,56 @@ export default function Dashboard() {
 
               {/* Order Rounds */}
               <div className="space-y-4 mb-4">
-                {groupedByOrder.map((order, index) => (
-                  <div key={order.id}
-                    className={`bg-white rounded-2xl shadow p-5
-                      ${index === 0 ? 'border-2 border-orange-400' : 'border border-gray-100'}`}>
-                    <div className="flex justify-between items-center mb-3">
-                      <div className="flex items-center gap-2">
-                        <span className="bg-orange-100 text-orange-600 text-xs font-bold px-3 py-1 rounded-full">
-                          Round {groupedByOrder.length - index}
-                        </span>
-                        {index === 0 && (
-                          <span className="bg-green-100 text-green-600 text-xs font-bold px-3 py-1 rounded-full">
-                            Latest ✨
-                          </span>
-                        )}
-                      </div>
-                      <span className="text-xs text-gray-400 font-medium">
-                        🕐 {toIST(order.created_at)}
-                      </span>
-                    </div>
+                {groupedByOrder.map((order, index) => {
+                  const isNewOrder = newOrderIds.has(order.id)
+                  return (
+                    <div key={order.id}
+                      className={`bg-white rounded-2xl shadow p-5 transition-all
+                        ${isNewOrder
+                          ? 'border-2 border-yellow-400 bg-yellow-50'
+                          : index === 0
+                            ? 'border-2 border-orange-400'
+                            : 'border border-gray-100'}`}>
 
-                    <div className="space-y-3">
-                      {order.items.map((item, i) => (
-                        <div key={i} className="py-2 border-b border-gray-50 last:border-0">
-                          <div className="flex justify-between text-sm text-gray-700">
-                            <span className="font-medium">{item.food_items?.name}</span>
-                            <span className="text-gray-500">× {item.quantity}</span>
-                          </div>
-                          {item.note && item.note.trim() !== '' && (
-                            <p className="text-xs text-orange-500 italic mt-1">
-                              📝 "{item.note}"
-                            </p>
+                      <div className="flex justify-between items-center mb-3">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="bg-orange-100 text-orange-600 text-xs font-bold px-3 py-1 rounded-full">
+                            Round {groupedByOrder.length - index}
+                          </span>
+                          {isNewOrder && (
+                            <span className="bg-yellow-400 text-yellow-900 text-xs font-bold px-3 py-1 rounded-full animate-pulse">
+                              🆕 New Order!
+                            </span>
+                          )}
+                          {!isNewOrder && index === 0 && (
+                            <span className="bg-green-100 text-green-600 text-xs font-bold px-3 py-1 rounded-full">
+                              Latest ✨
+                            </span>
                           )}
                         </div>
-                      ))}
+                        <span className="text-xs text-gray-400 font-medium">
+                          🕐 {toIST(order.created_at)}
+                        </span>
+                      </div>
+
+                      <div className="space-y-3">
+                        {order.items.map((item, i) => (
+                          <div key={i} className="py-2 border-b border-gray-50 last:border-0">
+                            <div className="flex justify-between text-sm text-gray-700">
+                              <span className="font-medium">{item.food_items?.name}</span>
+                              <span className="text-gray-500">× {item.quantity}</span>
+                            </div>
+                            {item.note && item.note.trim() !== '' && (
+                              <p className="text-xs text-orange-500 italic mt-1">
+                                📝 "{item.note}"
+                              </p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
 
               {/* Grand Total */}
@@ -392,7 +440,9 @@ export default function Dashboard() {
                 <p className="text-orange-100 text-xs mb-4">
                   * Final bill may include service charges & taxes
                 </p>
-                <button onClick={() => clearTable(selectedTable.id)} disabled={clearing}
+                <button
+                  onClick={() => clearTable(selectedTable.id)}
+                  disabled={clearing}
                   className="w-full bg-white text-orange-500 py-3 rounded-xl font-bold hover:bg-orange-50 transition text-sm disabled:opacity-50">
                   {clearing ? '⏳ Processing...' : '✅ Mark as Paid & Clear Table'}
                 </button>
