@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 
@@ -10,44 +10,61 @@ const toISTDate = (d) => new Date(d).toLocaleDateString('en-IN', {
   timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric'
 })
 
-const playSound = () => {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)()
-
-    const bell = (startTime) => {
-      const o = ctx.createOscillator()
-      const g = ctx.createGain()
-      o.connect(g)
-      g.connect(ctx.destination)
-      o.type = 'sine'
-      o.frequency.value = 880
-      g.gain.setValueAtTime(0.4, startTime)
-      g.gain.exponentialRampToValueAtTime(0.001, startTime + 0.8)
-      o.start(startTime)
-      o.stop(startTime + 0.8)
-    }
-
-    // Ting - Ting (two bells with gap)
-    bell(ctx.currentTime)
-    bell(ctx.currentTime + 0.5)
-  } catch (e) {}
-}
-
 export default function Dashboard() {
   const [tables, setTables] = useState([])
   const [orders, setOrders] = useState([])
   const [selectedTable, setSelectedTable] = useState(null)
   const [newOrderTables, setNewOrderTables] = useState(new Set())
-  const [newOrderIds, setNewOrderIds] = useState(new Set()) // track new order IDs
+  const [newOrderIds, setNewOrderIds] = useState(new Set())
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [loading, setLoading] = useState(true)
   const [clearing, setClearing] = useState(false)
   const [showClearAllConfirm, setShowClearAllConfirm] = useState(false)
+  const [soundReady, setSoundReady] = useState(false)
+  const [sessionStart] = useState(() => new Date().toISOString())
+
   const prevOrderIds = useRef(new Set())
-  const isFirstLoad = useRef(true)
+  const audioCtxRef = useRef(null)
   const navigate = useNavigate()
 
-  const fetchAll = async () => {
+  // ── Sound setup ───────────────────────────────────────────
+  const initAudio = () => {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)()
+    }
+    if (audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume()
+    }
+    setSoundReady(true)
+  }
+
+  const playTingTing = useCallback(() => {
+    try {
+      if (!audioCtxRef.current) return
+      const ctx = audioCtxRef.current
+
+      const bell = (startTime, freq = 880) => {
+        const o = ctx.createOscillator()
+        const g = ctx.createGain()
+        o.connect(g)
+        g.connect(ctx.destination)
+        o.type = 'sine'
+        o.frequency.value = freq
+        g.gain.setValueAtTime(0.5, startTime)
+        g.gain.exponentialRampToValueAtTime(0.001, startTime + 1.0)
+        o.start(startTime)
+        o.stop(startTime + 1.0)
+      }
+
+      bell(ctx.currentTime, 880)
+      bell(ctx.currentTime + 0.6, 1100)
+    } catch (e) {
+      console.log('Sound error:', e)
+    }
+  }, [])
+
+  // ── Fetch all data ────────────────────────────────────────
+  const fetchAll = useCallback(async () => {
     const { data: tablesData } = await supabase
       .from('tables').select('*').order('created_at')
     setTables(tablesData || [])
@@ -57,64 +74,54 @@ export default function Dashboard() {
       .select(`
         *,
         tables(table_name),
-        order_items(
-          quantity,
-          price_at_order,
-          note,
-          food_items(name)
-        )
+        order_items(quantity, price_at_order, note, food_items(name))
       `)
       .order('created_at', { ascending: false })
 
     if (ordersData) {
-      const addedTableIds = new Set()
       const addedOrderIds = new Set()
+      const addedTableIds = new Set()
 
       ordersData.forEach(o => {
         if (!prevOrderIds.current.has(o.id)) {
-          if (!isFirstLoad.current) {
-            // New order detected — flag it
-            addedTableIds.add(o.table_id)
+          // Only flag as new if order was placed AFTER dashboard opened
+          if (o.created_at > sessionStart) {
             addedOrderIds.add(o.id)
+            addedTableIds.add(o.table_id)
           }
         }
       })
 
-      // Play sound for any new orders (including first order on a table)
       if (addedOrderIds.size > 0) {
-        playSound()
-        setNewOrderTables(prev => new Set([...prev, ...addedTableIds]))
         setNewOrderIds(prev => new Set([...prev, ...addedOrderIds]))
+        setNewOrderTables(prev => new Set([...prev, ...addedTableIds]))
+        playTingTing()
       }
 
       prevOrderIds.current = new Set(ordersData.map(o => o.id))
-      isFirstLoad.current = false
       setOrders(ordersData)
     }
     setLoading(false)
-  }
+  }, [sessionStart, playTingTing])
 
   useEffect(() => {
     fetchAll()
-    const poll = setInterval(fetchAll, 5000)
+    const poll = setInterval(fetchAll, 4000)
     const sub = supabase.channel('db-changes')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'orders' }, fetchAll)
       .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'orders' }, fetchAll)
       .subscribe()
     return () => { clearInterval(poll); supabase.removeChannel(sub) }
-  }, [])
+  }, [fetchAll])
 
+  // ── Table selection ───────────────────────────────────────
   const selectTable = (table) => {
     setSelectedTable(table)
-    // Remove table highlight when selected
-    setNewOrderTables(prev => {
-      const n = new Set(prev)
-      n.delete(table.id)
-      return n
-    })
+    setNewOrderTables(prev => { const n = new Set(prev); n.delete(table.id); return n })
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
+  // ── Nuke clear ────────────────────────────────────────────
   const nukeClearTable = async (tableId) => {
     try {
       const { data: ords } = await supabase
@@ -144,7 +151,6 @@ export default function Dashboard() {
     if (!window.confirm('Mark as paid and clear this table?')) return
     setClearing(true)
     await nukeClearTable(tableId)
-    // Clear new order flags for this table
     setNewOrderIds(prev => {
       const n = new Set(prev)
       orders.filter(o => o.table_id === tableId).forEach(o => n.delete(o.id))
@@ -158,10 +164,8 @@ export default function Dashboard() {
   const clearAllTables = async () => {
     setShowClearAllConfirm(false)
     setClearing(true)
-    const activeTables = tables.filter(t => orders.some(o => o.table_id === t.id))
-    for (const table of activeTables) {
-      await nukeClearTable(table.id)
-    }
+    const active = tables.filter(t => orders.some(o => o.table_id === t.id))
+    for (const table of active) await nukeClearTable(table.id)
     setNewOrderIds(new Set())
     setNewOrderTables(new Set())
     setSelectedTable(null)
@@ -170,7 +174,7 @@ export default function Dashboard() {
   }
 
   const deleteTable = async (tableId, tableName) => {
-    if (!window.confirm(`Permanently DELETE table "${tableName}"?\nThe QR code will stop working.`)) return
+    if (!window.confirm(`Permanently DELETE "${tableName}"?\nQR code will stop working.`)) return
     setClearing(true)
     await nukeClearTable(tableId)
     await supabase.from('tables').delete().eq('id', tableId)
@@ -188,15 +192,23 @@ export default function Dashboard() {
     ? orders.filter(o => o.table_id === selectedTable.id)
     : []
 
-  const allItems = tableOrders.flatMap(o => (o.order_items || []))
+  const allItems = tableOrders.flatMap(o => o.order_items || [])
   const groupedByOrder = tableOrders.map(o => ({ ...o, items: o.order_items || [] }))
   const grandTotal = allItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
   const activeTables = tables.filter(t => orders.some(o => o.table_id === t.id))
 
   return (
-    <div className="min-h-screen bg-gray-100 flex flex-col">
+    <div className="min-h-screen bg-gray-100 flex flex-col" onClick={initAudio}>
 
-      {/* Clear All Confirm Modal */}
+      {/* Sound activation hint */}
+      {!soundReady && (
+        <div className="bg-orange-500 text-white text-center text-xs py-1.5 cursor-pointer"
+          onClick={initAudio}>
+          🔔 Tap anywhere to enable sound notifications
+        </div>
+      )}
+
+      {/* Clear All Modal */}
       {showClearAllConfirm && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl">
@@ -269,9 +281,7 @@ export default function Dashboard() {
             </div>
 
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
-              {loading && (
-                <p className="text-xs text-gray-400 text-center py-4">Loading...</p>
-              )}
+              {loading && <p className="text-xs text-gray-400 text-center py-4">Loading...</p>}
 
               {!loading && activeTables.length === 0 && (
                 <div className="text-center py-8 text-gray-400">
@@ -286,8 +296,6 @@ export default function Dashboard() {
                 const tableOrderList = orders.filter(o => o.table_id === table.id)
                 const count = tableOrderList.length
                 const latest = tableOrderList[0]
-
-                // Count new unread orders for this table
                 const newCount = tableOrderList.filter(o => newOrderIds.has(o.id)).length
 
                 return (
@@ -296,7 +304,7 @@ export default function Dashboard() {
                       ${isSelected
                         ? 'bg-orange-500 text-white border-orange-500 shadow-md'
                         : isNew
-                          ? 'bg-yellow-400 text-yellow-900 border-yellow-400 animate-pulse'
+                          ? 'bg-yellow-400 text-yellow-900 border-yellow-500 animate-pulse'
                           : 'bg-gray-50 text-gray-700 border-gray-100 hover:bg-orange-50'}`}>
                     <div className="flex justify-between items-center">
                       <span className="font-semibold text-sm">{table.table_name}</span>
@@ -317,7 +325,7 @@ export default function Dashboard() {
             </div>
 
             <div className="p-3 border-t text-center">
-              <p className="text-xs text-gray-300">Auto-refreshes every 5s</p>
+              <p className="text-xs text-gray-300">Auto-refreshes every 4s</p>
             </div>
           </div>
         </div>
@@ -361,15 +369,11 @@ export default function Dashboard() {
                     </p>
                   </div>
                   <div className="flex gap-2 flex-wrap">
-                    <button
-                      onClick={() => clearTable(selectedTable.id)}
-                      disabled={clearing}
+                    <button onClick={() => clearTable(selectedTable.id)} disabled={clearing}
                       className="bg-green-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-green-600 transition disabled:opacity-50">
                       {clearing ? '⏳...' : '✅ Mark Paid & Clear'}
                     </button>
-                    <button
-                      onClick={() => deleteTable(selectedTable.id, selectedTable.table_name)}
-                      disabled={clearing}
+                    <button onClick={() => deleteTable(selectedTable.id, selectedTable.table_name)} disabled={clearing}
                       className="bg-red-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-red-600 transition disabled:opacity-50">
                       {clearing ? '⏳...' : '💥 Delete Table'}
                     </button>
@@ -383,21 +387,19 @@ export default function Dashboard() {
                   const isNewOrder = newOrderIds.has(order.id)
                   return (
                     <div key={order.id}
-                      className={`bg-white rounded-2xl shadow p-5 transition-all
+                      className={`rounded-2xl shadow p-5 transition-all
                         ${isNewOrder
-                          ? 'border-2 border-yellow-400 bg-yellow-50'
-                          : index === 0
-                            ? 'border-2 border-orange-400'
-                            : 'border border-gray-100'}`}>
+                          ? 'bg-yellow-50 border-2 border-yellow-400'
+                          : 'bg-white border border-gray-100'}`}>
 
-                      <div className="flex justify-between items-center mb-3">
+                      <div className="flex justify-between items-center mb-3 flex-wrap gap-2">
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="bg-orange-100 text-orange-600 text-xs font-bold px-3 py-1 rounded-full">
                             Round {groupedByOrder.length - index}
                           </span>
                           {isNewOrder && (
                             <span className="bg-yellow-400 text-yellow-900 text-xs font-bold px-3 py-1 rounded-full animate-pulse">
-                              🆕 New Order!
+                              🆕 New!
                             </span>
                           )}
                           {!isNewOrder && index === 0 && (
@@ -440,9 +442,7 @@ export default function Dashboard() {
                 <p className="text-orange-100 text-xs mb-4">
                   * Final bill may include service charges & taxes
                 </p>
-                <button
-                  onClick={() => clearTable(selectedTable.id)}
-                  disabled={clearing}
+                <button onClick={() => clearTable(selectedTable.id)} disabled={clearing}
                   className="w-full bg-white text-orange-500 py-3 rounded-xl font-bold hover:bg-orange-50 transition text-sm disabled:opacity-50">
                   {clearing ? '⏳ Processing...' : '✅ Mark as Paid & Clear Table'}
                 </button>
