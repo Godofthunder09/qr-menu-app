@@ -67,12 +67,10 @@ export default function MenuPage() {
     const saved = localStorage.getItem(SESSION_KEY)
     if (saved) {
       const parsed = JSON.parse(saved)
-      // Check if version matches — if not, session is expired
       if (parsed.version === tbl.session_version) {
         setPinVerified(true)
         setPinPhase(false)
       } else {
-        // Version changed = admin cleared = force re-pin
         localStorage.removeItem(SESSION_KEY)
         setPinVerified(false)
         setPinPhase(true)
@@ -81,14 +79,20 @@ export default function MenuPage() {
       setPinPhase(true)
     }
 
-    // Load menu data
+    // ✅ FIX 1: Only fetch top-level categories (exclude subcategories)
     const { data: cats } = await supabase
-      .from('categories').select('*').order('created_at')
+      .from('categories')
+      .select('*')
+      .eq('is_subcategory', false)
+      .order('created_at')
     setCategories(cats || [])
 
+    // ✅ FIX 2: Use explicit FK hints to match MenuManager's insert structure
     const { data: items } = await supabase
-      .from('food_items').select('*, categories(name)')
-      .eq('is_available', true).order('created_at')
+      .from('food_items')
+      .select('*, categories!food_items_category_id_fkey(name), subcategory:categories!food_items_subcategory_id_fkey(name)')
+      .eq('is_available', true)
+      .order('created_at')
     setFoodItems(items || [])
 
     setLoading(false)
@@ -108,7 +112,6 @@ export default function MenuPage() {
 
     const parsed = JSON.parse(saved)
     if (parsed.version !== tbl.session_version) {
-      // Admin cleared session — kick customer back to PIN screen
       localStorage.removeItem(SESSION_KEY)
       setCart([])
       setPinVerified(false)
@@ -133,7 +136,6 @@ export default function MenuPage() {
     }
 
     if (pinInput === tbl.pin) {
-      // Save session with current version
       localStorage.setItem(SESSION_KEY, JSON.stringify({
         version: tbl.session_version,
         tableId,
@@ -548,7 +550,7 @@ export default function MenuPage() {
       {totalItems > 0 && !showCart && (
         <div className="fixed bottom-0 left-0 right-0 p-4 bg-white border-t shadow-lg">
           <button onClick={() => setShowCart(true)}
-            className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg flex justify-between px-6">
+            className="w-full bg-orange-500 text-white py-4 rounded-2xl flex justify-between px-6 font-bold text-lg">
             <span>🛒 {totalItems} items</span>
             <span>View Cart →</span>
           </button>
