@@ -3,12 +3,15 @@ import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 import { QRCodeCanvas } from 'qrcode.react'
 
+const generatePin = () => String(Math.floor(1000 + Math.random() * 9000))
+
 export default function TableManager() {
   const [tables, setTables] = useState([])
   const [tableName, setTableName] = useState('')
   const [loading, setLoading] = useState(false)
   const [deleting, setDeleting] = useState(null)
   const [message, setMessage] = useState('')
+  const [showPin, setShowPin] = useState({})
   const navigate = useNavigate()
 
   const fetchTables = async () => {
@@ -16,19 +19,19 @@ export default function TableManager() {
     setTables(data || [])
   }
 
-  useEffect(() => {
-    fetchTables()
-  }, [])
+  useEffect(() => { fetchTables() }, [])
 
   const addTable = async () => {
     if (!tableName.trim()) { alert('Enter table name!'); return }
     if (tables.length >= 10) { alert('Beta limit: max 10 tables!'); return }
     setLoading(true)
 
+    const pin = generatePin()
     const { error } = await supabase.from('tables').insert({
       table_name: tableName.trim(),
       is_active: true,
-      session_version: 1
+      session_version: 1,
+      pin
     })
 
     if (error) { alert('Error: ' + error.message); setLoading(false); return }
@@ -40,47 +43,39 @@ export default function TableManager() {
     fetchTables()
   }
 
+  const regeneratePin = async (tableId) => {
+    const newPin = generatePin()
+    await supabase.from('tables').update({ pin: newPin }).eq('id', tableId)
+    setMessage('New PIN generated! ✅')
+    setTimeout(() => setMessage(''), 2000)
+    fetchTables()
+  }
+
   const deleteTable = async (table) => {
     if (!window.confirm(
-      `Delete "${table.table_name}" permanently?\n\nThis will delete:\n• All orders for this table\n• All order items\n• The session\n• The QR code will stop working`
+      `Delete "${table.table_name}" permanently?\n\nThis will delete:\n• All orders\n• All order items\n• The session\n• QR code stops working`
     )) return
 
     setDeleting(table.id)
-
     try {
-      // With cascade constraints, just deleting the table
-      // will automatically delete orders, order_items, sessions
-      const { error } = await supabase
-        .from('tables')
-        .delete()
-        .eq('id', table.id)
+      const { data: ords } = await supabase
+        .from('orders').select('id').eq('table_id', table.id)
 
-      if (error) {
-        // If cascade didn't work, manually delete
-        const { data: ords } = await supabase
-          .from('orders').select('id').eq('table_id', table.id)
-
-        if (ords && ords.length > 0) {
-          await supabase.from('order_items')
-            .delete().in('order_id', ords.map(o => o.id))
-          await supabase.from('orders')
-            .delete().eq('table_id', table.id)
-        }
-
-        await supabase.from('table_sessions')
-          .delete().eq('table_id', table.id)
-
-        await supabase.from('tables')
-          .delete().eq('id', table.id)
+      if (ords && ords.length > 0) {
+        await supabase.from('order_items')
+          .delete().in('order_id', ords.map(o => o.id))
+        await supabase.from('orders').delete().eq('table_id', table.id)
       }
 
-      setMessage(`"${table.table_name}" deleted successfully! ✅`)
+      await supabase.from('table_sessions').delete().eq('table_id', table.id)
+      await supabase.from('tables').delete().eq('id', table.id)
+
+      setMessage(`"${table.table_name}" deleted! ✅`)
       setTimeout(() => setMessage(''), 3000)
       fetchTables()
     } catch (err) {
-      alert('Error deleting table: ' + err.message)
+      alert('Error: ' + err.message)
     }
-
     setDeleting(null)
   }
 
@@ -94,9 +89,7 @@ export default function TableManager() {
     link.click()
   }
 
-  const getMenuUrl = (tableId) => {
-    return `${window.location.origin}/menu?table=${tableId}`
-  }
+  const getMenuUrl = (tableId) => `${window.location.origin}/menu?table=${tableId}`
 
   return (
     <div className="min-h-screen bg-orange-50">
@@ -115,7 +108,6 @@ export default function TableManager() {
 
       <div className="p-6 max-w-4xl mx-auto">
 
-        {/* Success Message */}
         {message && (
           <div className="bg-green-100 text-green-700 px-4 py-3 rounded-lg mb-4 text-sm font-medium">
             {message}
@@ -131,20 +123,18 @@ export default function TableManager() {
             <input
               type="text"
               value={tableName}
-              onChange={(e) => setTableName(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && addTable()}
+              onChange={e => setTableName(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && addTable()}
               placeholder="e.g. Table 1, Table A, VIP Table"
               className="flex-1 border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400"
             />
-            <button
-              onClick={addTable}
-              disabled={loading || tables.length >= 10}
+            <button onClick={addTable} disabled={loading || tables.length >= 10}
               className="bg-orange-500 text-white px-6 py-2 rounded-lg text-sm font-medium hover:bg-orange-600 disabled:opacity-50">
               {loading ? 'Adding...' : 'Add Table'}
             </button>
           </div>
           {tables.length >= 10 && (
-            <p className="text-red-400 text-xs mt-2">Beta limit reached. Max 10 tables.</p>
+            <p className="text-red-400 text-xs mt-2">Beta limit: max 10 tables.</p>
           )}
         </div>
 
@@ -157,13 +147,32 @@ export default function TableManager() {
             </div>
           )}
 
-          {tables.map((table) => (
+          {tables.map(table => (
             <div key={table.id} className="bg-white rounded-2xl shadow p-5 flex flex-col items-center">
 
-              {/* Table Name */}
-              <h3 className="font-bold text-lg text-orange-500 mb-4">
-                {table.table_name}
-              </h3>
+              <h3 className="font-bold text-lg text-orange-500 mb-2">{table.table_name}</h3>
+
+              {/* PIN Display */}
+              <div className="bg-orange-50 border border-orange-200 rounded-xl px-4 py-2 mb-4 flex items-center gap-3">
+                <div>
+                  <p className="text-xs text-gray-400 mb-0.5">Table PIN</p>
+                  <p className="text-2xl font-bold tracking-widest text-orange-600">
+                    {showPin[table.id] ? table.pin : '••••'}
+                  </p>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <button
+                    onClick={() => setShowPin(prev => ({ ...prev, [table.id]: !prev[table.id] }))}
+                    className="text-xs bg-white border border-gray-200 px-2 py-1 rounded-lg text-gray-500 hover:bg-gray-50">
+                    {showPin[table.id] ? '🙈 Hide' : '👁️ Show'}
+                  </button>
+                  <button
+                    onClick={() => regeneratePin(table.id)}
+                    className="text-xs bg-white border border-orange-200 px-2 py-1 rounded-lg text-orange-500 hover:bg-orange-50">
+                    🔄 New PIN
+                  </button>
+                </div>
+              </div>
 
               {/* QR Code */}
               <div className="bg-white p-3 rounded-xl border-2 border-orange-100 mb-4">
@@ -176,29 +185,23 @@ export default function TableManager() {
                 />
               </div>
 
-              {/* URL */}
               <p className="text-xs text-gray-400 text-center mb-4 break-all px-2">
                 {getMenuUrl(table.id)}
               </p>
 
-              {/* Buttons */}
               <div className="flex gap-2 w-full">
-                <button
-                  onClick={() => downloadQR(table.table_name, table.id)}
+                <button onClick={() => downloadQR(table.table_name, table.id)}
                   className="flex-1 bg-orange-500 text-white py-2 rounded-lg text-sm font-medium hover:bg-orange-600">
                   ⬇️ Download QR
                 </button>
-                <button
-                  onClick={() => deleteTable(table)}
-                  disabled={deleting === table.id}
+                <button onClick={() => deleteTable(table)} disabled={deleting === table.id}
                   className="bg-red-500 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-red-600 disabled:opacity-50">
-                  {deleting === table.id ? '⏳' : '🗑️ Delete'}
+                  {deleting === table.id ? '⏳' : '🗑️'}
                 </button>
               </div>
 
-              {/* Warning */}
               <p className="text-xs text-red-300 mt-2 text-center">
-                Deleting removes ALL orders and data for this table
+                Deleting removes ALL data for this table
               </p>
             </div>
           ))}

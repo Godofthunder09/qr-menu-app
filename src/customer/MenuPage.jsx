@@ -17,29 +17,71 @@ export default function MenuPage() {
   const [suggestions, setSuggestions] = useState([])
   const [zoomedImage, setZoomedImage] = useState(null)
   const [phase, setPhase] = useState('welcome')
+  const [pinPhase, setPinPhase] = useState(false)
+  const [pinInput, setPinInput] = useState('')
+  const [pinError, setPinError] = useState('')
+  const [pinVerified, setPinVerified] = useState(false)
+  const [tableVersion, setTableVersion] = useState(null)
   const [noteItem, setNoteItem] = useState(null)
   const [noteText, setNoteText] = useState('')
   const navigate = useNavigate()
 
+  const SESSION_KEY = `pin_session_${tableId}`
+
   // Welcome animation
   useEffect(() => {
     const t1 = setTimeout(() => setPhase('logo'), 2000)
-    const t2 = setTimeout(() => setPhase('menu'), 4000)
+    const t2 = setTimeout(() => {
+      setPhase('ready')
+    }, 4000)
     return () => { clearTimeout(t1); clearTimeout(t2) }
   }, [])
 
   useEffect(() => {
-    if (phase === 'menu' && tableId) init()
+    if (phase === 'ready' && tableId) init()
   }, [phase, tableId])
+
+  // Poll every 5s to detect session clear
+  useEffect(() => {
+    if (!tableId || !pinVerified) return
+    const t = setInterval(checkSessionValid, 5000)
+    return () => clearInterval(t)
+  }, [tableId, pinVerified])
 
   const init = async () => {
     setLoading(true)
 
     const { data: tbl } = await supabase
       .from('tables').select('*').eq('id', tableId).single()
-    if (!tbl) { setLoading(false); return }
-    setTableName(tbl.table_name)
 
+    if (!tbl) {
+      setLoading(false)
+      setPinPhase(true)
+      return
+    }
+
+    setTableName(tbl.table_name)
+    setTableVersion(tbl.session_version)
+
+    // Check if this device has a valid session
+    const saved = localStorage.getItem(SESSION_KEY)
+    if (saved) {
+      const parsed = JSON.parse(saved)
+      // Check if version matches — if not, session is expired
+      if (parsed.version === tbl.session_version) {
+        setPinVerified(true)
+        setPinPhase(false)
+      } else {
+        // Version changed = admin cleared = force re-pin
+        localStorage.removeItem(SESSION_KEY)
+        setPinVerified(false)
+        setPinPhase(true)
+      }
+    } else {
+      setPinPhase(true)
+    }
+
+    // Load menu data
     const { data: cats } = await supabase
       .from('categories').select('*').order('created_at')
     setCategories(cats || [])
@@ -50,6 +92,61 @@ export default function MenuPage() {
     setFoodItems(items || [])
 
     setLoading(false)
+  }
+
+  const checkSessionValid = async () => {
+    const { data: tbl } = await supabase
+      .from('tables').select('session_version').eq('id', tableId).single()
+    if (!tbl) return
+
+    const saved = localStorage.getItem(SESSION_KEY)
+    if (!saved) {
+      setPinVerified(false)
+      setPinPhase(true)
+      return
+    }
+
+    const parsed = JSON.parse(saved)
+    if (parsed.version !== tbl.session_version) {
+      // Admin cleared session — kick customer back to PIN screen
+      localStorage.removeItem(SESSION_KEY)
+      setCart([])
+      setPinVerified(false)
+      setPinInput('')
+      setPinError('')
+      setPinPhase(true)
+    }
+  }
+
+  const verifyPin = async () => {
+    if (pinInput.length !== 4) {
+      setPinError('Please enter 4 digit PIN')
+      return
+    }
+
+    const { data: tbl } = await supabase
+      .from('tables').select('*').eq('id', tableId).single()
+
+    if (!tbl) {
+      setPinError('Table not found. Please scan again.')
+      return
+    }
+
+    if (pinInput === tbl.pin) {
+      // Save session with current version
+      localStorage.setItem(SESSION_KEY, JSON.stringify({
+        version: tbl.session_version,
+        tableId,
+        enteredAt: new Date().toISOString()
+      }))
+      setTableVersion(tbl.session_version)
+      setPinVerified(true)
+      setPinPhase(false)
+      setPinError('')
+    } else {
+      setPinError('Wrong PIN. Please ask your waiter.')
+      setPinInput('')
+    }
   }
 
   const handleSearch = (q) => {
@@ -122,6 +219,7 @@ export default function MenuPage() {
   }
 
   // ── Screens ──────────────────────────────────────────────
+
   if (phase === 'welcome') return (
     <div className="min-h-screen bg-orange-500 flex items-center justify-center">
       <div className="text-center animate-pulse">
@@ -155,30 +253,89 @@ export default function MenuPage() {
     <div className="min-h-screen bg-orange-50 flex items-center justify-center">
       <div className="text-center">
         <div className="text-5xl mb-3">🍽️</div>
-        <p className="text-gray-400">Loading menu...</p>
+        <p className="text-gray-400">Loading...</p>
       </div>
     </div>
   )
 
-  // ── Main UI ──────────────────────────────────────────────
+  // ── PIN Entry Screen ─────────────────────────────────────
+  if (pinPhase && !pinVerified) return (
+    <div className="min-h-screen bg-orange-50 flex items-center justify-center px-4">
+      <div className="bg-white rounded-3xl shadow-lg p-8 w-full max-w-sm text-center">
+        <div className="text-5xl mb-4">🔐</div>
+        <h1 className="text-2xl font-bold text-gray-800 mb-1">Enter Table PIN</h1>
+        <p className="text-gray-400 text-sm mb-6">
+          Ask your waiter for the 4-digit PIN for <span className="font-semibold text-orange-500">{tableName}</span>
+        </p>
+
+        {/* PIN Input Boxes */}
+        <div className="flex justify-center gap-3 mb-4">
+          {[0, 1, 2, 3].map(i => (
+            <div key={i}
+              className={`w-14 h-14 rounded-xl border-2 flex items-center justify-center text-2xl font-bold
+                ${pinInput.length > i
+                  ? 'border-orange-500 bg-orange-50 text-orange-600'
+                  : 'border-gray-200 bg-gray-50 text-gray-300'}`}>
+              {pinInput[i] ? '●' : '○'}
+            </div>
+          ))}
+        </div>
+
+        {pinError && (
+          <p className="text-red-500 text-sm mb-4 font-medium">{pinError}</p>
+        )}
+
+        {/* Number Pad */}
+        <div className="grid grid-cols-3 gap-3 mb-4">
+          {[1,2,3,4,5,6,7,8,9].map(n => (
+            <button key={n}
+              onClick={() => {
+                if (pinInput.length < 4) setPinInput(prev => prev + n)
+              }}
+              className="bg-gray-100 hover:bg-orange-100 text-gray-800 font-bold text-xl py-4 rounded-xl transition">
+              {n}
+            </button>
+          ))}
+          <button
+            onClick={() => setPinInput(prev => prev.slice(0, -1))}
+            className="bg-gray-100 hover:bg-red-100 text-gray-600 font-bold py-4 rounded-xl transition text-sm">
+            ⌫
+          </button>
+          <button
+            onClick={() => {
+              if (pinInput.length < 4) setPinInput(prev => prev + '0')
+            }}
+            className="bg-gray-100 hover:bg-orange-100 text-gray-800 font-bold text-xl py-4 rounded-xl transition">
+            0
+          </button>
+          <button
+            onClick={verifyPin}
+            className="bg-orange-500 hover:bg-orange-600 text-white font-bold py-4 rounded-xl transition text-sm">
+            ✓ OK
+          </button>
+        </div>
+
+        <p className="text-xs text-gray-300">
+          🍽️ QR Menu System
+        </p>
+      </div>
+    </div>
+  )
+
+  // ── Main Menu UI ─────────────────────────────────────────
   return (
     <div className="min-h-screen bg-orange-50 pb-32">
 
       {/* Zoom Modal */}
       {zoomedImage && (
-        <div
-          className="fixed inset-0 z-50 bg-black bg-opacity-80 flex items-center justify-center p-4"
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-80 flex items-center justify-center p-4"
           onClick={() => setZoomedImage(null)}>
           <div className="relative max-w-lg w-full">
             <img src={zoomedImage} alt="zoom"
               className="w-full rounded-2xl object-contain max-h-96" />
             <button onClick={() => setZoomedImage(null)}
-              className="absolute top-2 right-2 bg-white rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg">
-              ×
-            </button>
-            <p className="text-white text-center text-xs mt-2 opacity-60">
-              Tap to close
-            </p>
+              className="absolute top-2 right-2 bg-white rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg">×</button>
+            <p className="text-white text-center text-xs mt-2 opacity-60">Tap to close</p>
           </div>
         </div>
       )}
@@ -197,19 +354,17 @@ export default function MenuPage() {
               className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 mb-4"
             />
             <div className="flex gap-3">
-              <button
-                onClick={() => { setNoteItem(null); setNoteText('') }}
+              <button onClick={() => { setNoteItem(null); setNoteText('') }}
                 className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium text-sm">
                 Cancel
               </button>
-              <button
-                onClick={() => {
-                  const inCart = cart.find(c => c.id === noteItem.id)
-                  if (inCart) updateNote(noteItem.id, noteText)
-                  else addToCart(noteItem, noteText)
-                  setNoteItem(null)
-                  setNoteText('')
-                }}
+              <button onClick={() => {
+                const inCart = cart.find(c => c.id === noteItem.id)
+                if (inCart) updateNote(noteItem.id, noteText)
+                else addToCart(noteItem, noteText)
+                setNoteItem(null)
+                setNoteText('')
+              }}
                 className="flex-1 bg-orange-500 text-white py-2 rounded-xl font-medium text-sm">
                 {cart.find(c => c.id === noteItem.id) ? 'Update Note' : 'Add to Cart'}
               </button>
@@ -238,13 +393,10 @@ export default function MenuPage() {
 
         {/* Search */}
         <div className="relative mb-3">
-          <input
-            type="text"
-            value={searchQuery}
+          <input type="text" value={searchQuery}
             onChange={e => handleSearch(e.target.value)}
             placeholder="🔍 Search food items..."
-            className="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50"
-          />
+            className="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50" />
           {suggestions.length > 0 && (
             <div className="absolute top-full left-0 right-0 bg-white border rounded-xl shadow-lg z-20 mt-1">
               {suggestions.map(item => (
@@ -261,21 +413,15 @@ export default function MenuPage() {
         {/* Category Tabs */}
         {!searchQuery && (
           <div className="flex gap-2 overflow-x-auto pb-1">
-            <button
-              onClick={() => setActiveCategory('all')}
+            <button onClick={() => setActiveCategory('all')}
               className={`px-4 py-1 rounded-full text-sm font-medium whitespace-nowrap
-                ${activeCategory === 'all'
-                  ? 'bg-orange-500 text-white'
-                  : 'bg-orange-100 text-orange-600'}`}>
+                ${activeCategory === 'all' ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
               All
             </button>
             {categories.map(cat => (
-              <button key={cat.id}
-                onClick={() => setActiveCategory(cat.id)}
+              <button key={cat.id} onClick={() => setActiveCategory(cat.id)}
                 className={`px-4 py-1 rounded-full text-sm font-medium whitespace-nowrap
-                  ${activeCategory === cat.id
-                    ? 'bg-orange-500 text-white'
-                    : 'bg-orange-100 text-orange-600'}`}>
+                  ${activeCategory === cat.id ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
                 {cat.name}
               </button>
             ))}
@@ -301,9 +447,7 @@ export default function MenuPage() {
                 ? <img src={item.image_url} alt={item.name}
                     onClick={() => setZoomedImage(item.image_url)}
                     className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer hover:opacity-90 transition" />
-                : <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">
-                    🍴
-                  </div>
+                : <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">🍴</div>
               }
               <div className="flex-1">
                 <h3 className="font-semibold text-gray-800">{item.name}</h3>
@@ -313,9 +457,7 @@ export default function MenuPage() {
                 <p className="text-orange-500 font-bold mt-1">₹{item.price}</p>
 
                 {cartItem?.note && (
-                  <p className="text-xs text-orange-400 italic mt-1">
-                    📝 "{cartItem.note}"
-                  </p>
+                  <p className="text-xs text-orange-400 italic mt-1">📝 "{cartItem.note}"</p>
                 )}
 
                 <div className="mt-2 flex items-center gap-2 flex-wrap">
@@ -325,8 +467,7 @@ export default function MenuPage() {
                         className="bg-orange-500 text-white px-4 py-1 rounded-full text-sm font-medium hover:bg-orange-600">
                         + Add
                       </button>
-                      <button
-                        onClick={() => { setNoteItem(item); setNoteText('') }}
+                      <button onClick={() => { setNoteItem(item); setNoteText('') }}
                         className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
                         📝 Customize
                       </button>
@@ -335,20 +476,12 @@ export default function MenuPage() {
                     <>
                       <div className="flex items-center gap-2">
                         <button onClick={() => updateQty(item.id, qty - 1)}
-                          className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">
-                          −
-                        </button>
+                          className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
                         <span className="font-semibold">{qty}</span>
                         <button onClick={() => updateQty(item.id, qty + 1)}
-                          className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">
-                          +
-                        </button>
+                          className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
                       </div>
-                      <button
-                        onClick={() => {
-                          setNoteItem(item)
-                          setNoteText(cartItem?.note || '')
-                        }}
+                      <button onClick={() => { setNoteItem(item); setNoteText(cartItem?.note || '') }}
                         className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
                         📝 {cartItem?.note ? 'Edit Note' : 'Add Note'}
                       </button>
@@ -370,7 +503,6 @@ export default function MenuPage() {
               <button onClick={() => setShowCart(false)}
                 className="text-gray-400 text-2xl font-bold">×</button>
             </div>
-
             <div className="space-y-3 mb-4">
               {cart.map(item => (
                 <div key={item.id} className="border-b pb-3">
@@ -378,43 +510,33 @@ export default function MenuPage() {
                     <div className="flex-1">
                       <p className="font-medium text-gray-700">{item.name}</p>
                       {item.note && (
-                        <p className="text-xs text-orange-500 italic mt-0.5">
-                          📝 "{item.note}"
-                        </p>
+                        <p className="text-xs text-orange-500 italic mt-0.5">📝 "{item.note}"</p>
                       )}
                     </div>
                     <div className="flex items-center gap-2">
                       <button onClick={() => updateQty(item.id, item.quantity - 1)}
-                        className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">
-                        −
-                      </button>
-                      <span className="font-semibold w-4 text-center">
-                        {item.quantity}
-                      </span>
+                        className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
+                      <span className="font-semibold w-4 text-center">{item.quantity}</span>
                       <button onClick={() => updateQty(item.id, item.quantity + 1)}
-                        className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">
-                        +
-                      </button>
+                        className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
                       <button onClick={() => removeFromCart(item.id)}
                         className="text-red-400 text-sm ml-1">✕</button>
                     </div>
                   </div>
-                  <button
-                    onClick={() => {
-                      setNoteItem(item)
-                      setNoteText(item.note || '')
-                      setShowCart(false)
-                    }}
+                  <button onClick={() => {
+                    setNoteItem(item)
+                    setNoteText(item.note || '')
+                    setShowCart(false)
+                  }}
                     className="mt-1 text-xs text-orange-400 underline">
                     {item.note ? '✏️ Edit customization' : '📝 Add customization'}
                   </button>
                 </div>
               ))}
             </div>
-
             {cart.length > 0 && (
               <button onClick={placeOrder} disabled={placing}
-                className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg hover:bg-orange-600 disabled:opacity-50">
+                className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg disabled:opacity-50">
                 {placing ? 'Placing...' : '🍽️ Place Order'}
               </button>
             )}

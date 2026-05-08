@@ -10,6 +10,8 @@ const toISTDate = (d) => new Date(d).toLocaleDateString('en-IN', {
   timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric'
 })
 
+const generatePin = () => String(Math.floor(1000 + Math.random() * 9000))
+
 export default function Dashboard() {
   const [tables, setTables] = useState([])
   const [orders, setOrders] = useState([])
@@ -21,13 +23,14 @@ export default function Dashboard() {
   const [clearing, setClearing] = useState(false)
   const [showClearAllConfirm, setShowClearAllConfirm] = useState(false)
   const [soundReady, setSoundReady] = useState(false)
+  const [showPin, setShowPin] = useState({})
   const [sessionStart] = useState(() => new Date().toISOString())
 
   const prevOrderIds = useRef(new Set())
   const audioCtxRef = useRef(null)
   const navigate = useNavigate()
 
-  // ── Sound setup ───────────────────────────────────────────
+  // ── Sound ────────────────────────────────────────────────
   const initAudio = () => {
     if (!audioCtxRef.current) {
       audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)()
@@ -42,8 +45,7 @@ export default function Dashboard() {
     try {
       if (!audioCtxRef.current) return
       const ctx = audioCtxRef.current
-
-      const bell = (startTime, freq = 880) => {
+      const bell = (startTime, freq) => {
         const o = ctx.createOscillator()
         const g = ctx.createGain()
         o.connect(g)
@@ -55,15 +57,12 @@ export default function Dashboard() {
         o.start(startTime)
         o.stop(startTime + 1.0)
       }
-
       bell(ctx.currentTime, 880)
       bell(ctx.currentTime + 0.6, 1100)
-    } catch (e) {
-      console.log('Sound error:', e)
-    }
+    } catch (e) {}
   }, [])
 
-  // ── Fetch all data ────────────────────────────────────────
+  // ── Fetch ────────────────────────────────────────────────
   const fetchAll = useCallback(async () => {
     const { data: tablesData } = await supabase
       .from('tables').select('*').order('created_at')
@@ -71,11 +70,7 @@ export default function Dashboard() {
 
     const { data: ordersData } = await supabase
       .from('orders')
-      .select(`
-        *,
-        tables(table_name),
-        order_items(quantity, price_at_order, note, food_items(name))
-      `)
+      .select(`*, tables(table_name), order_items(quantity, price_at_order, note, food_items(name))`)
       .order('created_at', { ascending: false })
 
     if (ordersData) {
@@ -83,12 +78,9 @@ export default function Dashboard() {
       const addedTableIds = new Set()
 
       ordersData.forEach(o => {
-        if (!prevOrderIds.current.has(o.id)) {
-          // Only flag as new if order was placed AFTER dashboard opened
-          if (o.created_at > sessionStart) {
-            addedOrderIds.add(o.id)
-            addedTableIds.add(o.table_id)
-          }
+        if (!prevOrderIds.current.has(o.id) && o.created_at > sessionStart) {
+          addedOrderIds.add(o.id)
+          addedTableIds.add(o.table_id)
         }
       })
 
@@ -114,14 +106,20 @@ export default function Dashboard() {
     return () => { clearInterval(poll); supabase.removeChannel(sub) }
   }, [fetchAll])
 
-  // ── Table selection ───────────────────────────────────────
   const selectTable = (table) => {
     setSelectedTable(table)
     setNewOrderTables(prev => { const n = new Set(prev); n.delete(table.id); return n })
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
-  // ── Nuke clear ────────────────────────────────────────────
+  // ── Generate new PIN ─────────────────────────────────────
+  const generateNewPin = async (tableId) => {
+    const newPin = generatePin()
+    await supabase.from('tables').update({ pin: newPin }).eq('id', tableId)
+    return newPin
+  }
+
+  // ── Nuke clear ───────────────────────────────────────────
   const nukeClearTable = async (tableId) => {
     try {
       const { data: ords } = await supabase
@@ -135,11 +133,14 @@ export default function Dashboard() {
       await supabase.from('orders').delete().eq('table_id', tableId)
       await supabase.from('table_sessions').delete().eq('table_id', tableId)
 
+      // Increment version + generate new PIN
       const { data: tbl } = await supabase
         .from('tables').select('session_version').eq('id', tableId).single()
-      await supabase.from('tables')
-        .update({ session_version: (tbl?.session_version || 1) + 1 })
-        .eq('id', tableId)
+      const newPin = generatePin()
+      await supabase.from('tables').update({
+        session_version: (tbl?.session_version || 1) + 1,
+        pin: newPin
+      }).eq('id', tableId)
 
       return true
     } catch (err) {
@@ -148,7 +149,7 @@ export default function Dashboard() {
   }
 
   const clearTable = async (tableId) => {
-    if (!window.confirm('Mark as paid and clear this table?')) return
+    if (!window.confirm('Mark as paid and clear this table? A new PIN will be generated.')) return
     setClearing(true)
     await nukeClearTable(tableId)
     setNewOrderIds(prev => {
@@ -197,14 +198,18 @@ export default function Dashboard() {
   const grandTotal = allItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
   const activeTables = tables.filter(t => orders.some(o => o.table_id === t.id))
 
+  // Get PIN for selected table
+  const selectedTableData = tables.find(t => t.id === selectedTable?.id)
+  const currentPin = selectedTableData?.pin || '----'
+
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col" onClick={initAudio}>
 
-      {/* Sound activation hint */}
+      {/* Sound hint */}
       {!soundReady && (
-        <div className="bg-orange-500 text-white text-center text-xs py-1.5 cursor-pointer"
+        <div className="bg-orange-500 text-white text-center text-xs py-1.5 cursor-pointer font-medium"
           onClick={initAudio}>
-          🔔 Tap anywhere to enable sound notifications
+          🔔 Tap anywhere to enable order notification sounds
         </div>
       )}
 
@@ -214,8 +219,8 @@ export default function Dashboard() {
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl">
             <h2 className="text-xl font-bold text-red-500 mb-2">⚠️ Clear All Active Tables?</h2>
             <p className="text-gray-600 text-sm mb-4">
-              This will clear orders from all {activeTables.length} active tables.
-              Tables themselves will NOT be deleted.
+              This will clear orders from all {activeTables.length} active tables
+              and generate new PINs for each. Tables will NOT be deleted.
             </p>
             <div className="flex gap-3">
               <button onClick={() => setShowClearAllConfirm(false)}
@@ -282,14 +287,12 @@ export default function Dashboard() {
 
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
               {loading && <p className="text-xs text-gray-400 text-center py-4">Loading...</p>}
-
               {!loading && activeTables.length === 0 && (
                 <div className="text-center py-8 text-gray-400">
                   <div className="text-3xl mb-2">🪑</div>
                   <p className="text-xs">No active orders yet</p>
                 </div>
               )}
-
               {activeTables.map(table => {
                 const isNew = newOrderTables.has(table.id)
                 const isSelected = selectedTable?.id === table.id
@@ -297,7 +300,6 @@ export default function Dashboard() {
                 const count = tableOrderList.length
                 const latest = tableOrderList[0]
                 const newCount = tableOrderList.filter(o => newOrderIds.has(o.id)).length
-
                 return (
                   <button key={table.id} onClick={() => selectTable(table)}
                     className={`w-full text-left px-4 py-3 rounded-xl transition-all border
@@ -367,7 +369,24 @@ export default function Dashboard() {
                       {tableOrders.length} round(s) •{' '}
                       {tableOrders.length > 0 && toISTDate(tableOrders[tableOrders.length - 1].created_at)}
                     </p>
+
+                    {/* PIN Display */}
+                    <div className="mt-3 flex items-center gap-2">
+                      <span className="text-xs text-gray-500 font-medium">Current PIN:</span>
+                      <span className="bg-orange-100 text-orange-600 font-bold text-lg px-3 py-1 rounded-lg tracking-widest">
+                        {showPin[selectedTable.id] ? currentPin : '••••'}
+                      </span>
+                      <button
+                        onClick={() => setShowPin(prev => ({
+                          ...prev,
+                          [selectedTable.id]: !prev[selectedTable.id]
+                        }))}
+                        className="text-xs text-gray-400 underline">
+                        {showPin[selectedTable.id] ? 'Hide' : 'Show'}
+                      </button>
+                    </div>
                   </div>
+
                   <div className="flex gap-2 flex-wrap">
                     <button onClick={() => clearTable(selectedTable.id)} disabled={clearing}
                       className="bg-green-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-green-600 transition disabled:opacity-50">
@@ -391,7 +410,6 @@ export default function Dashboard() {
                         ${isNewOrder
                           ? 'bg-yellow-50 border-2 border-yellow-400'
                           : 'bg-white border border-gray-100'}`}>
-
                       <div className="flex justify-between items-center mb-3 flex-wrap gap-2">
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="bg-orange-100 text-orange-600 text-xs font-bold px-3 py-1 rounded-full">
@@ -412,7 +430,6 @@ export default function Dashboard() {
                           🕐 {toIST(order.created_at)}
                         </span>
                       </div>
-
                       <div className="space-y-3">
                         {order.items.map((item, i) => (
                           <div key={i} className="py-2 border-b border-gray-50 last:border-0">
