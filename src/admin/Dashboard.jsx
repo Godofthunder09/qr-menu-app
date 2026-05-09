@@ -25,6 +25,13 @@ export default function Dashboard() {
   const [soundReady, setSoundReady] = useState(false)
   const [sessionStart] = useState(() => new Date().toISOString())
 
+  // Payment modal
+  const [showPaymentModal, setShowPaymentModal] = useState(false)
+  const [paymentTableId, setPaymentTableId] = useState(null)
+  const [paymentType, setPaymentType] = useState('cash')
+  const [serviceChargePct, setServiceChargePct] = useState(0)
+  const [paymentLoading, setPaymentLoading] = useState(false)
+
   const prevOrderIds = useRef(new Set())
   const audioCtxRef = useRef(null)
   const navigate = useNavigate()
@@ -68,6 +75,7 @@ export default function Dashboard() {
     const { data: ordersData } = await supabase
       .from('orders')
       .select(`*, tables(table_name), order_items(quantity, price_at_order, note, food_items(name))`)
+      .eq('is_paid', false)
       .order('created_at', { ascending: false })
 
     if (ordersData) {
@@ -106,15 +114,121 @@ export default function Dashboard() {
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
-  const nukeClearTable = async (tableId) => {
+  // Open payment modal before clearing
+  const openPaymentModal = (tableId) => {
+    setPaymentTableId(tableId)
+    setPaymentType('cash')
+    setServiceChargePct(0)
+    setShowPaymentModal(true)
+  }
+
+  // Calculate totals for payment modal
+  const getTableTotal = (tableId) => {
+    const tOrders = orders.filter(o => o.table_id === tableId)
+    const items = tOrders.flatMap(o => o.order_items || [])
+    return items.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
+  }
+
+  const subtotal = paymentTableId ? getTableTotal(paymentTableId) : 0
+  const serviceAmt = Math.round(subtotal * serviceChargePct / 100)
+  const finalAmt = subtotal + serviceAmt
+
+  // Save payment and clear table
+  const confirmPayment = async () => {
+    if (!paymentTableId) return
+    setPaymentLoading(true)
+
     try {
-      const { data: ords } = await supabase
-        .from('orders').select('id').eq('table_id', tableId)
-      if (ords && ords.length > 0) {
-        await supabase.from('order_items')
-          .delete().in('order_id', ords.map(o => o.id))
+      const tableOrders = orders.filter(o => o.table_id === paymentTableId)
+      const tableName = tables.find(t => t.id === paymentTableId)?.table_name || ''
+      const paidAt = new Date().toISOString()
+
+      // Update all orders for this table with payment info
+      for (const order of tableOrders) {
+        const orderItems = order.order_items || []
+        const orderSubtotal = orderItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
+        const orderServiceAmt = Math.round(orderSubtotal * serviceChargePct / 100)
+        const orderFinal = orderSubtotal + orderServiceAmt
+
+        await supabase.from('orders').update({
+          payment_type: paymentType,
+          is_paid: true,
+          paid_at: paidAt,
+          subtotal: orderSubtotal,
+          service_charge_pct: serviceChargePct,
+          service_charge_amt: orderServiceAmt,
+          final_amount: orderFinal,
+          table_name_snapshot: tableName,
+          status: 'paid'
+        }).eq('id', order.id)
       }
-      await supabase.from('orders').delete().eq('table_id', tableId)
+
+      // Update daily report
+      await updateDailyReport(paymentType, finalAmt, serviceAmt)
+
+      // Now clear the table (sessions, version increment, new PIN)
+      await nukeClearTable(paymentTableId, false) // false = don't delete orders, they're kept for reports
+
+      setShowPaymentModal(false)
+      setNewOrderIds(prev => {
+        const n = new Set(prev)
+        tableOrders.forEach(o => n.delete(o.id))
+        return n
+      })
+      if (selectedTable?.id === paymentTableId) setSelectedTable(null)
+      setPaymentLoading(false)
+      fetchAll()
+    } catch (err) {
+      alert('Error: ' + err.message)
+      setPaymentLoading(false)
+    }
+  }
+
+  const updateDailyReport = async (pType, amount, svcCharge) => {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
+
+    const { data: existing } = await supabase
+      .from('daily_reports')
+      .select('*')
+      .eq('report_date', today)
+      .single()
+
+    if (existing) {
+      const updates = {
+        total_orders: existing.total_orders + 1,
+        total_revenue: existing.total_revenue + amount,
+        service_charge_collected: existing.service_charge_collected + svcCharge,
+        updated_at: new Date().toISOString()
+      }
+      if (pType === 'cash') updates.cash_revenue = existing.cash_revenue + amount
+      if (pType === 'upi') updates.upi_revenue = existing.upi_revenue + amount
+      if (pType === 'card') updates.card_revenue = existing.card_revenue + amount
+
+      await supabase.from('daily_reports').update(updates).eq('id', existing.id)
+    } else {
+      await supabase.from('daily_reports').insert({
+        report_date: today,
+        total_orders: 1,
+        total_revenue: amount,
+        cash_revenue: pType === 'cash' ? amount : 0,
+        upi_revenue: pType === 'upi' ? amount : 0,
+        card_revenue: pType === 'card' ? amount : 0,
+        service_charge_collected: svcCharge
+      })
+    }
+  }
+
+  const nukeClearTable = async (tableId, deleteOrders = true) => {
+    try {
+      if (deleteOrders) {
+        const { data: ords } = await supabase
+          .from('orders').select('id').eq('table_id', tableId)
+        if (ords && ords.length > 0) {
+          await supabase.from('order_items').delete().in('order_id', ords.map(o => o.id))
+        }
+        await supabase.from('orders').delete().eq('table_id', tableId)
+      }
+
       await supabase.from('table_sessions').delete().eq('table_id', tableId)
       const { data: tbl } = await supabase
         .from('tables').select('session_version').eq('id', tableId).single()
@@ -127,25 +241,11 @@ export default function Dashboard() {
     } catch (err) { return false }
   }
 
-  const clearTable = async (tableId) => {
-    if (!window.confirm('Mark as paid and clear this table? A new PIN will be generated.')) return
-    setClearing(true)
-    await nukeClearTable(tableId)
-    setNewOrderIds(prev => {
-      const n = new Set(prev)
-      orders.filter(o => o.table_id === tableId).forEach(o => n.delete(o.id))
-      return n
-    })
-    if (selectedTable?.id === tableId) setSelectedTable(null)
-    setClearing(false)
-    fetchAll()
-  }
-
   const clearAllTables = async () => {
     setShowClearAllConfirm(false)
     setClearing(true)
     const active = tables.filter(t => orders.some(o => o.table_id === t.id))
-    for (const table of active) await nukeClearTable(table.id)
+    for (const table of active) await nukeClearTable(table.id, true)
     setNewOrderIds(new Set())
     setNewOrderTables(new Set())
     setSelectedTable(null)
@@ -172,18 +272,96 @@ export default function Dashboard() {
     <div className="min-h-screen bg-gray-100 flex flex-col" onClick={initAudio}>
 
       {!soundReady && (
-        <div className="bg-orange-500 text-white text-center text-xs py-1.5 cursor-pointer font-medium"
-          onClick={initAudio}>
+        <div className="bg-orange-500 text-white text-center text-xs py-1.5 cursor-pointer font-medium">
           🔔 Tap anywhere to enable order notification sounds
         </div>
       )}
 
+      {/* Payment Modal */}
+      {showPaymentModal && (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-xl">
+            <h2 className="text-xl font-bold text-gray-800 mb-1">💳 Payment Details</h2>
+            <p className="text-sm text-gray-400 mb-5">
+              {tables.find(t => t.id === paymentTableId)?.table_name}
+            </p>
+
+            {/* Payment Type */}
+            <p className="text-sm font-medium text-gray-600 mb-2">Payment Method</p>
+            <div className="grid grid-cols-3 gap-2 mb-5">
+              {[
+                { key: 'cash', label: '💵 Cash', color: 'green' },
+                { key: 'upi', label: '📱 UPI', color: 'blue' },
+                { key: 'card', label: '💳 Card', color: 'purple' }
+              ].map(p => (
+                <button key={p.key}
+                  onClick={() => setPaymentType(p.key)}
+                  className={`py-3 rounded-xl font-medium text-sm transition border-2
+                    ${paymentType === p.key
+                      ? 'border-orange-500 bg-orange-50 text-orange-600'
+                      : 'border-gray-200 bg-gray-50 text-gray-600'}`}>
+                  {p.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Service Charge */}
+            <p className="text-sm font-medium text-gray-600 mb-2">Service Charge</p>
+            <div className="grid grid-cols-4 gap-2 mb-5">
+              {[0, 5, 10, 12].map(pct => (
+                <button key={pct}
+                  onClick={() => setServiceChargePct(pct)}
+                  className={`py-2 rounded-xl font-medium text-sm transition border-2
+                    ${serviceChargePct === pct
+                      ? 'border-orange-500 bg-orange-50 text-orange-600'
+                      : 'border-gray-200 bg-gray-50 text-gray-600'}`}>
+                  {pct}%
+                </button>
+              ))}
+            </div>
+
+            {/* Bill Summary */}
+            <div className="bg-gray-50 rounded-xl p-4 mb-5 space-y-2">
+              <div className="flex justify-between text-sm text-gray-600">
+                <span>Subtotal</span>
+                <span>₹{subtotal}</span>
+              </div>
+              <div className="flex justify-between text-sm text-gray-600">
+                <span>Service Charge ({serviceChargePct}%)</span>
+                <span>₹{serviceAmt}</span>
+              </div>
+              <div className="flex justify-between font-bold text-gray-800 border-t pt-2">
+                <span>Final Amount</span>
+                <span className="text-orange-500 text-lg">₹{finalAmt}</span>
+              </div>
+              <div className="flex justify-between text-xs text-gray-400">
+                <span>Payment via</span>
+                <span className="capitalize font-medium">{paymentType.toUpperCase()}</span>
+              </div>
+            </div>
+
+            <div className="flex gap-3">
+              <button onClick={() => setShowPaymentModal(false)}
+                className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">
+                Cancel
+              </button>
+              <button onClick={confirmPayment} disabled={paymentLoading}
+                className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold disabled:opacity-50">
+                {paymentLoading ? '⏳ Processing...' : '✅ Confirm & Clear'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear All Modal */}
       {showClearAllConfirm && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl">
             <h2 className="text-xl font-bold text-red-500 mb-2">⚠️ Clear All Active Tables?</h2>
             <p className="text-gray-600 text-sm mb-4">
-              This will clear orders from all {activeTables.length} active tables and generate new PINs.
+              This will clear orders from all {activeTables.length} active tables.
+              Note: Payment data will NOT be saved for emergency clears.
             </p>
             <div className="flex gap-3">
               <button onClick={() => setShowClearAllConfirm(false)}
@@ -210,12 +388,22 @@ export default function Dashboard() {
               🧹 Clear All
             </button>
           )}
+          <button onClick={() => navigate('/admin/reports')}
+            className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">
+            📊 Reports
+          </button>
           <button onClick={() => navigate('/admin/menu')}
-            className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Menu</button>
+            className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">
+            Menu
+          </button>
           <button onClick={() => navigate('/admin/tables')}
-            className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Tables</button>
+            className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">
+            Tables
+          </button>
           <button onClick={handleLogout}
-            className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200">Logout</button>
+            className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200">
+            Logout
+          </button>
         </div>
       </div>
 
@@ -296,7 +484,7 @@ export default function Dashboard() {
           {selectedTable && (
             <div className="max-w-2xl mx-auto">
 
-              {/* Table Header — PIN always visible, no Delete button */}
+              {/* Table Header */}
               <div className="bg-white rounded-2xl shadow p-5 mb-4">
                 <div className="flex justify-between items-start flex-wrap gap-3">
                   <div>
@@ -305,7 +493,6 @@ export default function Dashboard() {
                       {tableOrders.length} round(s) •{' '}
                       {tableOrders.length > 0 && toISTDate(tableOrders[tableOrders.length - 1].created_at)}
                     </p>
-                    {/* PIN always visible */}
                     <div className="mt-3 flex items-center gap-2">
                       <span className="text-xs text-gray-500 font-medium">Table PIN:</span>
                       <span className="bg-orange-500 text-white font-bold text-xl px-4 py-1 rounded-xl tracking-widest">
@@ -314,12 +501,10 @@ export default function Dashboard() {
                       <span className="text-xs text-gray-400">Share with customer</span>
                     </div>
                   </div>
-                  <div className="flex gap-2 flex-wrap">
-                    <button onClick={() => clearTable(selectedTable.id)} disabled={clearing}
-                      className="bg-green-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-green-600 transition disabled:opacity-50">
-                      {clearing ? '⏳...' : '✅ Mark Paid & Clear'}
-                    </button>
-                  </div>
+                  <button onClick={() => openPaymentModal(selectedTable.id)} disabled={clearing}
+                    className="bg-green-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-green-600 transition disabled:opacity-50">
+                    {clearing ? '⏳...' : '✅ Mark Paid & Clear'}
+                  </button>
                 </div>
               </div>
 
@@ -373,13 +558,14 @@ export default function Dashboard() {
                   <span className="font-bold text-lg">Grand Total</span>
                   <span className="font-bold text-2xl">₹{grandTotal}</span>
                 </div>
-                <p className="text-orange-100 text-xs mb-4">* Final bill may include service charges & taxes</p>
-                <button onClick={() => clearTable(selectedTable.id)} disabled={clearing}
+                <p className="text-orange-100 text-xs mb-4">
+                  * Service charges will be added at payment
+                </p>
+                <button onClick={() => openPaymentModal(selectedTable.id)} disabled={clearing}
                   className="w-full bg-white text-orange-500 py-3 rounded-xl font-bold hover:bg-orange-50 transition text-sm disabled:opacity-50">
                   {clearing ? '⏳ Processing...' : '✅ Mark as Paid & Clear Table'}
                 </button>
               </div>
-
             </div>
           )}
         </div>
