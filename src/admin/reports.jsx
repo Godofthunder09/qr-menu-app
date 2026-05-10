@@ -14,152 +14,196 @@ const todayIST = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/
 
 export default function Reports() {
   const navigate = useNavigate()
-  const [activeTab, setActiveTab] = useState('daily')
+  const [activeTab, setActiveTab] = useState('today')
+  const [loading, setLoading] = useState(false)
 
-  // Daily
-  const [dailyDate, setDailyDate] = useState(todayIST())
-  const [dailyOrders, setDailyOrders] = useState([])
-  const [dailySummary, setDailySummary] = useState(null)
-  const [dailyLoading, setDailyLoading] = useState(false)
+  // Today data
+  const [todayOrders, setTodayOrders] = useState([])
+  const [todayReport, setTodayReport] = useState(null)
 
-  // Range
+  // Date range
   const [fromDate, setFromDate] = useState(todayIST())
   const [toDate, setToDate] = useState(todayIST())
   const [rangeOrders, setRangeOrders] = useState([])
-  const [rangeLoading, setRangeLoading] = useState(false)
+  const [rangeReport, setRangeReport] = useState(null)
 
-  // Items report
-  const [itemsData, setItemsData] = useState([])
-  const [itemsLoading, setItemsLoading] = useState(false)
-  const [itemsFrom, setItemsFrom] = useState(todayIST())
-  const [itemsTo, setItemsTo] = useState(todayIST())
+  // Item report
+  const [itemStats, setItemStats] = useState([])
+  const [itemFromDate, setItemFromDate] = useState(todayIST())
+  const [itemToDate, setItemToDate] = useState(todayIST())
 
-  useEffect(() => {
-    fetchDailyReport()
-  }, [dailyDate])
+  // Settlement
+  const [settlFromDate, setSettlFromDate] = useState(todayIST())
+  const [settlToDate, setSettlToDate] = useState(todayIST())
+  const [settlData, setSettlData] = useState(null)
 
-  const fetchDailyReport = async () => {
-    setDailyLoading(true)
+  useEffect(() => { fetchToday() }, [])
 
-    const start = `${dailyDate}T00:00:00+05:30`
-    const end = `${dailyDate}T23:59:59+05:30`
+  // ── Today ────────────────────────────────────────────────
+  const fetchToday = async () => {
+    setLoading(true)
+    const today = todayIST()
 
-    const { data: ords } = await supabase
-      .from('orders')
-      .select(`*, order_items(quantity, price_at_order, note, food_items(name))`)
-      .eq('is_paid', true)
-      .gte('paid_at', start)
-      .lte('paid_at', end)
-      .order('paid_at', { ascending: false })
+    const startISO = new Date(today + 'T00:00:00+05:30').toISOString()
+    const endISO = new Date(today + 'T23:59:59+05:30').toISOString()
 
-    setDailyOrders(ords || [])
-
-    // Summary
-    const total = (ords || []).reduce((s, o) => s + (o.final_amount || 0), 0)
-    const cash = (ords || []).filter(o => o.payment_type === 'cash').reduce((s, o) => s + (o.final_amount || 0), 0)
-    const upi = (ords || []).filter(o => o.payment_type === 'upi').reduce((s, o) => s + (o.final_amount || 0), 0)
-    const card = (ords || []).filter(o => o.payment_type === 'card').reduce((s, o) => s + (o.final_amount || 0), 0)
-    const svc = (ords || []).reduce((s, o) => s + (o.service_charge_amt || 0), 0)
-
-    setDailySummary({ total, cash, upi, card, svc, count: (ords || []).length })
-    setDailyLoading(false)
-  }
-
-  const fetchRangeReport = async () => {
-    setRangeLoading(true)
-    const start = `${fromDate}T00:00:00+05:30`
-    const end = `${toDate}T23:59:59+05:30`
-
-    const { data: ords } = await supabase
+    const { data: orders } = await supabase
       .from('orders')
       .select(`*, order_items(quantity, price_at_order, food_items(name))`)
       .eq('is_paid', true)
-      .gte('paid_at', start)
-      .lte('paid_at', end)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
 
-    setRangeOrders(ords || [])
-    setRangeLoading(false)
+    setTodayOrders(orders || [])
+
+    if (orders && orders.length > 0) {
+      const totalRevenue = orders.reduce((s, o) => s + (o.final_amount || 0), 0)
+      const cashRev = orders.filter(o => o.payment_type === 'cash').reduce((s, o) => s + (o.final_amount || 0), 0)
+      const upiRev = orders.filter(o => o.payment_type === 'upi').reduce((s, o) => s + (o.final_amount || 0), 0)
+      const cardRev = orders.filter(o => o.payment_type === 'card').reduce((s, o) => s + (o.final_amount || 0), 0)
+      const scTotal = orders.reduce((s, o) => s + (o.service_charge_amt || 0), 0)
+      setTodayReport({ totalRevenue, cashRev, upiRev, cardRev, scTotal, totalOrders: orders.length })
+    } else {
+      setTodayReport(null)
+    }
+    setLoading(false)
   }
 
-  const fetchItemsReport = async () => {
-    setItemsLoading(true)
-    const start = `${itemsFrom}T00:00:00+05:30`
-    const end = `${itemsTo}T23:59:59+05:30`
+  // ── Date Range ───────────────────────────────────────────
+  const fetchRange = async () => {
+    setLoading(true)
+    const startISO = new Date(fromDate + 'T00:00:00+05:30').toISOString()
+    const endISO = new Date(toDate + 'T23:59:59+05:30').toISOString()
 
-    const { data: ords } = await supabase
+    const { data: orders } = await supabase
       .from('orders')
-      .select(`order_items(quantity, price_at_order, food_items(name, id))`)
+      .select(`*, order_items(quantity, price_at_order, food_items(name))`)
       .eq('is_paid', true)
-      .gte('paid_at', start)
-      .lte('paid_at', end)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
+      .order('paid_at', { ascending: false })
 
-    // Aggregate items
-    const itemMap = {}
-    ;(ords || []).forEach(o => {
-      ;(o.order_items || []).forEach(item => {
-        const name = item.food_items?.name || 'Unknown'
-        if (!itemMap[name]) itemMap[name] = { name, qty: 0, revenue: 0 }
-        itemMap[name].qty += item.quantity
-        itemMap[name].revenue += item.price_at_order * item.quantity
-      })
+    setRangeOrders(orders || [])
+
+    if (orders && orders.length > 0) {
+      const totalRevenue = orders.reduce((s, o) => s + (o.final_amount || 0), 0)
+      const cashRev = orders.filter(o => o.payment_type === 'cash').reduce((s, o) => s + (o.final_amount || 0), 0)
+      const upiRev = orders.filter(o => o.payment_type === 'upi').reduce((s, o) => s + (o.final_amount || 0), 0)
+      const cardRev = orders.filter(o => o.payment_type === 'card').reduce((s, o) => s + (o.final_amount || 0), 0)
+      const scTotal = orders.reduce((s, o) => s + (o.service_charge_amt || 0), 0)
+      setRangeReport({ totalRevenue, cashRev, upiRev, cardRev, scTotal, totalOrders: orders.length })
+    } else {
+      setRangeReport(null)
+    }
+    setLoading(false)
+  }
+
+  // ── Item Stats ───────────────────────────────────────────
+  const fetchItemStats = async () => {
+    setLoading(true)
+    const startISO = new Date(itemFromDate + 'T00:00:00+05:30').toISOString()
+    const endISO = new Date(itemToDate + 'T23:59:59+05:30').toISOString()
+
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('is_paid', true)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
+
+    if (!orders || orders.length === 0) { setItemStats([]); setLoading(false); return }
+
+    const orderIds = orders.map(o => o.id)
+    const { data: items } = await supabase
+      .from('order_items')
+      .select('quantity, price_at_order, food_items(name)')
+      .in('order_id', orderIds)
+
+    const map = {}
+    items?.forEach(i => {
+      const name = i.food_items?.name || 'Unknown'
+      if (!map[name]) map[name] = { name, qty: 0, revenue: 0 }
+      map[name].qty += i.quantity
+      map[name].revenue += i.price_at_order * i.quantity
     })
 
-    const sorted = Object.values(itemMap).sort((a, b) => b.qty - a.qty)
-    setItemsData(sorted)
-    setItemsLoading(false)
+    const sorted = Object.values(map).sort((a, b) => b.qty - a.qty)
+    setItemStats(sorted)
+    setLoading(false)
   }
 
-  // Group range orders by date
-  const groupedByDate = rangeOrders.reduce((acc, o) => {
-    const date = new Date(o.paid_at).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
-    if (!acc[date]) acc[date] = []
-    acc[date].push(o)
-    return acc
-  }, {})
+  // ── Settlement ───────────────────────────────────────────
+  const fetchSettlement = async () => {
+    setLoading(true)
+    const startISO = new Date(settlFromDate + 'T00:00:00+05:30').toISOString()
+    const endISO = new Date(settlToDate + 'T23:59:59+05:30').toISOString()
 
-  const rangeSummary = {
-    total: rangeOrders.reduce((s, o) => s + (o.final_amount || 0), 0),
-    cash: rangeOrders.filter(o => o.payment_type === 'cash').reduce((s, o) => s + (o.final_amount || 0), 0),
-    upi: rangeOrders.filter(o => o.payment_type === 'upi').reduce((s, o) => s + (o.final_amount || 0), 0),
-    card: rangeOrders.filter(o => o.payment_type === 'card').reduce((s, o) => s + (o.final_amount || 0), 0),
-    svc: rangeOrders.reduce((s, o) => s + (o.service_charge_amt || 0), 0),
-    count: rangeOrders.length
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('payment_type, final_amount, subtotal, service_charge_amt, paid_at, table_name_snapshot')
+      .eq('is_paid', true)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
+      .order('paid_at', { ascending: false })
+
+    if (!orders) { setSettlData(null); setLoading(false); return }
+
+    const cash = orders.filter(o => o.payment_type === 'cash')
+    const upi = orders.filter(o => o.payment_type === 'upi')
+    const card = orders.filter(o => o.payment_type === 'card')
+
+    setSettlData({
+      orders,
+      cash: { count: cash.length, total: cash.reduce((s, o) => s + (o.final_amount || 0), 0) },
+      upi: { count: upi.length, total: upi.reduce((s, o) => s + (o.final_amount || 0), 0) },
+      card: { count: card.length, total: card.reduce((s, o) => s + (o.final_amount || 0), 0) },
+      grandTotal: orders.reduce((s, o) => s + (o.final_amount || 0), 0),
+      serviceTotal: orders.reduce((s, o) => s + (o.service_charge_amt || 0), 0)
+    })
+    setLoading(false)
   }
 
+  // ── Print ────────────────────────────────────────────────
   const printReport = () => window.print()
 
-  const exportCSV = (data, filename) => {
-    const headers = ['Table', 'Payment', 'Subtotal', 'Service Charge', 'Final Amount', 'Date', 'Time']
-    const rows = data.map(o => [
-      o.table_name_snapshot || '-',
-      o.payment_type?.toUpperCase(),
-      o.subtotal || 0,
-      o.service_charge_amt || 0,
-      o.final_amount || 0,
-      new Date(o.paid_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }),
-      toIST(o.paid_at)
-    ])
-    const csv = [headers, ...rows].map(r => r.join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    a.click()
-  }
+  const SummaryCard = ({ label, value, color = 'orange', sub }) => (
+    <div className={`bg-${color}-50 border border-${color}-200 rounded-2xl p-4`}>
+      <p className="text-xs text-gray-500 mb-1">{label}</p>
+      <p className={`text-2xl font-bold text-${color}-600`}>{value}</p>
+      {sub && <p className="text-xs text-gray-400 mt-1">{sub}</p>}
+    </div>
+  )
 
-  const paymentIcon = (type) => {
-    if (type === 'cash') return '💵'
-    if (type === 'upi') return '📱'
-    if (type === 'card') return '💳'
-    return '💰'
-  }
+  const ReportSummary = ({ data }) => (
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <SummaryCard label="Total Revenue" value={`₹${data.totalRevenue}`} color="orange" />
+      <SummaryCard label="Total Orders" value={data.totalOrders} color="blue" />
+      <SummaryCard label="Service Charge" value={`₹${data.scTotal}`} color="gray" />
+      <div className="bg-gray-50 border border-gray-200 rounded-2xl p-4">
+        <p className="text-xs text-gray-500 mb-2">By Payment</p>
+        <div className="space-y-1 text-xs">
+          <div className="flex justify-between">
+            <span className="text-green-600">💵 Cash</span>
+            <span className="font-bold">₹{data.cashRev}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-blue-600">📱 UPI</span>
+            <span className="font-bold">₹{data.upiRev}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-purple-600">💳 Card</span>
+            <span className="font-bold">₹{data.cardRev}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
 
   return (
-    <div className="min-h-screen bg-gray-50 print:bg-white">
+    <div className="min-h-screen bg-gray-50">
 
-      {/* Navbar — hidden on print */}
+      {/* Navbar */}
       <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30 print:hidden">
         <div className="flex items-center gap-3">
           <span className="text-xl">📊</span>
@@ -177,120 +221,78 @@ export default function Reports() {
         </div>
       </div>
 
-      <div className="p-4 md:p-6 max-w-4xl mx-auto">
+      <div className="p-4 md:p-6 max-w-5xl mx-auto">
 
-        {/* Print Header */}
-        <div className="hidden print:block text-center mb-6">
-          <h1 className="text-2xl font-bold">🍽️ QR Menu — Sales Report</h1>
-          <p className="text-gray-500 text-sm">Generated on {new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}</p>
-        </div>
-
-        {/* Tabs — hidden on print */}
-        <div className="flex gap-2 mb-6 flex-wrap print:hidden">
+        {/* Tabs */}
+        <div className="flex gap-2 mb-6 overflow-x-auto pb-1 print:hidden">
           {[
-            { key: 'daily', label: '📅 Daily Report' },
-            { key: 'range', label: '📆 Date Range' },
-            { key: 'items', label: '🍴 Item Sales' }
+            { id: 'today', label: '📅 Today' },
+            { id: 'range', label: '📆 Date Range' },
+            { id: 'items', label: '🍴 Items' },
+            { id: 'settlement', label: '💰 Settlement' }
           ].map(tab => (
-            <button key={tab.key} onClick={() => setActiveTab(tab.key)}
-              className={`px-5 py-2 rounded-full font-medium text-sm transition
-                ${activeTab === tab.key ? 'bg-orange-500 text-white' : 'bg-white text-gray-500 border'}`}>
+            <button key={tab.id} onClick={() => setActiveTab(tab.id)}
+              className={`px-4 py-2 rounded-full font-medium text-sm whitespace-nowrap transition
+                ${activeTab === tab.id ? 'bg-orange-500 text-white' : 'bg-white text-gray-500 border hover:bg-orange-50'}`}>
               {tab.label}
             </button>
           ))}
         </div>
 
-        {/* ── Daily Report ── */}
-        {activeTab === 'daily' && (
+        {loading && (
+          <div className="text-center py-8 text-gray-400">
+            <p>Loading report data...</p>
+          </div>
+        )}
+
+        {/* ── Today Tab ── */}
+        {activeTab === 'today' && !loading && (
           <div>
-            <div className="flex gap-3 mb-5 items-center flex-wrap print:hidden">
-              <input type="date" value={dailyDate}
-                onChange={e => setDailyDate(e.target.value)}
-                max={todayIST()}
-                className="border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-              <button onClick={fetchDailyReport}
-                className="bg-orange-500 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-orange-600">
-                Load Report
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-lg font-bold text-gray-700">
+                📅 Today's Report — {formatDate(new Date())}
+              </h2>
+              <button onClick={fetchToday}
+                className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium">
+                🔄 Refresh
               </button>
-              {dailyOrders.length > 0 && (
-                <button onClick={() => exportCSV(dailyOrders, `daily-report-${dailyDate}.csv`)}
-                  className="bg-green-100 text-green-600 px-4 py-2 rounded-lg text-sm font-medium hover:bg-green-200">
-                  📥 Export CSV
-                </button>
-              )}
             </div>
 
-            {dailyLoading && <p className="text-gray-400 text-center py-8">Loading...</p>}
+            {!todayReport && (
+              <div className="text-center py-12 text-gray-400">
+                <div className="text-4xl mb-2">📭</div>
+                <p>No paid orders today yet.</p>
+              </div>
+            )}
 
-            {!dailyLoading && dailySummary && (
+            {todayReport && (
               <>
-                {/* Summary Cards */}
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
-                  <div className="bg-orange-500 text-white rounded-2xl p-4">
-                    <p className="text-xs text-orange-100">Total Revenue</p>
-                    <p className="text-2xl font-bold">₹{dailySummary.total}</p>
-                    <p className="text-xs text-orange-100 mt-1">{dailySummary.count} orders</p>
-                  </div>
-                  <div className="bg-white rounded-2xl shadow p-4">
-                    <p className="text-xs text-gray-400">💵 Cash</p>
-                    <p className="text-xl font-bold text-gray-700">₹{dailySummary.cash}</p>
-                  </div>
-                  <div className="bg-white rounded-2xl shadow p-4">
-                    <p className="text-xs text-gray-400">📱 UPI</p>
-                    <p className="text-xl font-bold text-gray-700">₹{dailySummary.upi}</p>
-                  </div>
-                  <div className="bg-white rounded-2xl shadow p-4">
-                    <p className="text-xs text-gray-400">💳 Card</p>
-                    <p className="text-xl font-bold text-gray-700">₹{dailySummary.card}</p>
-                  </div>
-                </div>
-
-                <div className="bg-white rounded-2xl shadow p-4 mb-5">
-                  <div className="flex justify-between text-sm text-gray-600">
-                    <span>Service Charges Collected</span>
-                    <span className="font-semibold">₹{dailySummary.svc}</span>
-                  </div>
-                  <div className="flex justify-between text-sm text-gray-600 mt-2">
-                    <span>Food Revenue (excl. service)</span>
-                    <span className="font-semibold">₹{dailySummary.total - dailySummary.svc}</span>
-                  </div>
-                </div>
-
-                {/* Orders List */}
-                {dailyOrders.length === 0 ? (
-                  <div className="text-center py-12 text-gray-400">
-                    <div className="text-4xl mb-2">📭</div>
-                    <p>No orders found for this date</p>
-                  </div>
-                ) : (
+                <ReportSummary data={todayReport} />
+                <div className="bg-white rounded-2xl shadow p-5">
+                  <h3 className="font-bold text-gray-700 mb-3">Order Details</h3>
                   <div className="space-y-3">
-                    <h3 className="font-bold text-gray-700">Order Details ({dailyOrders.length})</h3>
-                    {dailyOrders.map((order, i) => (
-                      <div key={order.id} className="bg-white rounded-2xl shadow p-4">
+                    {todayOrders.map((order, i) => (
+                      <div key={order.id} className="border border-gray-100 rounded-xl p-4">
                         <div className="flex justify-between items-start mb-2">
                           <div>
                             <span className="font-semibold text-gray-700">
                               {order.table_name_snapshot || 'Table'}
                             </span>
-                            <span className="ml-2 text-xs text-gray-400">#{i + 1}</span>
+                            <span className={`ml-2 text-xs px-2 py-0.5 rounded-full font-medium
+                              ${order.payment_type === 'cash' ? 'bg-green-100 text-green-600'
+                                : order.payment_type === 'upi' ? 'bg-blue-100 text-blue-600'
+                                : 'bg-purple-100 text-purple-600'}`}>
+                              {order.payment_type === 'cash' ? '💵 Cash'
+                                : order.payment_type === 'upi' ? '📱 UPI' : '💳 Card'}
+                            </span>
                           </div>
                           <div className="text-right">
                             <p className="font-bold text-orange-500">₹{order.final_amount}</p>
                             <p className="text-xs text-gray-400">{toIST(order.paid_at)}</p>
                           </div>
                         </div>
-                        <div className="flex items-center gap-2 mb-2">
-                          <span className="text-xs bg-gray-100 px-2 py-0.5 rounded-full">
-                            {paymentIcon(order.payment_type)} {order.payment_type?.toUpperCase()}
-                          </span>
-                          {order.service_charge_pct > 0 && (
-                            <span className="text-xs bg-blue-50 text-blue-500 px-2 py-0.5 rounded-full">
-                              +{order.service_charge_pct}% service
-                            </span>
-                          )}
-                        </div>
                         <div className="space-y-1">
-                          {(order.order_items || []).map((item, j) => (
+                          {order.order_items?.map((item, j) => (
                             <div key={j} className="flex justify-between text-xs text-gray-500">
                               <span>{item.food_items?.name} × {item.quantity}</span>
                               <span>₹{item.price_at_order * item.quantity}</span>
@@ -298,200 +300,277 @@ export default function Reports() {
                           ))}
                         </div>
                         {order.service_charge_amt > 0 && (
-                          <div className="flex justify-between text-xs text-blue-400 mt-1 pt-1 border-t">
-                            <span>Service Charge</span>
+                          <div className="flex justify-between text-xs text-gray-400 mt-1 border-t pt-1">
+                            <span>Service charge ({order.service_charge_pct}%)</span>
                             <span>₹{order.service_charge_amt}</span>
                           </div>
                         )}
                       </div>
                     ))}
                   </div>
-                )}
+                </div>
               </>
             )}
           </div>
         )}
 
-        {/* ── Date Range Report ── */}
-        {activeTab === 'range' && (
+        {/* ── Date Range Tab ── */}
+        {activeTab === 'range' && !loading && (
           <div>
-            <div className="bg-white rounded-2xl shadow p-4 mb-5">
+            <div className="bg-white rounded-2xl shadow p-5 mb-4">
+              <h3 className="font-bold text-gray-700 mb-3">Select Date Range</h3>
               <div className="flex gap-3 flex-wrap items-end">
                 <div>
-                  <label className="text-xs text-gray-500 block mb-1">From Date</label>
-                  <input type="date" value={fromDate}
-                    onChange={e => setFromDate(e.target.value)}
-                    max={todayIST()}
-                    className="border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                  <label className="text-xs text-gray-500 block mb-1">From</label>
+                  <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
+                    className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
                 </div>
                 <div>
-                  <label className="text-xs text-gray-500 block mb-1">To Date</label>
-                  <input type="date" value={toDate}
-                    onChange={e => setToDate(e.target.value)}
-                    max={todayIST()}
-                    className="border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                  <label className="text-xs text-gray-500 block mb-1">To</label>
+                  <input type="date" value={toDate} onChange={e => setToDate(e.target.value)}
+                    className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
                 </div>
-                <button onClick={fetchRangeReport}
+                <button onClick={fetchRange}
                   className="bg-orange-500 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-orange-600">
-                  Load Report
+                  View Report
                 </button>
-                {rangeOrders.length > 0 && (
-                  <button onClick={() => exportCSV(rangeOrders, `range-report-${fromDate}-to-${toDate}.csv`)}
-                    className="bg-green-100 text-green-600 px-4 py-2 rounded-lg text-sm font-medium hover:bg-green-200">
-                    📥 Export CSV
-                  </button>
-                )}
               </div>
             </div>
 
-            {rangeLoading && <p className="text-gray-400 text-center py-8">Loading...</p>}
-
-            {!rangeLoading && rangeOrders.length > 0 && (
-              <>
-                {/* Summary */}
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
-                  <div className="bg-orange-500 text-white rounded-2xl p-4">
-                    <p className="text-xs text-orange-100">Total Revenue</p>
-                    <p className="text-2xl font-bold">₹{rangeSummary.total}</p>
-                    <p className="text-xs text-orange-100 mt-1">{rangeSummary.count} orders</p>
-                  </div>
-                  <div className="bg-white rounded-2xl shadow p-4">
-                    <p className="text-xs text-gray-400">💵 Cash</p>
-                    <p className="text-xl font-bold text-gray-700">₹{rangeSummary.cash}</p>
-                  </div>
-                  <div className="bg-white rounded-2xl shadow p-4">
-                    <p className="text-xs text-gray-400">📱 UPI</p>
-                    <p className="text-xl font-bold text-gray-700">₹{rangeSummary.upi}</p>
-                  </div>
-                  <div className="bg-white rounded-2xl shadow p-4">
-                    <p className="text-xs text-gray-400">💳 Card</p>
-                    <p className="text-xl font-bold text-gray-700">₹{rangeSummary.card}</p>
-                  </div>
-                </div>
-
-                <div className="bg-white rounded-2xl shadow p-4 mb-5">
-                  <div className="flex justify-between text-sm text-gray-600">
-                    <span>Total Service Charges</span>
-                    <span className="font-semibold">₹{rangeSummary.svc}</span>
-                  </div>
-                  <div className="flex justify-between text-sm text-gray-600 mt-2">
-                    <span>Food Revenue (excl. service)</span>
-                    <span className="font-semibold">₹{rangeSummary.total - rangeSummary.svc}</span>
-                  </div>
-                </div>
-
-                {/* Day by day breakdown */}
-                <h3 className="font-bold text-gray-700 mb-3">Day-by-Day Breakdown</h3>
-                {Object.entries(groupedByDate)
-                  .sort(([a], [b]) => new Date(b) - new Date(a))
-                  .map(([date, dayOrders]) => {
-                    const dayTotal = dayOrders.reduce((s, o) => s + (o.final_amount || 0), 0)
-                    return (
-                      <div key={date} className="bg-white rounded-2xl shadow p-4 mb-3">
-                        <div className="flex justify-between items-center mb-3">
-                          <span className="font-bold text-gray-700">
-                            {new Date(date).toLocaleDateString('en-IN', {
-                              timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', weekday: 'short'
-                            })}
-                          </span>
-                          <div className="text-right">
-                            <p className="font-bold text-orange-500">₹{dayTotal}</p>
-                            <p className="text-xs text-gray-400">{dayOrders.length} orders</p>
-                          </div>
-                        </div>
-                        <div className="flex gap-3 text-xs text-gray-500">
-                          <span>💵 ₹{dayOrders.filter(o => o.payment_type === 'cash').reduce((s, o) => s + (o.final_amount || 0), 0)}</span>
-                          <span>📱 ₹{dayOrders.filter(o => o.payment_type === 'upi').reduce((s, o) => s + (o.final_amount || 0), 0)}</span>
-                          <span>💳 ₹{dayOrders.filter(o => o.payment_type === 'card').reduce((s, o) => s + (o.final_amount || 0), 0)}</span>
-                        </div>
-                      </div>
-                    )
-                  })}
-              </>
-            )}
-
-            {!rangeLoading && rangeOrders.length === 0 && fromDate && toDate && (
+            {!rangeReport && rangeOrders.length === 0 && (
               <div className="text-center py-12 text-gray-400">
-                <div className="text-4xl mb-2">📭</div>
-                <p>No orders in this date range</p>
+                <div className="text-4xl mb-2">📊</div>
+                <p>Select a date range and click View Report</p>
               </div>
+            )}
+
+            {rangeReport && (
+              <>
+                <div className="flex justify-between items-center mb-4">
+                  <h2 className="text-lg font-bold text-gray-700">
+                    {formatDate(fromDate)} → {formatDate(toDate)}
+                  </h2>
+                </div>
+                <ReportSummary data={rangeReport} />
+                <div className="bg-white rounded-2xl shadow p-5">
+                  <h3 className="font-bold text-gray-700 mb-3">
+                    All Orders ({rangeOrders.length})
+                  </h3>
+                  <div className="space-y-3">
+                    {rangeOrders.map(order => (
+                      <div key={order.id} className="border border-gray-100 rounded-xl p-4">
+                        <div className="flex justify-between items-start mb-2">
+                          <div>
+                            <span className="font-semibold text-gray-700">{order.table_name_snapshot || 'Table'}</span>
+                            <span className={`ml-2 text-xs px-2 py-0.5 rounded-full font-medium
+                              ${order.payment_type === 'cash' ? 'bg-green-100 text-green-600'
+                                : order.payment_type === 'upi' ? 'bg-blue-100 text-blue-600'
+                                : 'bg-purple-100 text-purple-600'}`}>
+                              {order.payment_type === 'cash' ? '💵 Cash'
+                                : order.payment_type === 'upi' ? '📱 UPI' : '💳 Card'}
+                            </span>
+                          </div>
+                          <div className="text-right">
+                            <p className="font-bold text-orange-500">₹{order.final_amount}</p>
+                            <p className="text-xs text-gray-400">{formatDate(order.paid_at)} {toIST(order.paid_at)}</p>
+                          </div>
+                        </div>
+                        <div className="space-y-1">
+                          {order.order_items?.map((item, j) => (
+                            <div key={j} className="flex justify-between text-xs text-gray-500">
+                              <span>{item.food_items?.name} × {item.quantity}</span>
+                              <span>₹{item.price_at_order * item.quantity}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </>
             )}
           </div>
         )}
 
-        {/* ── Item Sales Report ── */}
-        {activeTab === 'items' && (
+        {/* ── Item Stats Tab ── */}
+        {activeTab === 'items' && !loading && (
           <div>
-            <div className="bg-white rounded-2xl shadow p-4 mb-5">
+            <div className="bg-white rounded-2xl shadow p-5 mb-4">
+              <h3 className="font-bold text-gray-700 mb-3">Item Sales Report</h3>
               <div className="flex gap-3 flex-wrap items-end">
                 <div>
-                  <label className="text-xs text-gray-500 block mb-1">From Date</label>
-                  <input type="date" value={itemsFrom}
-                    onChange={e => setItemsFrom(e.target.value)}
-                    max={todayIST()}
-                    className="border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                  <label className="text-xs text-gray-500 block mb-1">From</label>
+                  <input type="date" value={itemFromDate} onChange={e => setItemFromDate(e.target.value)}
+                    className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
                 </div>
                 <div>
-                  <label className="text-xs text-gray-500 block mb-1">To Date</label>
-                  <input type="date" value={itemsTo}
-                    onChange={e => setItemsTo(e.target.value)}
-                    max={todayIST()}
-                    className="border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                  <label className="text-xs text-gray-500 block mb-1">To</label>
+                  <input type="date" value={itemToDate} onChange={e => setItemToDate(e.target.value)}
+                    className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
                 </div>
-                <button onClick={fetchItemsReport}
+                <button onClick={fetchItemStats}
                   className="bg-orange-500 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-orange-600">
-                  Load Report
+                  View Items
                 </button>
               </div>
             </div>
 
-            {itemsLoading && <p className="text-gray-400 text-center py-8">Loading...</p>}
-
-            {!itemsLoading && itemsData.length > 0 && (
-              <div className="bg-white rounded-2xl shadow overflow-hidden">
-                <div className="p-4 border-b">
-                  <h3 className="font-bold text-gray-700">
-                    Best Selling Items — {itemsData.length} items
-                  </h3>
-                </div>
-                <div className="divide-y">
-                  {itemsData.map((item, i) => {
-                    const maxQty = itemsData[0].qty
-                    const pct = Math.round((item.qty / maxQty) * 100)
-                    return (
-                      <div key={i} className="p-4">
-                        <div className="flex justify-between items-center mb-1">
-                          <div className="flex items-center gap-2">
-                            <span className={`text-xs font-bold w-6 h-6 rounded-full flex items-center justify-center
-                              ${i === 0 ? 'bg-yellow-400 text-yellow-900'
-                                : i === 1 ? 'bg-gray-300 text-gray-700'
-                                : i === 2 ? 'bg-orange-200 text-orange-700'
-                                : 'bg-gray-100 text-gray-500'}`}>
-                              {i + 1}
-                            </span>
-                            <span className="font-medium text-gray-700">{item.name}</span>
-                          </div>
-                          <div className="text-right">
-                            <p className="font-bold text-gray-700">{item.qty} sold</p>
-                            <p className="text-xs text-orange-500">₹{item.revenue}</p>
-                          </div>
-                        </div>
-                        <div className="w-full bg-gray-100 rounded-full h-1.5 mt-2">
-                          <div className="bg-orange-500 h-1.5 rounded-full"
-                            style={{ width: `${pct}%` }} />
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-            )}
-
-            {!itemsLoading && itemsData.length === 0 && (
+            {itemStats.length === 0 && (
               <div className="text-center py-12 text-gray-400">
                 <div className="text-4xl mb-2">🍴</div>
-                <p>Select date range and load report</p>
+                <p>Select date range and click View Items</p>
               </div>
+            )}
+
+            {itemStats.length > 0 && (
+              <div className="bg-white rounded-2xl shadow p-5">
+                <h3 className="font-bold text-gray-700 mb-4">
+                  🏆 Best Sellers ({itemStats.length} items)
+                </h3>
+                <div className="space-y-3">
+                  {itemStats.map((item, index) => (
+                    <div key={item.name} className="flex items-center gap-4 p-3 rounded-xl bg-gray-50">
+                      <span className={`text-lg font-bold w-8 text-center
+                        ${index === 0 ? 'text-yellow-500' : index === 1 ? 'text-gray-400' : index === 2 ? 'text-orange-400' : 'text-gray-300'}`}>
+                        {index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `#${index + 1}`}
+                      </span>
+                      <div className="flex-1">
+                        <p className="font-semibold text-gray-700">{item.name}</p>
+                        <div className="w-full bg-gray-200 rounded-full h-1.5 mt-1">
+                          <div className="bg-orange-400 h-1.5 rounded-full"
+                            style={{ width: `${Math.min((item.qty / itemStats[0].qty) * 100, 100)}%` }} />
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <p className="font-bold text-orange-500">{item.qty} sold</p>
+                        <p className="text-xs text-gray-400">₹{item.revenue}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Settlement Tab ── */}
+        {activeTab === 'settlement' && !loading && (
+          <div>
+            <div className="bg-white rounded-2xl shadow p-5 mb-4">
+              <h3 className="font-bold text-gray-700 mb-3">Settlement Report</h3>
+              <div className="flex gap-3 flex-wrap items-end">
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">From</label>
+                  <input type="date" value={settlFromDate} onChange={e => setSettlFromDate(e.target.value)}
+                    className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">To</label>
+                  <input type="date" value={settlToDate} onChange={e => setSettlToDate(e.target.value)}
+                    className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                </div>
+                <button onClick={fetchSettlement}
+                  className="bg-orange-500 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-orange-600">
+                  View Settlement
+                </button>
+              </div>
+            </div>
+
+            {!settlData && (
+              <div className="text-center py-12 text-gray-400">
+                <div className="text-4xl mb-2">💰</div>
+                <p>Select date range and click View Settlement</p>
+              </div>
+            )}
+
+            {settlData && (
+              <>
+                {/* Summary Cards */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+                  <div className="bg-orange-50 border border-orange-200 rounded-2xl p-4 col-span-2 md:col-span-1">
+                    <p className="text-xs text-gray-500 mb-1">Grand Total</p>
+                    <p className="text-3xl font-bold text-orange-600">₹{settlData.grandTotal}</p>
+                    <p className="text-xs text-gray-400 mt-1">{settlData.orders.length} transactions</p>
+                  </div>
+                  <div className="bg-green-50 border border-green-200 rounded-2xl p-4">
+                    <p className="text-xs text-gray-500 mb-1">💵 Cash</p>
+                    <p className="text-2xl font-bold text-green-600">₹{settlData.cash.total}</p>
+                    <p className="text-xs text-gray-400">{settlData.cash.count} orders</p>
+                  </div>
+                  <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4">
+                    <p className="text-xs text-gray-500 mb-1">📱 UPI</p>
+                    <p className="text-2xl font-bold text-blue-600">₹{settlData.upi.total}</p>
+                    <p className="text-xs text-gray-400">{settlData.upi.count} orders</p>
+                  </div>
+                  <div className="bg-purple-50 border border-purple-200 rounded-2xl p-4">
+                    <p className="text-xs text-gray-500 mb-1">💳 Card</p>
+                    <p className="text-2xl font-bold text-purple-600">₹{settlData.card.total}</p>
+                    <p className="text-xs text-gray-400">{settlData.card.count} orders</p>
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl shadow p-5 mb-4">
+                  <div className="flex justify-between items-center mb-1">
+                    <span className="text-sm text-gray-600">Total Service Charges Collected</span>
+                    <span className="font-bold text-gray-700">₹{settlData.serviceTotal}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-sm text-gray-600">Net (excl. service charge)</span>
+                    <span className="font-bold text-gray-700">₹{settlData.grandTotal - settlData.serviceTotal}</span>
+                  </div>
+                </div>
+
+                {/* Transaction List */}
+                <div className="bg-white rounded-2xl shadow p-5">
+                  <h3 className="font-bold text-gray-700 mb-3">All Transactions</h3>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b">
+                          <th className="text-left py-2 text-xs text-gray-500">Time</th>
+                          <th className="text-left py-2 text-xs text-gray-500">Table</th>
+                          <th className="text-left py-2 text-xs text-gray-500">Payment</th>
+                          <th className="text-right py-2 text-xs text-gray-500">Subtotal</th>
+                          <th className="text-right py-2 text-xs text-gray-500">SC</th>
+                          <th className="text-right py-2 text-xs text-gray-500">Total</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {settlData.orders.map(order => (
+                          <tr key={order.id} className="border-b border-gray-50 hover:bg-gray-50">
+                            <td className="py-2 text-xs text-gray-400">
+                              {formatDate(order.paid_at)}<br />{toIST(order.paid_at)}
+                            </td>
+                            <td className="py-2 font-medium text-gray-700">
+                              {order.table_name_snapshot || 'Table'}
+                            </td>
+                            <td className="py-2">
+                              <span className={`text-xs px-2 py-0.5 rounded-full font-medium
+                                ${order.payment_type === 'cash' ? 'bg-green-100 text-green-600'
+                                  : order.payment_type === 'upi' ? 'bg-blue-100 text-blue-600'
+                                  : 'bg-purple-100 text-purple-600'}`}>
+                                {order.payment_type === 'cash' ? '💵 Cash'
+                                  : order.payment_type === 'upi' ? '📱 UPI' : '💳 Card'}
+                              </span>
+                            </td>
+                            <td className="py-2 text-right text-gray-600">₹{order.subtotal}</td>
+                            <td className="py-2 text-right text-gray-400">₹{order.service_charge_amt}</td>
+                            <td className="py-2 text-right font-bold text-orange-500">₹{order.final_amount}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                      <tfoot>
+                        <tr className="border-t-2 border-gray-200">
+                          <td colSpan={5} className="py-2 font-bold text-gray-700">Grand Total</td>
+                          <td className="py-2 text-right font-bold text-orange-500 text-lg">
+                            ₹{settlData.grandTotal}
+                          </td>
+                        </tr>
+                      </tfoot>
+                    </table>
+                  </div>
+                </div>
+              </>
             )}
           </div>
         )}
