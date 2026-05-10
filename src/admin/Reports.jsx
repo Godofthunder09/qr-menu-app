@@ -577,4 +577,8 @@ export default function Reports() {
       </div>
     </div>
   )
+<<<<<<< HEAD:src/admin/reports.jsx
 }
+=======
+}
+>>>>>>> 1bd1516eca3b0cacced50d5a5e0ffacddec7ee2b:src/admin/Reports.jsx
