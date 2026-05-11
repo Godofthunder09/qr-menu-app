@@ -1,6 +1,5 @@
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { useEffect, useState } from 'react'
-import { supabase } from '../supabase/client'
 
 export default function OrderConfirmation() {
   const [searchParams] = useSearchParams()
@@ -32,12 +31,12 @@ export default function OrderConfirmation() {
         <p className="text-orange-500 font-bold text-lg mb-4">{tableName || 'Your Table'}</p>
         <div className="bg-orange-50 rounded-2xl p-4 mb-6">
           <p className="text-gray-600 text-sm leading-relaxed">
-            ✅ Your order has been sent to the kitchen.<br />
+            ✅ Your order has been sent!<br />
             Please wait while we prepare your food! 🍴
           </p>
         </div>
         <p className="text-gray-400 text-sm mb-4">
-          Going back to menu in <span className="font-bold text-orange-500">{count}s</span>
+          Going back in <span className="font-bold text-orange-500">{count}s</span>
         </p>
         <button
           onClick={() => navigate(`/menu?table=${tableId}`)}
