@@ -52,14 +52,31 @@ export default function MenuPage() {
   const init = async () => {
     setLoading(true)
 
-    // ── Always load menu data first ──────────────────────
+    // ── Load categories (only top-level, non-subcategory) ──
     const { data: cats } = await supabase
-      .from('categories').select('*').order('created_at')
+      .from('categories')
+      .select('*')
+      .eq('is_subcategory', false)
+      .order('created_at')
     setCategories(cats || [])
 
-    const { data: items } = await supabase
-      .from('food_items').select('*, categories(name)')
-      .eq('is_available', true).order('created_at')
+    // ── FIX: Use explicit foreign key hints to avoid ambiguity ──
+    // Since food_items has TWO foreign keys to categories table,
+    // we must name them explicitly using the FK constraint names.
+    const { data: items, error: itemsError } = await supabase
+      .from('food_items')
+      .select(`
+        *,
+        category:categories!food_items_category_id_fkey(id, name),
+        subcategory:categories!food_items_subcategory_id_fkey(id, name)
+      `)
+      .eq('is_available', true)
+      .order('created_at')
+
+    if (itemsError) {
+      console.error('Error fetching food items:', itemsError.message)
+    }
+
     setFoodItems(items || [])
 
     // ── Then check table + session ───────────────────────
@@ -505,6 +522,13 @@ export default function MenuPage() {
                     </span>
                   )}
                 </div>
+                {/* FIX: use item.category.name from the aliased join */}
+                {item.category?.name && (
+                  <p className="text-xs text-orange-400 font-medium mt-0.5">
+                    {item.category.name}
+                    {item.subcategory?.name && ` › ${item.subcategory.name}`}
+                  </p>
+                )}
                 {item.description && (
                   <p className="text-xs text-gray-400 mt-1">{item.description}</p>
                 )}
