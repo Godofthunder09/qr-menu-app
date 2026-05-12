@@ -52,41 +52,15 @@ export default function MenuPage() {
   const init = async () => {
     setLoading(true)
 
-    // ── Load categories (only top-level, non-subcategory) ──
-    const { data: cats } = await supabase
-      .from('categories')
-      .select('*')
-      .eq('is_subcategory', false)
-      .order('created_at')
-    setCategories(cats || [])
-
-    // ── FIX: Use explicit foreign key hints to avoid ambiguity ──
-    // Since food_items has TWO foreign keys to categories table,
-    // we must name them explicitly using the FK constraint names.
-    const { data: items, error: itemsError } = await supabase
-      .from('food_items')
-      .select(`
-        *,
-        category:categories!food_items_category_id_fkey(id, name),
-        subcategory:categories!food_items_subcategory_id_fkey(id, name)
-      `)
-      .eq('is_available', true)
-      .order('created_at')
-
-    if (itemsError) {
-      console.error('Error fetching food items:', itemsError.message)
-    }
-
-    setFoodItems(items || [])
-
-    // ── Then check table + session ───────────────────────
+    // ── STEP 1: Check table + PIN FIRST ─────────────────────
+    // Nothing loads until PIN is verified
     const { data: tbl } = await supabase
       .from('tables').select('*').eq('id', tableId).single()
 
     if (!tbl) {
       setLoading(false)
       setPinPhase(true)
-      return
+      return  // ← stop here, don't load menu
     }
 
     setTableName(tbl.table_name)
@@ -101,29 +75,59 @@ export default function MenuPage() {
       localStorage.removeItem(VERSION_KEY)
       setOrderSummary([])
     } else {
-      // Load saved order summary only if version matches
       const saved = localStorage.getItem(SUMMARY_KEY)
       if (saved) setOrderSummary(JSON.parse(saved))
     }
 
-    // Check PIN session
+    // Check existing PIN session
     const session = localStorage.getItem(SESSION_KEY)
     if (session) {
       const parsed = JSON.parse(session)
       if (parsed.version === tbl.session_version) {
+        // Session valid — now safe to load menu
         setPinVerified(true)
         setPinPhase(false)
       } else {
+        // Session expired
         localStorage.removeItem(SESSION_KEY)
         localStorage.removeItem(SUMMARY_KEY)
         setOrderSummary([])
+        setLoading(false)
         setPinPhase(true)
+        return  // ← stop here, don't load menu
       }
     } else {
+      // No session — show PIN screen
+      setLoading(false)
       setPinPhase(true)
+      return  // ← stop here, don't load menu
     }
 
+    // ── STEP 2: PIN verified — NOW load menu data ────────────
+    await loadMenuData()
     setLoading(false)
+  }
+
+  const loadMenuData = async () => {
+    const { data: cats } = await supabase
+      .from('categories')
+      .select('*')
+      .eq('is_subcategory', false)
+      .order('created_at')
+    setCategories(cats || [])
+
+    const { data: items, error: itemsError } = await supabase
+      .from('food_items')
+      .select(`
+        *,
+        category:categories!food_items_category_id_fkey(id, name),
+        subcategory:categories!food_items_subcategory_id_fkey(id, name)
+      `)
+      .eq('is_available', true)
+      .order('created_at')
+
+    if (itemsError) console.error('Error fetching food items:', itemsError.message)
+    setFoodItems(items || [])
   }
 
   const checkSessionValid = async () => {
@@ -171,6 +175,11 @@ export default function MenuPage() {
       setPinError('')
       const saved = localStorage.getItem(SUMMARY_KEY)
       if (saved) setOrderSummary(JSON.parse(saved))
+
+      // ── Load menu data AFTER PIN is confirmed ──────────────
+      setLoading(true)
+      await loadMenuData()
+      setLoading(false)
     } else {
       setPinError('Wrong PIN. Ask your waiter.')
       setPinInput('')
@@ -522,7 +531,6 @@ export default function MenuPage() {
                     </span>
                   )}
                 </div>
-                {/* FIX: use item.category.name from the aliased join */}
                 {item.category?.name && (
                   <p className="text-xs text-orange-400 font-medium mt-0.5">
                     {item.category.name}
