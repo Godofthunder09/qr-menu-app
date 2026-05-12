@@ -24,10 +24,7 @@ export default function MenuPage() {
   const [pinInput, setPinInput] = useState('')
   const [pinError, setPinError] = useState('')
   const [pinVerified, setPinVerified] = useState(false)
-
-  // Merged order summary — persists across rounds
   const [orderSummary, setOrderSummary] = useState([])
-
   const navigate = useNavigate()
 
   const SESSION_KEY = `pin_session_${tableId}`
@@ -54,9 +51,27 @@ export default function MenuPage() {
 
   const init = async () => {
     setLoading(true)
+
+    // ── Always load menu data first ──────────────────────
+    const { data: cats } = await supabase
+      .from('categories').select('*').order('created_at')
+    setCategories(cats || [])
+
+    const { data: items } = await supabase
+      .from('food_items').select('*, categories(name)')
+      .eq('is_available', true).order('created_at')
+    setFoodItems(items || [])
+
+    // ── Then check table + session ───────────────────────
     const { data: tbl } = await supabase
       .from('tables').select('*').eq('id', tableId).single()
-    if (!tbl) { setLoading(false); setPinPhase(true); return }
+
+    if (!tbl) {
+      setLoading(false)
+      setPinPhase(true)
+      return
+    }
+
     setTableName(tbl.table_name)
 
     const dbVer = tbl.session_version || 1
@@ -68,11 +83,11 @@ export default function MenuPage() {
       localStorage.removeItem(SUMMARY_KEY)
       localStorage.removeItem(VERSION_KEY)
       setOrderSummary([])
+    } else {
+      // Load saved order summary only if version matches
+      const saved = localStorage.getItem(SUMMARY_KEY)
+      if (saved) setOrderSummary(JSON.parse(saved))
     }
-
-    // Load saved order summary
-    const saved = localStorage.getItem(SUMMARY_KEY)
-    if (saved) setOrderSummary(JSON.parse(saved))
 
     // Check PIN session
     const session = localStorage.getItem(SESSION_KEY)
@@ -90,16 +105,6 @@ export default function MenuPage() {
     } else {
       setPinPhase(true)
     }
-
-    // Load menu
-    const { data: cats } = await supabase
-      .from('categories').select('*').order('created_at')
-    setCategories(cats || [])
-
-    const { data: items } = await supabase
-      .from('food_items').select('*, categories(name)')
-      .eq('is_available', true).order('created_at')
-    setFoodItems(items || [])
 
     setLoading(false)
   }
@@ -147,8 +152,6 @@ export default function MenuPage() {
       setPinVerified(true)
       setPinPhase(false)
       setPinError('')
-
-      // Load existing summary for this session
       const saved = localStorage.getItem(SUMMARY_KEY)
       if (saved) setOrderSummary(JSON.parse(saved))
     } else {
@@ -157,7 +160,6 @@ export default function MenuPage() {
     }
   }
 
-  // Merge new items into existing summary (update quantities)
   const mergeIntoSummary = (cartItems) => {
     setOrderSummary(prev => {
       const updated = [...prev]
@@ -239,9 +241,7 @@ export default function MenuPage() {
 
     if (e2) { alert('Error: ' + e2.message); setPlacing(false); return }
 
-    // Merge cart into summary
     mergeIntoSummary(cart)
-
     setCart([])
     setShowCart(false)
     setPlacing(false)
@@ -297,19 +297,18 @@ export default function MenuPage() {
           Ask your waiter for the PIN for{' '}
           <span className="font-semibold text-orange-500">{tableName}</span>
         </p>
-
         <div className="flex justify-center gap-3 mb-4">
           {[0,1,2,3].map(i => (
             <div key={i}
               className={`w-14 h-14 rounded-xl border-2 flex items-center justify-center text-2xl font-bold
-                ${pinInput.length > i ? 'border-orange-500 bg-orange-50 text-orange-600' : 'border-gray-200 bg-gray-50'}`}>
+                ${pinInput.length > i
+                  ? 'border-orange-500 bg-orange-50 text-orange-600'
+                  : 'border-gray-200 bg-gray-50'}`}>
               {pinInput[i] ? '●' : '○'}
             </div>
           ))}
         </div>
-
         {pinError && <p className="text-red-500 text-sm mb-4 font-medium">{pinError}</p>}
-
         <div className="grid grid-cols-3 gap-3 mb-4">
           {[1,2,3,4,5,6,7,8,9].map(n => (
             <button key={n}
@@ -383,7 +382,6 @@ export default function MenuPage() {
               <button onClick={() => setShowOrderSummary(false)}
                 className="text-gray-400 text-2xl font-bold">×</button>
             </div>
-
             {orderSummary.length === 0 ? (
               <p className="text-gray-400 text-center py-8 text-sm">No orders placed yet.</p>
             ) : (
@@ -396,18 +394,15 @@ export default function MenuPage() {
                         <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>
                       )}
                     </div>
-                    <div className="text-right ml-3">
-                      <span className="bg-orange-100 text-orange-600 text-sm font-bold px-2 py-0.5 rounded-full">
-                        × {item.quantity}
-                      </span>
-                    </div>
+                    <span className="bg-orange-100 text-orange-600 text-sm font-bold px-2 py-0.5 rounded-full ml-3">
+                      × {item.quantity}
+                    </span>
                   </div>
                 ))}
               </div>
             )}
-
             <p className="text-xs text-gray-300 text-center mt-4">
-              This shows all items ordered in this session
+              All items ordered this session
             </p>
           </div>
         </div>
@@ -421,7 +416,6 @@ export default function MenuPage() {
             <p className="text-sm text-gray-400">{tableName}</p>
           </div>
           <div className="flex gap-2 items-center">
-            {/* My Orders button */}
             {orderSummary.length > 0 && (
               <button onClick={() => setShowOrderSummary(true)}
                 className="relative bg-gray-100 text-gray-600 px-3 py-2 rounded-full text-xs font-medium">
@@ -494,7 +488,6 @@ export default function MenuPage() {
           const qty = getQty(item.id)
           const cartItem = cart.find(c => c.id === item.id)
           const summaryItem = orderSummary.find(s => s.id === item.id)
-
           return (
             <div key={item.id} className="bg-white rounded-2xl shadow p-4 flex gap-3">
               {item.image_url
@@ -504,10 +497,10 @@ export default function MenuPage() {
                 : <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">🍴</div>
               }
               <div className="flex-1">
-                <div className="flex justify-between items-start">
+                <div className="flex justify-between items-start gap-1">
                   <h3 className="font-semibold text-gray-800">{item.name}</h3>
                   {summaryItem && (
-                    <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full font-medium ml-1">
+                    <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full font-medium shrink-0">
                       Ordered: {summaryItem.quantity}
                     </span>
                   )}
@@ -516,11 +509,9 @@ export default function MenuPage() {
                   <p className="text-xs text-gray-400 mt-1">{item.description}</p>
                 )}
                 <p className="text-orange-500 font-bold mt-1">₹{item.price}</p>
-
                 {cartItem?.note && (
                   <p className="text-xs text-orange-400 italic mt-1">📝 "{cartItem.note}"</p>
                 )}
-
                 <div className="mt-2 flex items-center gap-2 flex-wrap">
                   {qty === 0 ? (
                     <>
