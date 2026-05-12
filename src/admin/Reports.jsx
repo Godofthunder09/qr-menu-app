@@ -12,6 +12,15 @@ const formatDate = (d) => new Date(d).toLocaleDateString('en-IN', {
 
 const todayIST = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
 
+// Full order select string — used everywhere so we never miss columns
+const ORDER_SELECT = `
+  id, payment_type, is_paid, paid_at,
+  subtotal, service_charge_pct, service_charge_amt,
+  discount_type, discount_value, discount_amt,
+  final_amount, table_name_snapshot,
+  order_items(quantity, price_at_order, food_items(name))
+`
+
 export default function Reports() {
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState('today')
@@ -39,86 +48,94 @@ export default function Reports() {
 
   useEffect(() => { fetchToday() }, [])
 
-  // ── Today ────────────────────────────────────────────────
+  // ── Shared: build summary from orders array ────────────────────────────────
+  const buildSummary = (orders) => {
+    const totalRevenue = orders.reduce((s, o) => s + (o.final_amount || 0), 0)
+    const cashRev = orders.filter(o => o.payment_type === 'cash').reduce((s, o) => s + (o.final_amount || 0), 0)
+    const upiRev = orders.filter(o => o.payment_type === 'upi').reduce((s, o) => s + (o.final_amount || 0), 0)
+    const cardRev = orders.filter(o => o.payment_type === 'card').reduce((s, o) => s + (o.final_amount || 0), 0)
+    const scTotal = orders.reduce((s, o) => s + (o.service_charge_amt || 0), 0)
+    const discountTotal = orders.reduce((s, o) => s + (o.discount_amt || 0), 0)
+    return { totalRevenue, cashRev, upiRev, cardRev, scTotal, discountTotal, totalOrders: orders.length }
+  }
+
+  // ── Shared: date range ISO strings ────────────────────────────────────────
+  const toRange = (from, to) => ({
+    startISO: new Date(from + 'T00:00:00+05:30').toISOString(),
+    endISO: new Date(to + 'T23:59:59+05:30').toISOString(),
+  })
+
+  // ── Today ─────────────────────────────────────────────────────────────────
   const fetchToday = async () => {
     setLoading(true)
     const today = todayIST()
+    const { startISO, endISO } = toRange(today, today)
 
-    const startISO = new Date(today + 'T00:00:00+05:30').toISOString()
-    const endISO = new Date(today + 'T23:59:59+05:30').toISOString()
-
-    const { data: orders } = await supabase
+    const { data: orders, error } = await supabase
       .from('orders')
-      .select(`*, order_items(quantity, price_at_order, food_items(name))`)
+      .select(ORDER_SELECT)
       .eq('is_paid', true)
       .gte('paid_at', startISO)
       .lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
 
-    setTodayOrders(orders || [])
+    if (error) console.error('fetchToday error:', error)
 
-    if (orders && orders.length > 0) {
-      const totalRevenue = orders.reduce((s, o) => s + (o.final_amount || 0), 0)
-      const cashRev = orders.filter(o => o.payment_type === 'cash').reduce((s, o) => s + (o.final_amount || 0), 0)
-      const upiRev = orders.filter(o => o.payment_type === 'upi').reduce((s, o) => s + (o.final_amount || 0), 0)
-      const cardRev = orders.filter(o => o.payment_type === 'card').reduce((s, o) => s + (o.final_amount || 0), 0)
-      const scTotal = orders.reduce((s, o) => s + (o.service_charge_amt || 0), 0)
-      setTodayReport({ totalRevenue, cashRev, upiRev, cardRev, scTotal, totalOrders: orders.length })
-    } else {
-      setTodayReport(null)
-    }
+    const list = orders || []
+    setTodayOrders(list)
+    setTodayReport(list.length > 0 ? buildSummary(list) : null)
     setLoading(false)
   }
 
-  // ── Date Range ───────────────────────────────────────────
+  // ── Date Range ────────────────────────────────────────────────────────────
   const fetchRange = async () => {
     setLoading(true)
-    const startISO = new Date(fromDate + 'T00:00:00+05:30').toISOString()
-    const endISO = new Date(toDate + 'T23:59:59+05:30').toISOString()
+    const { startISO, endISO } = toRange(fromDate, toDate)
 
-    const { data: orders } = await supabase
+    const { data: orders, error } = await supabase
       .from('orders')
-      .select(`*, order_items(quantity, price_at_order, food_items(name))`)
+      .select(ORDER_SELECT)
       .eq('is_paid', true)
       .gte('paid_at', startISO)
       .lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
 
-    setRangeOrders(orders || [])
+    if (error) console.error('fetchRange error:', error)
 
-    if (orders && orders.length > 0) {
-      const totalRevenue = orders.reduce((s, o) => s + (o.final_amount || 0), 0)
-      const cashRev = orders.filter(o => o.payment_type === 'cash').reduce((s, o) => s + (o.final_amount || 0), 0)
-      const upiRev = orders.filter(o => o.payment_type === 'upi').reduce((s, o) => s + (o.final_amount || 0), 0)
-      const cardRev = orders.filter(o => o.payment_type === 'card').reduce((s, o) => s + (o.final_amount || 0), 0)
-      const scTotal = orders.reduce((s, o) => s + (o.service_charge_amt || 0), 0)
-      setRangeReport({ totalRevenue, cashRev, upiRev, cardRev, scTotal, totalOrders: orders.length })
-    } else {
-      setRangeReport(null)
-    }
+    const list = orders || []
+    setRangeOrders(list)
+    setRangeReport(list.length > 0 ? buildSummary(list) : null)
     setLoading(false)
   }
 
-  // ── Item Stats ───────────────────────────────────────────
+  // ── Item Stats ────────────────────────────────────────────────────────────
   const fetchItemStats = async () => {
     setLoading(true)
-    const startISO = new Date(itemFromDate + 'T00:00:00+05:30').toISOString()
-    const endISO = new Date(itemToDate + 'T23:59:59+05:30').toISOString()
+    const { startISO, endISO } = toRange(itemFromDate, itemToDate)
 
-    const { data: orders } = await supabase
+    // Get paid order IDs in range
+    const { data: orders, error: ordErr } = await supabase
       .from('orders')
       .select('id')
       .eq('is_paid', true)
       .gte('paid_at', startISO)
       .lte('paid_at', endISO)
 
-    if (!orders || orders.length === 0) { setItemStats([]); setLoading(false); return }
+    if (ordErr) console.error('fetchItemStats orders error:', ordErr)
+
+    if (!orders || orders.length === 0) {
+      setItemStats([])
+      setLoading(false)
+      return
+    }
 
     const orderIds = orders.map(o => o.id)
-    const { data: items } = await supabase
+    const { data: items, error: itemErr } = await supabase
       .from('order_items')
       .select('quantity, price_at_order, food_items(name)')
       .in('order_id', orderIds)
+
+    if (itemErr) console.error('fetchItemStats items error:', itemErr)
 
     const map = {}
     items?.forEach(i => {
@@ -128,59 +145,83 @@ export default function Reports() {
       map[name].revenue += i.price_at_order * i.quantity
     })
 
-    const sorted = Object.values(map).sort((a, b) => b.qty - a.qty)
-    setItemStats(sorted)
+    setItemStats(Object.values(map).sort((a, b) => b.qty - a.qty))
     setLoading(false)
   }
 
-  // ── Settlement ───────────────────────────────────────────
+  // ── Settlement ────────────────────────────────────────────────────────────
   const fetchSettlement = async () => {
     setLoading(true)
-    const startISO = new Date(settlFromDate + 'T00:00:00+05:30').toISOString()
-    const endISO = new Date(settlToDate + 'T23:59:59+05:30').toISOString()
+    const { startISO, endISO } = toRange(settlFromDate, settlToDate)
 
-    const { data: orders } = await supabase
+    const { data: orders, error } = await supabase
       .from('orders')
-      .select('payment_type, final_amount, subtotal, service_charge_amt, paid_at, table_name_snapshot')
+      .select(`
+        id, payment_type, paid_at, table_name_snapshot,
+        subtotal, service_charge_pct, service_charge_amt,
+        discount_type, discount_value, discount_amt,
+        final_amount
+      `)
       .eq('is_paid', true)
       .gte('paid_at', startISO)
       .lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
 
-    if (!orders) { setSettlData(null); setLoading(false); return }
+    if (error) console.error('fetchSettlement error:', error)
+
+    if (!orders || orders.length === 0) {
+      setSettlData(null)
+      setLoading(false)
+      return
+    }
 
     const cash = orders.filter(o => o.payment_type === 'cash')
     const upi = orders.filter(o => o.payment_type === 'upi')
     const card = orders.filter(o => o.payment_type === 'card')
+    const grandTotal = orders.reduce((s, o) => s + (o.final_amount || 0), 0)
+    const serviceTotal = orders.reduce((s, o) => s + (o.service_charge_amt || 0), 0)
+    const discountTotal = orders.reduce((s, o) => s + (o.discount_amt || 0), 0)
 
     setSettlData({
       orders,
       cash: { count: cash.length, total: cash.reduce((s, o) => s + (o.final_amount || 0), 0) },
       upi: { count: upi.length, total: upi.reduce((s, o) => s + (o.final_amount || 0), 0) },
       card: { count: card.length, total: card.reduce((s, o) => s + (o.final_amount || 0), 0) },
-      grandTotal: orders.reduce((s, o) => s + (o.final_amount || 0), 0),
-      serviceTotal: orders.reduce((s, o) => s + (o.service_charge_amt || 0), 0)
+      grandTotal, serviceTotal, discountTotal
     })
     setLoading(false)
   }
 
-  // ── Print ────────────────────────────────────────────────
   const printReport = () => window.print()
 
-  const SummaryCard = ({ label, value, color = 'orange', sub }) => (
-    <div className={`bg-${color}-50 border border-${color}-200 rounded-2xl p-4`}>
-      <p className="text-xs text-gray-500 mb-1">{label}</p>
-      <p className={`text-2xl font-bold text-${color}-600`}>{value}</p>
-      {sub && <p className="text-xs text-gray-400 mt-1">{sub}</p>}
-    </div>
+  // ── Sub-components ────────────────────────────────────────────────────────
+  const PayBadge = ({ type }) => (
+    <span className={`text-xs px-2 py-0.5 rounded-full font-medium
+      ${type === 'cash' ? 'bg-green-100 text-green-600'
+        : type === 'upi' ? 'bg-blue-100 text-blue-600'
+        : 'bg-purple-100 text-purple-600'}`}>
+      {type === 'cash' ? '💵 Cash' : type === 'upi' ? '📱 UPI' : '💳 Card'}
+    </span>
   )
 
   const ReportSummary = ({ data }) => (
     <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-      <SummaryCard label="Total Revenue" value={`₹${data.totalRevenue}`} color="orange" />
-      <SummaryCard label="Total Orders" value={data.totalOrders} color="blue" />
-      <SummaryCard label="Service Charge" value={`₹${data.scTotal}`} color="gray" />
+      <div className="bg-orange-50 border border-orange-200 rounded-2xl p-4">
+        <p className="text-xs text-gray-500 mb-1">Total Revenue</p>
+        <p className="text-2xl font-bold text-orange-600">₹{data.totalRevenue}</p>
+      </div>
+      <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4">
+        <p className="text-xs text-gray-500 mb-1">Total Orders</p>
+        <p className="text-2xl font-bold text-blue-600">{data.totalOrders}</p>
+      </div>
       <div className="bg-gray-50 border border-gray-200 rounded-2xl p-4">
+        <p className="text-xs text-gray-500 mb-1">Service Charge</p>
+        <p className="text-2xl font-bold text-gray-600">₹{data.scTotal}</p>
+        {data.discountTotal > 0 && (
+          <p className="text-xs text-green-600 mt-1">Discount: -₹{data.discountTotal}</p>
+        )}
+      </div>
+      <div className="bg-white border border-gray-200 rounded-2xl p-4">
         <p className="text-xs text-gray-500 mb-2">By Payment</p>
         <div className="space-y-1 text-xs">
           <div className="flex justify-between">
@@ -196,6 +237,58 @@ export default function Reports() {
             <span className="font-bold">₹{data.cardRev}</span>
           </div>
         </div>
+      </div>
+    </div>
+  )
+
+  const OrderCard = ({ order, showDate = false }) => (
+    <div className="border border-gray-100 rounded-xl p-4">
+      <div className="flex justify-between items-start mb-2 flex-wrap gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="font-semibold text-gray-700">{order.table_name_snapshot || 'Table'}</span>
+          <PayBadge type={order.payment_type} />
+        </div>
+        <div className="text-right">
+          <p className="font-bold text-orange-500">₹{order.final_amount}</p>
+          <p className="text-xs text-gray-400">
+            {showDate ? `${formatDate(order.paid_at)} ` : ''}{toIST(order.paid_at)}
+          </p>
+        </div>
+      </div>
+
+      {/* Items */}
+      <div className="space-y-1 mb-2">
+        {order.order_items?.map((item, j) => (
+          <div key={j} className="flex justify-between text-xs text-gray-500">
+            <span>{item.food_items?.name} × {item.quantity}</span>
+            <span>₹{item.price_at_order * item.quantity}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Charges breakdown */}
+      <div className="border-t pt-2 space-y-0.5">
+        <div className="flex justify-between text-xs text-gray-400">
+          <span>Subtotal</span>
+          <span>₹{order.subtotal || 0}</span>
+        </div>
+        {(order.service_charge_amt > 0) && (
+          <div className="flex justify-between text-xs text-gray-400">
+            <span>Service ({order.service_charge_pct}%)</span>
+            <span>₹{order.service_charge_amt}</span>
+          </div>
+        )}
+        {(order.discount_amt > 0) && (
+          <div className="flex justify-between text-xs text-green-600">
+            <span>
+              Discount
+              {order.discount_type === 'percent'
+                ? ` (${order.discount_value}%)`
+                : ` (₹${order.discount_value} flat)`}
+            </span>
+            <span>-₹{order.discount_amt}</span>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -240,17 +333,15 @@ export default function Reports() {
         </div>
 
         {loading && (
-          <div className="text-center py-8 text-gray-400">
-            <p>Loading report data...</p>
-          </div>
+          <div className="text-center py-8 text-gray-400">Loading...</div>
         )}
 
-        {/* ── Today Tab ── */}
+        {/* ── Today Tab ──────────────────────────────────────────────────── */}
         {activeTab === 'today' && !loading && (
           <div>
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-lg font-bold text-gray-700">
-                📅 Today's Report — {formatDate(new Date())}
+                📅 Today — {formatDate(new Date())}
               </h2>
               <button onClick={fetchToday}
                 className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium">
@@ -258,54 +349,19 @@ export default function Reports() {
               </button>
             </div>
 
-            {!todayReport && (
+            {!todayReport ? (
               <div className="text-center py-12 text-gray-400">
                 <div className="text-4xl mb-2">📭</div>
                 <p>No paid orders today yet.</p>
               </div>
-            )}
-
-            {todayReport && (
+            ) : (
               <>
                 <ReportSummary data={todayReport} />
                 <div className="bg-white rounded-2xl shadow p-5">
-                  <h3 className="font-bold text-gray-700 mb-3">Order Details</h3>
+                  <h3 className="font-bold text-gray-700 mb-3">Order Details ({todayOrders.length})</h3>
                   <div className="space-y-3">
-                    {todayOrders.map((order, i) => (
-                      <div key={order.id} className="border border-gray-100 rounded-xl p-4">
-                        <div className="flex justify-between items-start mb-2">
-                          <div>
-                            <span className="font-semibold text-gray-700">
-                              {order.table_name_snapshot || 'Table'}
-                            </span>
-                            <span className={`ml-2 text-xs px-2 py-0.5 rounded-full font-medium
-                              ${order.payment_type === 'cash' ? 'bg-green-100 text-green-600'
-                                : order.payment_type === 'upi' ? 'bg-blue-100 text-blue-600'
-                                : 'bg-purple-100 text-purple-600'}`}>
-                              {order.payment_type === 'cash' ? '💵 Cash'
-                                : order.payment_type === 'upi' ? '📱 UPI' : '💳 Card'}
-                            </span>
-                          </div>
-                          <div className="text-right">
-                            <p className="font-bold text-orange-500">₹{order.final_amount}</p>
-                            <p className="text-xs text-gray-400">{toIST(order.paid_at)}</p>
-                          </div>
-                        </div>
-                        <div className="space-y-1">
-                          {order.order_items?.map((item, j) => (
-                            <div key={j} className="flex justify-between text-xs text-gray-500">
-                              <span>{item.food_items?.name} × {item.quantity}</span>
-                              <span>₹{item.price_at_order * item.quantity}</span>
-                            </div>
-                          ))}
-                        </div>
-                        {order.service_charge_amt > 0 && (
-                          <div className="flex justify-between text-xs text-gray-400 mt-1 border-t pt-1">
-                            <span>Service charge ({order.service_charge_pct}%)</span>
-                            <span>₹{order.service_charge_amt}</span>
-                          </div>
-                        )}
-                      </div>
+                    {todayOrders.map(order => (
+                      <OrderCard key={order.id} order={order} showDate={false} />
                     ))}
                   </div>
                 </div>
@@ -314,7 +370,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── Date Range Tab ── */}
+        {/* ── Date Range Tab ─────────────────────────────────────────────── */}
         {activeTab === 'range' && !loading && (
           <div>
             <div className="bg-white rounded-2xl shadow p-5 mb-4">
@@ -337,14 +393,12 @@ export default function Reports() {
               </div>
             </div>
 
-            {!rangeReport && rangeOrders.length === 0 && (
+            {!rangeReport ? (
               <div className="text-center py-12 text-gray-400">
                 <div className="text-4xl mb-2">📊</div>
                 <p>Select a date range and click View Report</p>
               </div>
-            )}
-
-            {rangeReport && (
+            ) : (
               <>
                 <div className="flex justify-between items-center mb-4">
                   <h2 className="text-lg font-bold text-gray-700">
@@ -353,37 +407,10 @@ export default function Reports() {
                 </div>
                 <ReportSummary data={rangeReport} />
                 <div className="bg-white rounded-2xl shadow p-5">
-                  <h3 className="font-bold text-gray-700 mb-3">
-                    All Orders ({rangeOrders.length})
-                  </h3>
+                  <h3 className="font-bold text-gray-700 mb-3">All Orders ({rangeOrders.length})</h3>
                   <div className="space-y-3">
                     {rangeOrders.map(order => (
-                      <div key={order.id} className="border border-gray-100 rounded-xl p-4">
-                        <div className="flex justify-between items-start mb-2">
-                          <div>
-                            <span className="font-semibold text-gray-700">{order.table_name_snapshot || 'Table'}</span>
-                            <span className={`ml-2 text-xs px-2 py-0.5 rounded-full font-medium
-                              ${order.payment_type === 'cash' ? 'bg-green-100 text-green-600'
-                                : order.payment_type === 'upi' ? 'bg-blue-100 text-blue-600'
-                                : 'bg-purple-100 text-purple-600'}`}>
-                              {order.payment_type === 'cash' ? '💵 Cash'
-                                : order.payment_type === 'upi' ? '📱 UPI' : '💳 Card'}
-                            </span>
-                          </div>
-                          <div className="text-right">
-                            <p className="font-bold text-orange-500">₹{order.final_amount}</p>
-                            <p className="text-xs text-gray-400">{formatDate(order.paid_at)} {toIST(order.paid_at)}</p>
-                          </div>
-                        </div>
-                        <div className="space-y-1">
-                          {order.order_items?.map((item, j) => (
-                            <div key={j} className="flex justify-between text-xs text-gray-500">
-                              <span>{item.food_items?.name} × {item.quantity}</span>
-                              <span>₹{item.price_at_order * item.quantity}</span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
+                      <OrderCard key={order.id} order={order} showDate={true} />
                     ))}
                   </div>
                 </div>
@@ -392,7 +419,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── Item Stats Tab ── */}
+        {/* ── Item Stats Tab ─────────────────────────────────────────────── */}
         {activeTab === 'items' && !loading && (
           <div>
             <div className="bg-white rounded-2xl shadow p-5 mb-4">
@@ -415,14 +442,12 @@ export default function Reports() {
               </div>
             </div>
 
-            {itemStats.length === 0 && (
+            {itemStats.length === 0 ? (
               <div className="text-center py-12 text-gray-400">
                 <div className="text-4xl mb-2">🍴</div>
                 <p>Select date range and click View Items</p>
               </div>
-            )}
-
-            {itemStats.length > 0 && (
+            ) : (
               <div className="bg-white rounded-2xl shadow p-5">
                 <h3 className="font-bold text-gray-700 mb-4">
                   🏆 Best Sellers ({itemStats.length} items)
@@ -430,8 +455,7 @@ export default function Reports() {
                 <div className="space-y-3">
                   {itemStats.map((item, index) => (
                     <div key={item.name} className="flex items-center gap-4 p-3 rounded-xl bg-gray-50">
-                      <span className={`text-lg font-bold w-8 text-center
-                        ${index === 0 ? 'text-yellow-500' : index === 1 ? 'text-gray-400' : index === 2 ? 'text-orange-400' : 'text-gray-300'}`}>
+                      <span className="text-lg font-bold w-8 text-center">
                         {index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `#${index + 1}`}
                       </span>
                       <div className="flex-1">
@@ -453,7 +477,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── Settlement Tab ── */}
+        {/* ── Settlement Tab ─────────────────────────────────────────────── */}
         {activeTab === 'settlement' && !loading && (
           <div>
             <div className="bg-white rounded-2xl shadow p-5 mb-4">
@@ -476,14 +500,12 @@ export default function Reports() {
               </div>
             </div>
 
-            {!settlData && (
+            {!settlData ? (
               <div className="text-center py-12 text-gray-400">
                 <div className="text-4xl mb-2">💰</div>
                 <p>Select date range and click View Settlement</p>
               </div>
-            )}
-
-            {settlData && (
+            ) : (
               <>
                 {/* Summary Cards */}
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
@@ -509,18 +531,27 @@ export default function Reports() {
                   </div>
                 </div>
 
-                <div className="bg-white rounded-2xl shadow p-5 mb-4">
-                  <div className="flex justify-between items-center mb-1">
-                    <span className="text-sm text-gray-600">Total Service Charges Collected</span>
+                {/* Charge summary */}
+                <div className="bg-white rounded-2xl shadow p-5 mb-4 space-y-2 text-sm">
+                  <div className="flex justify-between text-gray-600">
+                    <span>Total Service Charges Collected</span>
                     <span className="font-bold text-gray-700">₹{settlData.serviceTotal}</span>
                   </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm text-gray-600">Net (excl. service charge)</span>
-                    <span className="font-bold text-gray-700">₹{settlData.grandTotal - settlData.serviceTotal}</span>
+                  {settlData.discountTotal > 0 && (
+                    <div className="flex justify-between text-green-600">
+                      <span>Total Discounts Given</span>
+                      <span className="font-bold">-₹{settlData.discountTotal}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between text-gray-600 border-t pt-2">
+                    <span>Net (excl. service charge)</span>
+                    <span className="font-bold text-gray-700">
+                      ₹{settlData.grandTotal - settlData.serviceTotal}
+                    </span>
                   </div>
                 </div>
 
-                {/* Transaction List */}
+                {/* Transaction Table */}
                 <div className="bg-white rounded-2xl shadow p-5">
                   <h3 className="font-bold text-gray-700 mb-3">All Transactions</h3>
                   <div className="overflow-x-auto">
@@ -532,6 +563,7 @@ export default function Reports() {
                           <th className="text-left py-2 text-xs text-gray-500">Payment</th>
                           <th className="text-right py-2 text-xs text-gray-500">Subtotal</th>
                           <th className="text-right py-2 text-xs text-gray-500">SC</th>
+                          <th className="text-right py-2 text-xs text-gray-500">Disc</th>
                           <th className="text-right py-2 text-xs text-gray-500">Total</th>
                         </tr>
                       </thead>
@@ -545,23 +577,24 @@ export default function Reports() {
                               {order.table_name_snapshot || 'Table'}
                             </td>
                             <td className="py-2">
-                              <span className={`text-xs px-2 py-0.5 rounded-full font-medium
-                                ${order.payment_type === 'cash' ? 'bg-green-100 text-green-600'
-                                  : order.payment_type === 'upi' ? 'bg-blue-100 text-blue-600'
-                                  : 'bg-purple-100 text-purple-600'}`}>
-                                {order.payment_type === 'cash' ? '💵 Cash'
-                                  : order.payment_type === 'upi' ? '📱 UPI' : '💳 Card'}
-                              </span>
+                              <PayBadge type={order.payment_type} />
                             </td>
-                            <td className="py-2 text-right text-gray-600">₹{order.subtotal}</td>
-                            <td className="py-2 text-right text-gray-400">₹{order.service_charge_amt}</td>
-                            <td className="py-2 text-right font-bold text-orange-500">₹{order.final_amount}</td>
+                            <td className="py-2 text-right text-gray-600">₹{order.subtotal || 0}</td>
+                            <td className="py-2 text-right text-gray-400">
+                              {order.service_charge_amt > 0 ? `₹${order.service_charge_amt}` : '—'}
+                            </td>
+                            <td className="py-2 text-right text-green-600">
+                              {order.discount_amt > 0 ? `-₹${order.discount_amt}` : '—'}
+                            </td>
+                            <td className="py-2 text-right font-bold text-orange-500">
+                              ₹{order.final_amount}
+                            </td>
                           </tr>
                         ))}
                       </tbody>
                       <tfoot>
                         <tr className="border-t-2 border-gray-200">
-                          <td colSpan={5} className="py-2 font-bold text-gray-700">Grand Total</td>
+                          <td colSpan={6} className="py-2 font-bold text-gray-700">Grand Total</td>
                           <td className="py-2 text-right font-bold text-orange-500 text-lg">
                             ₹{settlData.grandTotal}
                           </td>
@@ -574,8 +607,8 @@ export default function Reports() {
             )}
           </div>
         )}
+
       </div>
     </div>
   )
 }
-//Yash Code
