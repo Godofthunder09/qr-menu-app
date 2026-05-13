@@ -14,20 +14,23 @@ export default function TodayReport() {
   const navigate = useNavigate()
   const [bills, setBills] = useState([])
   const [loading, setLoading] = useState(true)
-  const [settling, setSettling] = useState(null) // orderId being settled
+  const [settling, setSettling] = useState(null)
   const [showCloseDay, setShowCloseDay] = useState(false)
   const [closingDay, setClosingDay] = useState(false)
   const [summary, setSummary] = useState(null)
 
-  // Settlement modal
+  // Settlement modal — payment type only
   const [showSettleModal, setShowSettleModal] = useState(false)
   const [settleOrderId, setSettleOrderId] = useState(null)
   const [settleTableName, setSettleTableName] = useState('')
-  const [settleAmount, setSettleAmount] = useState(0)
+  const [settleFinalAmount, setSettleFinalAmount] = useState(0)
   const [settleType, setSettleType] = useState('cash')
-  const [serviceChargePct, setServiceChargePct] = useState(0)
-  const [discountType, setDiscountType] = useState('percent')
-  const [discountValue, setDiscountValue] = useState('')
+
+  // For display inside modal
+  const [settleSubtotal, setSettleSubtotal] = useState(0)
+  const [settleServiceChargePct, setSettleServiceChargePct] = useState(0)
+  const [settleServiceChargeAmt, setSettleServiceChargeAmt] = useState(0)
+  const [settleDiscountAmt, setSettleDiscountAmt] = useState(0)
 
   useEffect(() => { fetchTodayBills() }, [])
 
@@ -56,7 +59,6 @@ export default function TodayReport() {
     const list = data || []
     setBills(list)
 
-    // Compute summary
     const settled = list.filter(b => b.settlement_status === 'settled')
     const pending = list.filter(b => b.settlement_status === 'pending')
     const totalRevenue = settled.reduce((s, b) => s + (b.final_amount || 0), 0)
@@ -67,28 +69,20 @@ export default function TodayReport() {
     setLoading(false)
   }
 
-  // Open settle modal for a bill
+  // Open settle modal — amounts are read-only (already fixed at print time)
   const openSettle = (bill) => {
     setSettleOrderId(bill.id)
     setSettleTableName(bill.table_name_snapshot || 'Table')
-    setSettleAmount(bill.subtotal || 0)
+    setSettleSubtotal(bill.subtotal || 0)
+    setSettleServiceChargePct(bill.service_charge_pct || 0)
+    setSettleServiceChargeAmt(bill.service_charge_amt || 0)
+    setSettleDiscountAmt(bill.discount_amt || 0)
+    setSettleFinalAmount(bill.final_amount || bill.subtotal || 0)
     setSettleType('cash')
-    setServiceChargePct(0)
-    setDiscountType('percent')
-    setDiscountValue('')
     setShowSettleModal(true)
   }
 
-  // Computed settle amounts
-  const settleServiceAmt = Math.round(settleAmount * serviceChargePct / 100)
-  const afterService = settleAmount + settleServiceAmt
-  const dv = parseFloat(discountValue) || 0
-  const settleDiscountAmt = discountType === 'percent'
-    ? Math.round(afterService * dv / 100)
-    : Math.min(dv, afterService)
-  const settleFinalAmount = afterService - settleDiscountAmt
-
-  // Confirm settlement
+  // Confirm settlement — only update payment_type and status
   const confirmSettle = async () => {
     if (!settleOrderId) return
     setSettling(settleOrderId)
@@ -96,12 +90,6 @@ export default function TodayReport() {
     await supabase.from('orders').update({
       payment_type: settleType,
       settlement_status: 'settled',
-      service_charge_pct: serviceChargePct,
-      service_charge_amt: settleServiceAmt,
-      discount_type: discountType,
-      discount_value: dv,
-      discount_amt: settleDiscountAmt,
-      final_amount: settleFinalAmount
     }).eq('id', settleOrderId)
 
     // Update daily_reports
@@ -116,7 +104,7 @@ export default function TodayReport() {
         cash_revenue: existing.cash_revenue + (settleType === 'cash' ? settleFinalAmount : 0),
         upi_revenue: existing.upi_revenue + (settleType === 'upi' ? settleFinalAmount : 0),
         card_revenue: existing.card_revenue + (settleType === 'card' ? settleFinalAmount : 0),
-        service_charge_total: existing.service_charge_total + settleServiceAmt,
+        service_charge_total: existing.service_charge_total + settleServiceChargeAmt,
         updated_at: new Date().toISOString()
       }).eq('report_date', today)
     } else {
@@ -127,7 +115,7 @@ export default function TodayReport() {
         cash_revenue: settleType === 'cash' ? settleFinalAmount : 0,
         upi_revenue: settleType === 'upi' ? settleFinalAmount : 0,
         card_revenue: settleType === 'card' ? settleFinalAmount : 0,
-        service_charge_total: settleServiceAmt
+        service_charge_total: settleServiceChargeAmt
       })
     }
 
@@ -146,7 +134,6 @@ export default function TodayReport() {
     }
 
     setClosingDay(true)
-    // Mark all today's bills as day_closed
     const today = todayIST()
     const startISO = new Date(today + 'T00:00:00+05:30').toISOString()
     const endISO = new Date(today + 'T23:59:59+05:30').toISOString()
@@ -185,65 +172,39 @@ export default function TodayReport() {
   return (
     <div className="min-h-screen bg-gray-50">
 
-      {/* Settlement Modal */}
+      {/* Settlement Modal — payment type selection only */}
       {showSettleModal && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-2xl">
             <h2 className="text-xl font-bold text-gray-800 mb-1">💰 Settle Bill</h2>
             <p className="text-sm text-gray-400 mb-4">{settleTableName}</p>
 
-            {/* Amounts */}
+            {/* Bill breakdown — read only */}
             <div className="bg-gray-50 rounded-xl p-4 mb-4 space-y-2">
-              <div className="flex justify-between text-sm text-gray-600">
-                <span>Bill Amount</span>
-                <span className="font-bold">₹{settleAmount}</span>
+              <div className="flex justify-between text-sm text-gray-500">
+                <span>Bill Subtotal</span>
+                <span>₹{settleSubtotal}</span>
               </div>
-
-              {/* Service Charge */}
-              <div className="flex justify-between text-sm text-gray-600 items-center">
-                <span>Service Charge</span>
-                <div className="flex items-center gap-2">
-                  <select value={serviceChargePct}
-                    onChange={e => setServiceChargePct(Number(e.target.value))}
-                    className="border rounded px-2 py-0.5 text-xs">
-                    <option value={0}>0%</option>
-                    <option value={5}>5%</option>
-                    <option value={10}>10%</option>
-                    <option value={12}>12%</option>
-                    <option value={18}>18%</option>
-                  </select>
-                  <span className="font-medium text-xs">₹{settleServiceAmt}</span>
+              {settleServiceChargeAmt > 0 && (
+                <div className="flex justify-between text-sm text-gray-500">
+                  <span>Service Charge ({settleServiceChargePct}%)</span>
+                  <span>+₹{settleServiceChargeAmt}</span>
                 </div>
-              </div>
-
-              {/* Discount */}
-              <div className="flex justify-between text-sm text-gray-600 items-center">
-                <span>Discount</span>
-                <div className="flex items-center gap-2">
-                  <select value={discountType}
-                    onChange={e => { setDiscountType(e.target.value); setDiscountValue('') }}
-                    className="border rounded px-2 py-0.5 text-xs">
-                    <option value="percent">%</option>
-                    <option value="flat">₹ flat</option>
-                  </select>
-                  <input type="number" min="0" value={discountValue}
-                    onChange={e => setDiscountValue(e.target.value)}
-                    placeholder="0"
-                    className="border rounded px-2 py-0.5 text-xs w-16 text-right" />
-                  {settleDiscountAmt > 0 && (
-                    <span className="text-green-600 text-xs font-medium">-₹{settleDiscountAmt}</span>
-                  )}
+              )}
+              {settleDiscountAmt > 0 && (
+                <div className="flex justify-between text-sm text-green-600">
+                  <span>Discount</span>
+                  <span>-₹{settleDiscountAmt}</span>
                 </div>
-              </div>
-
+              )}
               <div className="border-t pt-2 flex justify-between font-bold text-gray-800">
-                <span>Final Total</span>
+                <span>Amount to Collect</span>
                 <span className="text-orange-500 text-lg">₹{settleFinalAmount}</span>
               </div>
             </div>
 
             {/* Payment Type */}
-            <p className="text-sm font-medium text-gray-700 mb-2">Payment Method</p>
+            <p className="text-sm font-medium text-gray-700 mb-2">How did they pay?</p>
             <div className="grid grid-cols-3 gap-2 mb-4">
               {[
                 { id: 'cash', label: '💵 Cash' },
@@ -419,12 +380,12 @@ export default function TodayReport() {
                       <p className="text-xs text-gray-400">{toIST(bill.paid_at)}</p>
                     </div>
                     <div className="text-right">
-                      <p className="text-xl font-bold text-orange-500">₹{bill.subtotal}</p>
+                      <p className="text-xl font-bold text-orange-500">₹{bill.final_amount}</p>
                       <PayBadge type={bill.payment_type} />
                     </div>
                   </div>
 
-                  <div className="space-y-1 mb-3">
+                  <div className="space-y-1 mb-2">
                     {bill.order_items?.map((item, i) => (
                       <div key={i} className="flex justify-between text-xs text-gray-500">
                         <span>{item.food_items?.name} × {item.quantity}</span>
@@ -433,9 +394,30 @@ export default function TodayReport() {
                     ))}
                   </div>
 
+                  {(bill.service_charge_amt > 0 || bill.discount_amt > 0) && (
+                    <div className="border-t mt-2 pt-2 space-y-0.5 mb-2">
+                      {bill.service_charge_amt > 0 && (
+                        <div className="flex justify-between text-xs text-gray-400">
+                          <span>Service ({bill.service_charge_pct}%)</span>
+                          <span>+₹{bill.service_charge_amt}</span>
+                        </div>
+                      )}
+                      {bill.discount_amt > 0 && (
+                        <div className="flex justify-between text-xs text-green-600">
+                          <span>Discount</span>
+                          <span>-₹{bill.discount_amt}</span>
+                        </div>
+                      )}
+                      <div className="flex justify-between text-xs font-bold text-gray-700 pt-1">
+                        <span>Total</span>
+                        <span>₹{bill.final_amount}</span>
+                      </div>
+                    </div>
+                  )}
+
                   <button onClick={() => openSettle(bill)}
                     className="w-full bg-orange-500 text-white py-2.5 rounded-xl font-bold text-sm hover:bg-orange-600">
-                    💰 Settle This Bill
+                    💳 Select Payment Method
                   </button>
                 </div>
               ))}
@@ -480,7 +462,7 @@ export default function TodayReport() {
                       {bill.service_charge_amt > 0 && (
                         <div className="flex justify-between text-xs text-gray-400">
                           <span>Service ({bill.service_charge_pct}%)</span>
-                          <span>₹{bill.service_charge_amt}</span>
+                          <span>+₹{bill.service_charge_amt}</span>
                         </div>
                       )}
                       {bill.discount_amt > 0 && (

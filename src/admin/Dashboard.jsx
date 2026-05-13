@@ -45,8 +45,10 @@ ${lines.liquorItems.map(i => `<div class="row"><span>${i.name} x${i.qty}</span><
 <div class="row bold"><span>Liquor Subtotal</span><span>Rs.${lines.liquorSubtotal}</span></div>
 <div class="div"></div>` : ''}
 <div class="row"><span>Subtotal</span><span>Rs.${lines.subtotal}</span></div>
+${lines.serviceChargeAmt > 0 ? `<div class="row"><span>Service Charge (${lines.serviceChargePct}%)</span><span>Rs.${lines.serviceChargeAmt}</span></div>` : ''}
+${lines.discountAmt > 0 ? `<div class="row"><span>Discount${lines.discountType === 'percent' ? ` (${lines.discountValue}%)` : ' (Flat)'}</span><span>-Rs.${lines.discountAmt}</span></div>` : ''}
 <div class="div"></div>
-<div class="row big"><span>TOTAL</span><span>Rs.${lines.subtotal}</span></div>
+<div class="row big"><span>TOTAL</span><span>Rs.${lines.finalAmount}</span></div>
 <div class="div"></div>
 <div class="center">Thank you! Visit again!</div>
 </body></html>`
@@ -70,6 +72,11 @@ export default function Dashboard() {
   const [editMode, setEditMode] = useState(false)
   const [removedItems, setRemovedItems] = useState(new Set())
   const [billPrinted, setBillPrinted] = useState(false)
+
+  // Service charge & discount (set at print time)
+  const [serviceChargePct, setServiceChargePct] = useState(0)
+  const [discountType, setDiscountType] = useState('percent')
+  const [discountValue, setDiscountValue] = useState('')
 
   const prevOrderIds = useRef(new Set())
   const audioCtxRef = useRef(null)
@@ -176,22 +183,44 @@ export default function Dashboard() {
     const foodSubtotal = foodItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
     const liquorSubtotal = liquorItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
     const subtotal = foodSubtotal + liquorSubtotal
-    return { items, foodItems, liquorItems, foodSubtotal, liquorSubtotal, subtotal }
-  }, [getEffectiveItems])
+
+    // Apply service charge then discount
+    const serviceChargeAmt = Math.round(subtotal * serviceChargePct / 100)
+    const afterService = subtotal + serviceChargeAmt
+    const dv = parseFloat(discountValue) || 0
+    const discountAmt = discountType === 'percent'
+      ? Math.round(afterService * dv / 100)
+      : Math.min(dv, afterService)
+    const finalAmount = afterService - discountAmt
+
+    return {
+      items, foodItems, liquorItems,
+      foodSubtotal, liquorSubtotal, subtotal,
+      serviceChargeAmt, discountAmt, finalAmount
+    }
+  }, [getEffectiveItems, serviceChargePct, discountType, discountValue])
 
   const openPreview = (tableId) => {
     setPayTableId(tableId)
     setEditMode(false)
     setRemovedItems(new Set())
     setBillPrinted(false)
+    setServiceChargePct(0)
+    setDiscountType('percent')
+    setDiscountValue('')
     setShowPreview(true)
   }
 
   // Print bill and save to today's report (pending settlement)
   const handlePrintAndSave = async () => {
     const tblData = tables.find(t => t.id === payTableId)
-    const { foodItems, liquorItems, foodSubtotal, liquorSubtotal, subtotal } = computeTotals(payTableId)
+    const {
+      foodItems, liquorItems,
+      foodSubtotal, liquorSubtotal, subtotal,
+      serviceChargeAmt, discountAmt, finalAmount
+    } = computeTotals(payTableId)
     const now = new Date()
+    const dv = parseFloat(discountValue) || 0
 
     // Print receipt
     const lines = {
@@ -210,6 +239,9 @@ export default function Dashboard() {
         total: i.price_at_order * i.quantity
       })),
       foodSubtotal, liquorSubtotal, subtotal,
+      serviceChargePct, serviceChargeAmt,
+      discountType, discountValue: dv, discountAmt,
+      finalAmount,
     }
 
     const w = window.open('', '_blank', 'width=400,height=600')
@@ -219,7 +251,7 @@ export default function Dashboard() {
     w.print()
     w.close()
 
-    // Save to DB — mark as printed, pending settlement
+    // Save to DB — mark as printed with full computed amounts, pending payment settlement only
     const tOrders = orders.filter(o => o.table_id === payTableId)
     const nowIST = now.toISOString()
 
@@ -228,7 +260,12 @@ export default function Dashboard() {
         is_paid: true,
         paid_at: nowIST,
         subtotal,
-        final_amount: subtotal,
+        service_charge_pct: serviceChargePct,
+        service_charge_amt: serviceChargeAmt,
+        discount_type: discountType,
+        discount_value: dv,
+        discount_amt: discountAmt,
+        final_amount: finalAmount,
         settlement_status: 'pending',
         table_name_snapshot: tblData?.table_name || '',
         payment_type: 'pending'
@@ -406,14 +443,81 @@ export default function Dashboard() {
                 </div>
               )}
 
+              {/* Service Charge & Discount */}
+              {!editMode && (
+                <div className="bg-gray-50 rounded-xl p-3 space-y-3">
+                  <p className="text-xs font-bold text-gray-500 uppercase">Charges & Discount</p>
+
+                  {/* Service Charge */}
+                  <div className="flex justify-between items-center text-sm text-gray-600">
+                    <span>Service Charge</span>
+                    <div className="flex items-center gap-2">
+                      <select value={serviceChargePct}
+                        onChange={e => setServiceChargePct(Number(e.target.value))}
+                        className="border rounded px-2 py-0.5 text-xs">
+                        <option value={0}>0%</option>
+                        <option value={5}>5%</option>
+                        <option value={10}>10%</option>
+                        <option value={12}>12%</option>
+                        <option value={18}>18%</option>
+                      </select>
+                      {previewTotals.serviceChargeAmt > 0 && (
+                        <span className="text-xs font-medium text-gray-700">+₹{previewTotals.serviceChargeAmt}</span>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Discount */}
+                  <div className="flex justify-between items-center text-sm text-gray-600">
+                    <span>Discount</span>
+                    <div className="flex items-center gap-2">
+                      <select value={discountType}
+                        onChange={e => { setDiscountType(e.target.value); setDiscountValue('') }}
+                        className="border rounded px-2 py-0.5 text-xs">
+                        <option value="percent">%</option>
+                        <option value="flat">₹ flat</option>
+                      </select>
+                      <input type="number" min="0" value={discountValue}
+                        onChange={e => setDiscountValue(e.target.value)}
+                        placeholder="0"
+                        className="border rounded px-2 py-0.5 text-xs w-16 text-right" />
+                      {previewTotals.discountAmt > 0 && (
+                        <span className="text-green-600 text-xs font-medium">-₹{previewTotals.discountAmt}</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Total */}
               <div className="bg-gray-50 rounded-xl p-3">
+                {!editMode && (
+                  <>
+                    <div className="flex justify-between text-xs text-gray-500 mb-1">
+                      <span>Subtotal</span>
+                      <span>₹{previewTotals.subtotal}</span>
+                    </div>
+                    {previewTotals.serviceChargeAmt > 0 && (
+                      <div className="flex justify-between text-xs text-gray-500 mb-1">
+                        <span>Service ({serviceChargePct}%)</span>
+                        <span>+₹{previewTotals.serviceChargeAmt}</span>
+                      </div>
+                    )}
+                    {previewTotals.discountAmt > 0 && (
+                      <div className="flex justify-between text-xs text-green-600 mb-1">
+                        <span>Discount</span>
+                        <span>-₹{previewTotals.discountAmt}</span>
+                      </div>
+                    )}
+                    <div className="border-t border-dashed border-gray-200 my-1" />
+                  </>
+                )}
                 <div className="flex justify-between font-bold text-gray-800 text-base">
-                  <span>Total</span>
-                  <span className="text-orange-500 text-xl">₹{previewTotals.subtotal}</span>
+                  <span>Final Total</span>
+                  <span className="text-orange-500 text-xl">₹{previewTotals.finalAmount}</span>
                 </div>
                 <p className="text-xs text-gray-400 mt-1 text-center">
-                  Payment will be settled in Today's Report
+                  Payment method collected in Today's Report
                 </p>
               </div>
 
@@ -655,7 +759,7 @@ export default function Dashboard() {
                   <span className="font-bold text-2xl">₹{tableSubtotal}</span>
                 </div>
                 <p className="text-orange-100 text-xs mb-4">
-                  * Settlement (Cash/UPI/Card) done in Today's Report
+                  * Charges, discount & payment method set when printing bill
                 </p>
                 <button onClick={() => openPreview(selectedTable.id)}
                   disabled={clearing || tableOrders.length === 0}
