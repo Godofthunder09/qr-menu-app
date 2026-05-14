@@ -26,10 +26,12 @@ const buildHtmlReceipt = (lines) => `
   .center{text-align:center}.bold{font-weight:bold}.big{font-size:16px;font-weight:bold}
   .row{display:flex;justify-content:space-between}.div{border-top:1px dashed #000;margin:4px 0}
   .section-title{font-weight:bold;margin-top:6px}
+  @media print{body{margin:0;padding:0}}
 </style></head><body>
 <div class="center big">${lines.restaurantName}</div>
 <div class="center">${lines.address}</div>
 <div class="center">${lines.phone}</div>
+${lines.gstNumber ? `<div class="center">GST: ${lines.gstNumber}</div>` : ''}
 <div class="div"></div>
 <div class="row"><span>Table: ${lines.tableName}</span><span>${lines.date}</span></div>
 <div>Time: ${lines.time}</div>
@@ -45,12 +47,12 @@ ${lines.liquorItems.map(i => `<div class="row"><span>${i.name} x${i.qty}</span><
 <div class="row bold"><span>Liquor Subtotal</span><span>Rs.${lines.liquorSubtotal}</span></div>
 <div class="div"></div>` : ''}
 <div class="row"><span>Subtotal</span><span>Rs.${lines.subtotal}</span></div>
-${lines.serviceChargeAmt > 0 ? `<div class="row"><span>Service Charge (${lines.serviceChargePct}%)</span><span>Rs.${lines.serviceChargeAmt}</span></div>` : ''}
+${lines.serviceChargeAmt > 0 ? `<div class="row"><span>Service (${lines.serviceChargePct}%)</span><span>Rs.${lines.serviceChargeAmt}</span></div>` : ''}
 ${lines.discountAmt > 0 ? `<div class="row"><span>Discount${lines.discountType === 'percent' ? ` (${lines.discountValue}%)` : ' (Flat)'}</span><span>-Rs.${lines.discountAmt}</span></div>` : ''}
 <div class="div"></div>
 <div class="row big"><span>TOTAL</span><span>Rs.${lines.finalAmount}</span></div>
 <div class="div"></div>
-<div class="center">Thank you! Visit again!</div>
+<div class="center">${lines.footerNote || 'Thank you! Visit again!'}</div>
 </body></html>`
 
 export default function Dashboard() {
@@ -66,6 +68,15 @@ export default function Dashboard() {
   const [soundReady, setSoundReady] = useState(false)
   const [sessionStart] = useState(() => new Date().toISOString())
 
+  // Restaurant settings from DB
+  const [restaurant, setRestaurant] = useState({
+    name: 'My Restaurant',
+    address: '',
+    phone: '',
+    gst_number: '',
+    footer_note: 'Thank you! Visit again!'
+  })
+
   // Bill preview modal
   const [showPreview, setShowPreview] = useState(false)
   const [payTableId, setPayTableId] = useState(null)
@@ -73,7 +84,7 @@ export default function Dashboard() {
   const [removedItems, setRemovedItems] = useState(new Set())
   const [billPrinted, setBillPrinted] = useState(false)
 
-  // Service charge & discount (set at print time)
+  // Service charge & discount
   const [serviceChargePct, setServiceChargePct] = useState(0)
   const [discountType, setDiscountType] = useState('percent')
   const [discountValue, setDiscountValue] = useState('')
@@ -82,11 +93,19 @@ export default function Dashboard() {
   const audioCtxRef = useRef(null)
   const navigate = useNavigate()
 
-  const RESTAURANT = {
-    name: 'My Restaurant',
-    address: '123, Main Street',
-    phone: '+91 98765 43210',
-  }
+  // ── Load restaurant settings ────────────────────────────
+  useEffect(() => {
+    supabase.from('settings').select('*').eq('id', 'main').single()
+      .then(({ data }) => {
+        if (data) setRestaurant({
+          name: data.restaurant_name || 'My Restaurant',
+          address: data.address || '',
+          phone: data.phone || '',
+          gst_number: data.gst_number || '',
+          footer_note: data.footer_note || 'Thank you! Visit again!'
+        })
+      })
+  }, [])
 
   const initAudio = () => {
     if (!audioCtxRef.current) {
@@ -161,7 +180,6 @@ export default function Dashboard() {
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
-  // Get items excluding removed ones
   const getEffectiveItems = useCallback((tableId) => {
     const tOrders = orders.filter(o => o.table_id === tableId)
     const result = []
@@ -183,8 +201,6 @@ export default function Dashboard() {
     const foodSubtotal = foodItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
     const liquorSubtotal = liquorItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
     const subtotal = foodSubtotal + liquorSubtotal
-
-    // Apply service charge then discount
     const serviceChargeAmt = Math.round(subtotal * serviceChargePct / 100)
     const afterService = subtotal + serviceChargeAmt
     const dv = parseFloat(discountValue) || 0
@@ -192,12 +208,7 @@ export default function Dashboard() {
       ? Math.round(afterService * dv / 100)
       : Math.min(dv, afterService)
     const finalAmount = afterService - discountAmt
-
-    return {
-      items, foodItems, liquorItems,
-      foodSubtotal, liquorSubtotal, subtotal,
-      serviceChargeAmt, discountAmt, finalAmount
-    }
+    return { items, foodItems, liquorItems, foodSubtotal, liquorSubtotal, subtotal, serviceChargeAmt, discountAmt, finalAmount }
   }, [getEffectiveItems, serviceChargePct, discountType, discountValue])
 
   const openPreview = (tableId) => {
@@ -211,33 +222,23 @@ export default function Dashboard() {
     setShowPreview(true)
   }
 
-  // Print bill and save to today's report (pending settlement)
   const handlePrintAndSave = async () => {
     const tblData = tables.find(t => t.id === payTableId)
-    const {
-      foodItems, liquorItems,
-      foodSubtotal, liquorSubtotal, subtotal,
-      serviceChargeAmt, discountAmt, finalAmount
-    } = computeTotals(payTableId)
+    const { foodItems, liquorItems, foodSubtotal, liquorSubtotal, subtotal, serviceChargeAmt, discountAmt, finalAmount } = computeTotals(payTableId)
     const now = new Date()
     const dv = parseFloat(discountValue) || 0
 
-    // Print receipt
     const lines = {
-      restaurantName: RESTAURANT.name,
-      address: RESTAURANT.address,
-      phone: RESTAURANT.phone,
+      restaurantName: restaurant.name,
+      address: restaurant.address,
+      phone: restaurant.phone,
+      gstNumber: restaurant.gst_number,
+      footerNote: restaurant.footer_note,
       tableName: tblData?.table_name || '',
       date: toISTDate(now.toISOString()),
       time: toIST(now.toISOString()),
-      foodItems: foodItems.map(i => ({
-        name: i.food_items?.name, qty: i.quantity,
-        total: i.price_at_order * i.quantity
-      })),
-      liquorItems: liquorItems.map(i => ({
-        name: i.food_items?.name, qty: i.quantity,
-        total: i.price_at_order * i.quantity
-      })),
+      foodItems: foodItems.map(i => ({ name: i.food_items?.name, qty: i.quantity, total: i.price_at_order * i.quantity })),
+      liquorItems: liquorItems.map(i => ({ name: i.food_items?.name, qty: i.quantity, total: i.price_at_order * i.quantity })),
       foodSubtotal, liquorSubtotal, subtotal,
       serviceChargePct, serviceChargeAmt,
       discountType, discountValue: dv, discountAmt,
@@ -251,7 +252,6 @@ export default function Dashboard() {
     w.print()
     w.close()
 
-    // Save to DB — mark as printed with full computed amounts, pending payment settlement only
     const tOrders = orders.filter(o => o.table_id === payTableId)
     const nowIST = now.toISOString()
 
@@ -272,7 +272,6 @@ export default function Dashboard() {
       }).eq('id', order.id)
     }
 
-    // Clear table
     await nukeClearTable(payTableId)
 
     setNewOrderIds(prev => {
@@ -292,11 +291,9 @@ export default function Dashboard() {
       const { data: ords } = await supabase
         .from('orders').select('id').eq('table_id', tableId).eq('is_paid', false)
       if (ords && ords.length > 0) {
-        await supabase.from('order_items').delete()
-          .in('order_id', ords.map(o => o.id))
+        await supabase.from('order_items').delete().in('order_id', ords.map(o => o.id))
       }
-      await supabase.from('orders').delete()
-        .eq('table_id', tableId).eq('is_paid', false)
+      await supabase.from('orders').delete().eq('table_id', tableId).eq('is_paid', false)
       await supabase.from('table_sessions').delete().eq('table_id', tableId)
       const { data: tbl } = await supabase
         .from('tables').select('session_version').eq('id', tableId).single()
@@ -325,9 +322,7 @@ export default function Dashboard() {
     navigate('/')
   }
 
-  const tableOrders = selectedTable
-    ? orders.filter(o => o.table_id === selectedTable.id)
-    : []
+  const tableOrders = selectedTable ? orders.filter(o => o.table_id === selectedTable.id) : []
   const allItems = tableOrders.flatMap(o => o.order_items || [])
   const groupedByOrder = tableOrders.map(o => ({ ...o, items: o.order_items || [] }))
   const tableSubtotal = allItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
@@ -351,12 +346,14 @@ export default function Dashboard() {
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl max-h-[92vh] flex flex-col">
 
-            {/* Header */}
             <div className="p-5 border-b">
               <div className="text-center">
-                <p className="font-bold text-lg text-gray-800">{RESTAURANT.name}</p>
-                <p className="text-xs text-gray-400">{RESTAURANT.address}</p>
-                <p className="text-xs text-gray-400">{RESTAURANT.phone}</p>
+                <p className="font-bold text-lg text-gray-800">{restaurant.name}</p>
+                <p className="text-xs text-gray-400">{restaurant.address}</p>
+                <p className="text-xs text-gray-400">{restaurant.phone}</p>
+                {restaurant.gst_number && (
+                  <p className="text-xs text-gray-400">GST: {restaurant.gst_number}</p>
+                )}
               </div>
               <div className="flex justify-between text-xs text-gray-500 mt-3">
                 <span>Table: <strong>{previewTableName}</strong></span>
@@ -364,7 +361,6 @@ export default function Dashboard() {
               </div>
             </div>
 
-            {/* Items */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
 
               {/* Food */}
@@ -443,12 +439,10 @@ export default function Dashboard() {
                 </div>
               )}
 
-              {/* Service Charge & Discount */}
+              {/* Charges */}
               {!editMode && (
                 <div className="bg-gray-50 rounded-xl p-3 space-y-3">
                   <p className="text-xs font-bold text-gray-500 uppercase">Charges & Discount</p>
-
-                  {/* Service Charge */}
                   <div className="flex justify-between items-center text-sm text-gray-600">
                     <span>Service Charge</span>
                     <div className="flex items-center gap-2">
@@ -466,8 +460,6 @@ export default function Dashboard() {
                       )}
                     </div>
                   </div>
-
-                  {/* Discount */}
                   <div className="flex justify-between items-center text-sm text-gray-600">
                     <span>Discount</span>
                     <div className="flex items-center gap-2">
@@ -494,8 +486,7 @@ export default function Dashboard() {
                 {!editMode && (
                   <>
                     <div className="flex justify-between text-xs text-gray-500 mb-1">
-                      <span>Subtotal</span>
-                      <span>₹{previewTotals.subtotal}</span>
+                      <span>Subtotal</span><span>₹{previewTotals.subtotal}</span>
                     </div>
                     {previewTotals.serviceChargeAmt > 0 && (
                       <div className="flex justify-between text-xs text-gray-500 mb-1">
@@ -517,7 +508,7 @@ export default function Dashboard() {
                   <span className="text-orange-500 text-xl">₹{previewTotals.finalAmount}</span>
                 </div>
                 <p className="text-xs text-gray-400 mt-1 text-center">
-                  Payment method collected in Today's Report
+                  Payment method settled in Today's Report
                 </p>
               </div>
 
@@ -528,7 +519,6 @@ export default function Dashboard() {
               )}
             </div>
 
-            {/* Actions */}
             <div className="p-4 border-t space-y-2">
               {editMode ? (
                 <div className="flex gap-3">
@@ -609,6 +599,10 @@ export default function Dashboard() {
             className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Menu</button>
           <button onClick={() => navigate('/admin/tables')}
             className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Tables</button>
+          <button onClick={() => navigate('/admin/settings')}
+            className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-gray-200">
+            ⚙️ Settings
+          </button>
           <button onClick={handleLogout}
             className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200">Logout</button>
         </div>
@@ -703,7 +697,8 @@ export default function Dashboard() {
                       </span>
                     </div>
                   </div>
-                  <button onClick={() => openPreview(selectedTable.id)} disabled={clearing || tableOrders.length === 0}
+                  <button onClick={() => openPreview(selectedTable.id)}
+                    disabled={clearing || tableOrders.length === 0}
                     className="bg-green-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-green-600 transition disabled:opacity-50">
                     🖨️ Print Bill & Clear
                   </button>
@@ -728,9 +723,7 @@ export default function Dashboard() {
                             </span>
                           )}
                           {!isNewOrder && index === 0 && (
-                            <span className="bg-green-100 text-green-600 text-xs font-bold px-3 py-1 rounded-full">
-                              Latest ✨
-                            </span>
+                            <span className="bg-green-100 text-green-600 text-xs font-bold px-3 py-1 rounded-full">Latest ✨</span>
                           )}
                         </div>
                         <span className="text-xs text-gray-400">🕐 {toIST(order.created_at)}</span>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 
@@ -7,12 +7,10 @@ export default function MenuManager() {
   const [subcategories, setSubcategories] = useState([])
   const [foodItems, setFoodItems] = useState([])
 
-  // Add form
   const [newCategory, setNewCategory] = useState('')
   const [newSubcategory, setNewSubcategory] = useState('')
   const [newSubcategoryParent, setNewSubcategoryParent] = useState('')
 
-  // Food item form
   const [itemName, setItemName] = useState('')
   const [itemPrice, setItemPrice] = useState('')
   const [itemDescription, setItemDescription] = useState('')
@@ -20,7 +18,6 @@ export default function MenuManager() {
   const [itemCategory, setItemCategory] = useState('')
   const [itemSubcategory, setItemSubcategory] = useState('')
 
-  // Edit form
   const [editItem, setEditItem] = useState(null)
   const [editName, setEditName] = useState('')
   const [editPrice, setEditPrice] = useState('')
@@ -29,10 +26,18 @@ export default function MenuManager() {
   const [editCategory, setEditCategory] = useState('')
   const [editSubcategory, setEditSubcategory] = useState('')
 
-  // Search/Filter
   const [filterCategory, setFilterCategory] = useState('')
   const [filterSubcategory, setFilterSubcategory] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
+
+  // CSV Import
+  const [showCsvModal, setShowCsvModal] = useState(false)
+  const [csvText, setCsvText] = useState('')
+  const [csvPreview, setCsvPreview] = useState([])
+  const [csvErrors, setCsvErrors] = useState([])
+  const [csvImporting, setCsvImporting] = useState(false)
+  const [csvDone, setCsvDone] = useState(false)
+  const csvFileRef = useRef(null)
 
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -42,17 +47,11 @@ export default function MenuManager() {
 
   const fetchAll = async () => {
     const { data: cats } = await supabase
-      .from('categories')
-      .select('*')
-      .eq('is_subcategory', false)
-      .order('created_at')
+      .from('categories').select('*').eq('is_subcategory', false).order('created_at')
     setCategories(cats || [])
 
     const { data: subs } = await supabase
-      .from('categories')
-      .select('*')
-      .eq('is_subcategory', true)
-      .order('created_at')
+      .from('categories').select('*').eq('is_subcategory', true).order('created_at')
     setSubcategories(subs || [])
 
     const { data: items } = await supabase
@@ -69,13 +68,10 @@ export default function MenuManager() {
     setTimeout(() => setMessage(''), 2500)
   }
 
-  // ── Categories ───────────────────────────────────────────
+  // ── Categories ────────────────────────────────────────────
   const addCategory = async () => {
     if (!newCategory.trim()) return
-    await supabase.from('categories').insert({
-      name: newCategory.trim(),
-      is_subcategory: false
-    })
+    await supabase.from('categories').insert({ name: newCategory.trim(), is_subcategory: false })
     setNewCategory('')
     fetchAll()
     showMsg('Category added! ✅')
@@ -85,9 +81,7 @@ export default function MenuManager() {
     if (!newSubcategory.trim()) { alert('Enter subcategory name'); return }
     if (!newSubcategoryParent) { alert('Select a parent category'); return }
     await supabase.from('categories').insert({
-      name: newSubcategory.trim(),
-      is_subcategory: true,
-      parent_id: newSubcategoryParent
+      name: newSubcategory.trim(), is_subcategory: true, parent_id: newSubcategoryParent
     })
     setNewSubcategory('')
     setNewSubcategoryParent('')
@@ -101,7 +95,7 @@ export default function MenuManager() {
     fetchAll()
   }
 
-  // ── Image upload ─────────────────────────────────────────
+  // ── Image upload ──────────────────────────────────────────
   const uploadImage = async (file) => {
     const ext = file.name.split('.').pop()
     const fileName = `${Date.now()}.${ext}`
@@ -183,6 +177,125 @@ export default function MenuManager() {
     fetchAll()
   }
 
+  // ── CSV Import ────────────────────────────────────────────
+  const handleCsvFile = (e) => {
+    const file = e.target.files[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = (ev) => {
+      setCsvText(ev.target.result)
+      parseCsv(ev.target.result)
+    }
+    reader.readAsText(file)
+  }
+
+  const parseCsv = (text) => {
+    const lines = text.trim().split('\n').map(l => l.trim()).filter(Boolean)
+    if (lines.length < 2) {
+      setCsvErrors(['CSV must have a header row and at least one data row.'])
+      setCsvPreview([])
+      return
+    }
+
+    const header = lines[0].toLowerCase().split(',').map(h => h.trim().replace(/"/g, ''))
+    const requiredCols = ['name', 'price']
+    const missing = requiredCols.filter(c => !header.includes(c))
+    if (missing.length > 0) {
+      setCsvErrors([`Missing required columns: ${missing.join(', ')}`])
+      setCsvPreview([])
+      return
+    }
+
+    const nameIdx = header.indexOf('name')
+    const priceIdx = header.indexOf('price')
+    const descIdx = header.indexOf('description')
+    const catIdx = header.indexOf('category')
+    const subIdx = header.indexOf('subcategory')
+
+    const errors = []
+    const rows = []
+
+    lines.slice(1).forEach((line, i) => {
+      // Handle quoted commas
+      const cols = line.match(/(".*?"|[^,]+)(?=,|$)/g)?.map(c => c.replace(/"/g, '').trim()) || line.split(',').map(c => c.trim())
+
+      const name = cols[nameIdx] || ''
+      const priceRaw = cols[priceIdx] || ''
+      const description = descIdx >= 0 ? (cols[descIdx] || '') : ''
+      const category = catIdx >= 0 ? (cols[catIdx] || '') : ''
+      const subcategory = subIdx >= 0 ? (cols[subIdx] || '') : ''
+
+      if (!name) { errors.push(`Row ${i + 2}: Name is empty`); return }
+
+      const price = parseFloat(priceRaw)
+      if (isNaN(price) || price <= 0) {
+        errors.push(`Row ${i + 2}: Invalid price "${priceRaw}" for "${name}"`)
+        return
+      }
+
+      rows.push({ name, price, description, category, subcategory })
+    })
+
+    setCsvErrors(errors)
+    setCsvPreview(rows)
+  }
+
+  const importCsv = async () => {
+    if (csvPreview.length === 0) return
+    setCsvImporting(true)
+
+    let imported = 0
+    let skipped = 0
+
+    for (const row of csvPreview) {
+      // Find category by name
+      let categoryId = null
+      let subcategoryId = null
+
+      if (row.category) {
+        const cat = categories.find(c =>
+          c.name.toLowerCase() === row.category.toLowerCase()
+        )
+        categoryId = cat?.id || null
+      }
+
+      if (row.subcategory && categoryId) {
+        const sub = subcategories.find(s =>
+          s.name.toLowerCase() === row.subcategory.toLowerCase() &&
+          s.parent_id === categoryId
+        )
+        subcategoryId = sub?.id || null
+      }
+
+      const { error } = await supabase.from('food_items').insert({
+        name: row.name,
+        price: row.price,
+        description: row.description || '',
+        category_id: categoryId,
+        subcategory_id: subcategoryId,
+        is_available: true,
+        image_url: null
+      })
+
+      if (error) skipped++
+      else imported++
+    }
+
+    setCsvImporting(false)
+    setCsvDone(true)
+    fetchAll()
+    showMsg(`✅ Imported ${imported} items! ${skipped > 0 ? `${skipped} skipped.` : ''}`)
+  }
+
+  const closeCsvModal = () => {
+    setShowCsvModal(false)
+    setCsvText('')
+    setCsvPreview([])
+    setCsvErrors([])
+    setCsvDone(false)
+    if (csvFileRef.current) csvFileRef.current.value = ''
+  }
+
   // ── Filter logic ──────────────────────────────────────────
   const filteredSubcategories = filterCategory
     ? subcategories.filter(s => s.parent_id === filterCategory)
@@ -213,39 +326,32 @@ export default function MenuManager() {
         <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-xl max-h-[90vh] overflow-y-auto">
             <h2 className="font-bold text-gray-800 text-lg mb-4">✏️ Edit Food Item</h2>
-
             <div className="space-y-3">
               <div>
                 <label className="text-xs text-gray-500 mb-1 block">Name</label>
-                <input type="text" value={editName}
-                  onChange={e => setEditName(e.target.value)}
+                <input type="text" value={editName} onChange={e => setEditName(e.target.value)}
                   className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
               </div>
-
               <div>
                 <label className="text-xs text-gray-500 mb-1 block">Price (₹)</label>
-                <input type="number" value={editPrice}
-                  onChange={e => setEditPrice(e.target.value)}
+                <input type="number" value={editPrice} onChange={e => setEditPrice(e.target.value)}
                   className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
               </div>
-
               <div>
                 <label className="text-xs text-gray-500 mb-1 block">Description</label>
-                <textarea value={editDescription}
-                  onChange={e => setEditDescription(e.target.value)}
+                <textarea value={editDescription} onChange={e => setEditDescription(e.target.value)}
                   rows={2}
                   className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
               </div>
-
               <div>
                 <label className="text-xs text-gray-500 mb-1 block">Category</label>
-                <select value={editCategory} onChange={e => { setEditCategory(e.target.value); setEditSubcategory('') }}
+                <select value={editCategory}
+                  onChange={e => { setEditCategory(e.target.value); setEditSubcategory('') }}
                   className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
                   <option value="">Select Category</option>
                   {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </select>
               </div>
-
               {editFilteredSubcategories.length > 0 && (
                 <div>
                   <label className="text-xs text-gray-500 mb-1 block">Subcategory (optional)</label>
@@ -256,7 +362,6 @@ export default function MenuManager() {
                   </select>
                 </div>
               )}
-
               <div>
                 <label className="text-xs text-gray-500 mb-1 block">Change Image (optional)</label>
                 {editItem.image_url && (
@@ -265,9 +370,7 @@ export default function MenuManager() {
                 )}
                 <div className="border-2 border-dashed border-orange-200 rounded-lg p-3 text-center">
                   <label className="cursor-pointer">
-                    <p className="text-xs text-gray-500">
-                      {editImage ? editImage.name : 'Click to change image'}
-                    </p>
+                    <p className="text-xs text-gray-500">{editImage ? editImage.name : 'Click to change image'}</p>
                     <input type="file" accept="image/*" className="hidden"
                       onChange={e => setEditImage(e.target.files[0])} />
                     <span className="text-xs text-orange-400 underline">Browse</span>
@@ -275,16 +378,174 @@ export default function MenuManager() {
                 </div>
               </div>
             </div>
-
             <div className="flex gap-3 mt-5">
               <button onClick={() => setEditItem(null)}
-                className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium">
-                Cancel
-              </button>
+                className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium">Cancel</button>
               <button onClick={saveEdit} disabled={saving}
                 className="flex-1 bg-orange-500 text-white py-2 rounded-xl font-medium disabled:opacity-50">
-                {saving ? 'Saving...' : '💾 Save Changes'}
+                {saving ? 'Saving...' : '💾 Save'}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CSV Import Modal */}
+      {showCsvModal && (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-lg shadow-xl max-h-[90vh] flex flex-col">
+
+            <div className="p-5 border-b">
+              <h2 className="font-bold text-gray-800 text-lg">📥 Import Items from CSV</h2>
+              <p className="text-xs text-gray-400 mt-1">
+                Upload a CSV file to add multiple items at once
+              </p>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+
+              {/* Format Guide */}
+              <div className="bg-orange-50 border border-orange-200 rounded-xl p-4">
+                <p className="text-xs font-bold text-orange-600 mb-2">📋 Required CSV Format:</p>
+                <code className="text-xs text-gray-700 bg-white px-2 py-1 rounded block">
+                  name,price,description,category,subcategory
+                </code>
+                <div className="mt-2 space-y-1 text-xs text-gray-500">
+                  <p>• <strong>name</strong> and <strong>price</strong> are required</p>
+                  <p>• <strong>description</strong>, <strong>category</strong>, <strong>subcategory</strong> are optional</p>
+                  <p>• Category names must exactly match your existing categories</p>
+                  <p>• Images can be added later by editing each item</p>
+                </div>
+
+                {/* Sample Download */}
+                <button
+                  onClick={() => {
+                    const sample = `name,price,description,category,subcategory\nChicken Tikka,350,Grilled chicken with spices,Non-veg,Chicken\nPaneer Butter Masala,280,Rich creamy curry,Veg,\nDal Makhani,220,Slow cooked black lentils,Veg,\nNaan,40,Soft tandoor bread,Breads,\nKingfisher Beer,180,330ml chilled beer,Liquor,Beer`
+                    const blob = new Blob([sample], { type: 'text/csv' })
+                    const url = URL.createObjectURL(blob)
+                    const a = document.createElement('a')
+                    a.href = url
+                    a.download = 'menu_sample.csv'
+                    a.click()
+                    URL.revokeObjectURL(url)
+                  }}
+                  className="mt-2 text-xs bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg font-medium hover:bg-orange-200">
+                  ⬇️ Download Sample CSV
+                </button>
+              </div>
+
+              {/* File Upload */}
+              {!csvDone && (
+                <div
+                  className="border-2 border-dashed border-orange-300 rounded-xl p-6 text-center cursor-pointer hover:bg-orange-50 transition"
+                  onClick={() => csvFileRef.current?.click()}>
+                  <div className="text-4xl mb-2">📄</div>
+                  <p className="text-sm text-gray-600 font-medium">Click to upload CSV file</p>
+                  <p className="text-xs text-gray-400 mt-1">
+                    {csvText ? '✅ File loaded — see preview below' : 'Supports .csv files'}
+                  </p>
+                  <input
+                    ref={csvFileRef}
+                    type="file"
+                    accept=".csv"
+                    className="hidden"
+                    onChange={handleCsvFile}
+                  />
+                </div>
+              )}
+
+              {/* Errors */}
+              {csvErrors.length > 0 && (
+                <div className="bg-red-50 border border-red-200 rounded-xl p-4">
+                  <p className="text-xs font-bold text-red-600 mb-2">
+                    ⚠️ {csvErrors.length} issue(s) found:
+                  </p>
+                  <div className="space-y-1">
+                    {csvErrors.map((err, i) => (
+                      <p key={i} className="text-xs text-red-500">{err}</p>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Preview Table */}
+              {csvPreview.length > 0 && !csvDone && (
+                <div>
+                  <p className="text-sm font-bold text-gray-700 mb-2">
+                    Preview — {csvPreview.length} items ready to import
+                  </p>
+                  <div className="overflow-x-auto rounded-xl border border-gray-200">
+                    <table className="w-full text-xs">
+                      <thead className="bg-orange-50">
+                        <tr>
+                          <th className="text-left py-2 px-3 text-gray-500">Name</th>
+                          <th className="text-left py-2 px-3 text-gray-500">Price</th>
+                          <th className="text-left py-2 px-3 text-gray-500">Category</th>
+                          <th className="text-left py-2 px-3 text-gray-500">Description</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {csvPreview.map((row, i) => {
+                          const catFound = row.category
+                            ? categories.some(c => c.name.toLowerCase() === row.category.toLowerCase())
+                            : true
+                          return (
+                            <tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
+                              <td className="py-2 px-3 font-medium text-gray-700">{row.name}</td>
+                              <td className="py-2 px-3 text-orange-600 font-bold">₹{row.price}</td>
+                              <td className="py-2 px-3">
+                                {row.category ? (
+                                  <span className={`px-2 py-0.5 rounded-full text-xs font-medium
+                                    ${catFound ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-500'}`}>
+                                    {catFound ? '✓' : '✗'} {row.category}
+                                    {row.subcategory ? ` › ${row.subcategory}` : ''}
+                                  </span>
+                                ) : (
+                                  <span className="text-gray-300">—</span>
+                                )}
+                              </td>
+                              <td className="py-2 px-3 text-gray-400 truncate max-w-32">
+                                {row.description || '—'}
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="text-xs text-gray-400 mt-2">
+                    ✅ Green = category found &nbsp; ❌ Red = category not found (item will be added without category)
+                  </p>
+                </div>
+              )}
+
+              {/* Done state */}
+              {csvDone && (
+                <div className="text-center py-8">
+                  <div className="text-5xl mb-3">🎉</div>
+                  <p className="text-lg font-bold text-green-600">Import Complete!</p>
+                  <p className="text-sm text-gray-500 mt-1">
+                    {csvPreview.length} items added. Go to Food Items to add images.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 border-t flex gap-3">
+              <button onClick={closeCsvModal}
+                className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">
+                {csvDone ? '✅ Done' : 'Cancel'}
+              </button>
+              {csvPreview.length > 0 && !csvDone && (
+                <button
+                  onClick={importCsv}
+                  disabled={csvImporting}
+                  className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold hover:bg-orange-600 disabled:opacity-50">
+                  {csvImporting
+                    ? `⏳ Importing...`
+                    : `📥 Import ${csvPreview.length} Items`}
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -378,7 +639,6 @@ export default function MenuManager() {
                 </button>
               </div>
             </div>
-
             <h2 className="font-bold text-gray-700 mb-3">All Sub-Categories ({subcategories.length})</h2>
             {categories.map(cat => {
               const subs = subcategories.filter(s => s.parent_id === cat.id)
@@ -407,7 +667,14 @@ export default function MenuManager() {
 
             {/* Add Form */}
             <div className="bg-white rounded-2xl shadow p-6">
-              <h2 className="font-bold text-gray-700 mb-4">Add Food Item</h2>
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="font-bold text-gray-700">Add Food Item</h2>
+                <button
+                  onClick={() => { setShowCsvModal(true); setCsvDone(false) }}
+                  className="bg-orange-100 text-orange-600 px-4 py-2 rounded-xl text-sm font-medium hover:bg-orange-200 flex items-center gap-2">
+                  📥 Import CSV
+                </button>
+              </div>
               <div className="space-y-3">
                 <input type="text" value={itemName}
                   onChange={e => setItemName(e.target.value)}
@@ -491,14 +758,10 @@ export default function MenuManager() {
               </div>
             </div>
 
-            {/* Food Items List */}
+            {/* Items List */}
             <div className="bg-white rounded-2xl shadow p-6">
-              <h2 className="font-bold text-gray-700 mb-4">
-                All Food Items ({filteredItems.length})
-              </h2>
-              {filteredItems.length === 0 && (
-                <p className="text-gray-400 text-sm">No items found.</p>
-              )}
+              <h2 className="font-bold text-gray-700 mb-4">All Food Items ({filteredItems.length})</h2>
+              {filteredItems.length === 0 && <p className="text-gray-400 text-sm">No items found.</p>}
               <div className="space-y-3">
                 {filteredItems.map(item => (
                   <div key={item.id} className="flex items-center gap-4 border border-gray-100 rounded-xl p-3">
@@ -530,9 +793,7 @@ export default function MenuManager() {
                         ✏️ Edit
                       </button>
                       <button onClick={() => deleteFoodItem(item.id)}
-                        className="text-red-400 hover:text-red-600 text-xs">
-                        Delete
-                      </button>
+                        className="text-red-400 hover:text-red-600 text-xs">Delete</button>
                     </div>
                   </div>
                 ))}
