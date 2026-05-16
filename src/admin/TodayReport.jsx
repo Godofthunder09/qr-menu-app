@@ -10,6 +10,58 @@ const formatDate = (d) => new Date(d).toLocaleDateString('en-IN', {
   timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric'
 })
 
+// Group multiple order rows that belong to the same table session into one bill.
+// They share the same table_name_snapshot and paid_at (set in the same handlePrintAndSave call).
+// We use table_name_snapshot + paid_at (truncated to the minute) as the group key
+// so that even tiny timestamp drifts don't split a session into two cards.
+const groupOrdersIntoBills = (orders) => {
+  const map = {}
+  orders.forEach(order => {
+    // Truncate paid_at to the minute for a stable group key
+    const minuteKey = order.paid_at
+      ? order.paid_at.substring(0, 16)   // "2024-05-16T14:02"
+      : order.id
+    const key = `${order.table_name_snapshot || ''}__${minuteKey}`
+
+    if (!map[key]) {
+      map[key] = {
+        // Use the first order's id as the representative id (for settlement)
+        // We'll store ALL order ids so we can update them all on settlement
+        _orderIds: [order.id],
+        _key: key,
+        payment_type: order.payment_type,
+        settlement_status: order.settlement_status,
+        paid_at: order.paid_at,
+        table_name_snapshot: order.table_name_snapshot,
+        // Financials — these are identical across all orders in a session
+        // (set once in handlePrintAndSave), so just take from the first row.
+        subtotal: order.subtotal || 0,
+        service_charge_pct: order.service_charge_pct || 0,
+        service_charge_amt: order.service_charge_amt || 0,
+        discount_type: order.discount_type,
+        discount_value: order.discount_value || 0,
+        discount_amt: order.discount_amt || 0,
+        final_amount: order.final_amount || 0,
+        // Collect all items from all rounds
+        order_items: [...(order.order_items || [])],
+      }
+    } else {
+      map[key]._orderIds.push(order.id)
+      // Merge order_items from subsequent rounds
+      map[key].order_items = [
+        ...map[key].order_items,
+        ...(order.order_items || [])
+      ]
+      // If any order in the group is still pending, the whole bill is pending
+      if (order.settlement_status === 'pending') {
+        map[key].settlement_status = 'pending'
+      }
+    }
+  })
+
+  return Object.values(map)
+}
+
 export default function TodayReport() {
   const navigate = useNavigate()
   const [bills, setBills] = useState([])
@@ -21,16 +73,8 @@ export default function TodayReport() {
 
   // Settlement modal — payment type only
   const [showSettleModal, setShowSettleModal] = useState(false)
-  const [settleOrderId, setSettleOrderId] = useState(null)
-  const [settleTableName, setSettleTableName] = useState('')
-  const [settleFinalAmount, setSettleFinalAmount] = useState(0)
+  const [settleBill, setSettleBill] = useState(null)   // the grouped bill object
   const [settleType, setSettleType] = useState('cash')
-
-  // For display inside modal
-  const [settleSubtotal, setSettleSubtotal] = useState(0)
-  const [settleServiceChargePct, setSettleServiceChargePct] = useState(0)
-  const [settleServiceChargeAmt, setSettleServiceChargeAmt] = useState(0)
-  const [settleDiscountAmt, setSettleDiscountAmt] = useState(0)
 
   useEffect(() => { fetchTodayBills() }, [])
 
@@ -56,66 +100,71 @@ export default function TodayReport() {
 
     if (error) console.error('fetchTodayBills:', error.message)
 
-    const list = data || []
-    setBills(list)
+    const rawList = data || []
+    const grouped = groupOrdersIntoBills(rawList)
 
-    const settled = list.filter(b => b.settlement_status === 'settled')
-    const pending = list.filter(b => b.settlement_status === 'pending')
+    setBills(grouped)
+
+    const settled = grouped.filter(b => b.settlement_status !== 'pending')
+    const pending = grouped.filter(b => b.settlement_status === 'pending')
     const totalRevenue = settled.reduce((s, b) => s + (b.final_amount || 0), 0)
     const cashRev = settled.filter(b => b.payment_type === 'cash').reduce((s, b) => s + (b.final_amount || 0), 0)
     const upiRev = settled.filter(b => b.payment_type === 'upi').reduce((s, b) => s + (b.final_amount || 0), 0)
     const cardRev = settled.filter(b => b.payment_type === 'card').reduce((s, b) => s + (b.final_amount || 0), 0)
-    setSummary({ totalRevenue, cashRev, upiRev, cardRev, settled: settled.length, pending: pending.length, total: list.length })
+    setSummary({
+      totalRevenue, cashRev, upiRev, cardRev,
+      settled: settled.length, pending: pending.length, total: grouped.length
+    })
     setLoading(false)
   }
 
-  // Open settle modal — amounts are read-only (already fixed at print time)
+  // Open settle modal
   const openSettle = (bill) => {
-    setSettleOrderId(bill.id)
-    setSettleTableName(bill.table_name_snapshot || 'Table')
-    setSettleSubtotal(bill.subtotal || 0)
-    setSettleServiceChargePct(bill.service_charge_pct || 0)
-    setSettleServiceChargeAmt(bill.service_charge_amt || 0)
-    setSettleDiscountAmt(bill.discount_amt || 0)
-    setSettleFinalAmount(bill.final_amount || bill.subtotal || 0)
+    setSettleBill(bill)
     setSettleType('cash')
     setShowSettleModal(true)
   }
 
-  // Confirm settlement — only update payment_type and status
+  // Confirm settlement — update ALL order rows that belong to this session
   const confirmSettle = async () => {
-    if (!settleOrderId) return
-    setSettling(settleOrderId)
+    if (!settleBill) return
+    setSettling(settleBill._key)
 
-    await supabase.from('orders').update({
-      payment_type: settleType,
-      settlement_status: 'settled',
-    }).eq('id', settleOrderId)
+    // Update every order row in this session
+    for (const orderId of settleBill._orderIds) {
+      await supabase.from('orders').update({
+        payment_type: settleType,
+        settlement_status: 'settled',
+      }).eq('id', orderId)
+    }
 
-    // Update daily_reports
+    // Update daily_reports — only once per session (use final_amount)
     const today = todayIST()
     const { data: existing } = await supabase
       .from('daily_reports').select('*').eq('report_date', today).single()
 
+    const amt = settleBill.final_amount || 0
+    const svc = settleBill.service_charge_amt || 0
+
     if (existing) {
       await supabase.from('daily_reports').update({
         total_orders: existing.total_orders + 1,
-        total_revenue: existing.total_revenue + settleFinalAmount,
-        cash_revenue: existing.cash_revenue + (settleType === 'cash' ? settleFinalAmount : 0),
-        upi_revenue: existing.upi_revenue + (settleType === 'upi' ? settleFinalAmount : 0),
-        card_revenue: existing.card_revenue + (settleType === 'card' ? settleFinalAmount : 0),
-        service_charge_total: existing.service_charge_total + settleServiceChargeAmt,
+        total_revenue: existing.total_revenue + amt,
+        cash_revenue: existing.cash_revenue + (settleType === 'cash' ? amt : 0),
+        upi_revenue: existing.upi_revenue + (settleType === 'upi' ? amt : 0),
+        card_revenue: existing.card_revenue + (settleType === 'card' ? amt : 0),
+        service_charge_total: existing.service_charge_total + svc,
         updated_at: new Date().toISOString()
       }).eq('report_date', today)
     } else {
       await supabase.from('daily_reports').insert({
         report_date: today,
         total_orders: 1,
-        total_revenue: settleFinalAmount,
-        cash_revenue: settleType === 'cash' ? settleFinalAmount : 0,
-        upi_revenue: settleType === 'upi' ? settleFinalAmount : 0,
-        card_revenue: settleType === 'card' ? settleFinalAmount : 0,
-        service_charge_total: settleServiceChargeAmt
+        total_revenue: amt,
+        cash_revenue: settleType === 'cash' ? amt : 0,
+        upi_revenue: settleType === 'upi' ? amt : 0,
+        card_revenue: settleType === 'card' ? amt : 0,
+        service_charge_total: svc
       })
     }
 
@@ -173,33 +222,33 @@ export default function TodayReport() {
     <div className="min-h-screen bg-gray-50">
 
       {/* Settlement Modal — payment type selection only */}
-      {showSettleModal && (
+      {showSettleModal && settleBill && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-2xl">
             <h2 className="text-xl font-bold text-gray-800 mb-1">💰 Settle Bill</h2>
-            <p className="text-sm text-gray-400 mb-4">{settleTableName}</p>
+            <p className="text-sm text-gray-400 mb-4">{settleBill.table_name_snapshot || 'Table'}</p>
 
             {/* Bill breakdown — read only */}
             <div className="bg-gray-50 rounded-xl p-4 mb-4 space-y-2">
               <div className="flex justify-between text-sm text-gray-500">
                 <span>Bill Subtotal</span>
-                <span>₹{settleSubtotal}</span>
+                <span>₹{settleBill.subtotal}</span>
               </div>
-              {settleServiceChargeAmt > 0 && (
+              {settleBill.service_charge_amt > 0 && (
                 <div className="flex justify-between text-sm text-gray-500">
-                  <span>Service Charge ({settleServiceChargePct}%)</span>
-                  <span>+₹{settleServiceChargeAmt}</span>
+                  <span>Service Charge ({settleBill.service_charge_pct}%)</span>
+                  <span>+₹{settleBill.service_charge_amt}</span>
                 </div>
               )}
-              {settleDiscountAmt > 0 && (
+              {settleBill.discount_amt > 0 && (
                 <div className="flex justify-between text-sm text-green-600">
                   <span>Discount</span>
-                  <span>-₹{settleDiscountAmt}</span>
+                  <span>-₹{settleBill.discount_amt}</span>
                 </div>
               )}
               <div className="border-t pt-2 flex justify-between font-bold text-gray-800">
                 <span>Amount to Collect</span>
-                <span className="text-orange-500 text-lg">₹{settleFinalAmount}</span>
+                <span className="text-orange-500 text-lg">₹{settleBill.final_amount}</span>
               </div>
             </div>
 
@@ -370,7 +419,7 @@ export default function TodayReport() {
             </h2>
             <div className="space-y-3">
               {pendingBills.map(bill => (
-                <div key={bill.id}
+                <div key={bill._key}
                   className="bg-white border-2 border-yellow-300 rounded-2xl p-4 shadow-sm">
                   <div className="flex justify-between items-start mb-3">
                     <div>
@@ -433,7 +482,7 @@ export default function TodayReport() {
             </h2>
             <div className="space-y-3">
               {settledBills.map(bill => (
-                <div key={bill.id}
+                <div key={bill._key}
                   className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm opacity-90">
                   <div className="flex justify-between items-start mb-2">
                     <div>
