@@ -5,120 +5,121 @@ import { supabase } from '../supabase/client'
 const toIST = (d) => new Date(d).toLocaleTimeString('en-IN', {
   timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true
 })
-
 const formatDate = (d) => new Date(d).toLocaleDateString('en-IN', {
   timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric'
 })
-
-const todayIST = () => new Date().toLocaleDateString('en-CA', {
-  timeZone: 'Asia/Kolkata'
-})
+const todayIST = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
 
 const ORDER_SELECT = `
   id, payment_type, is_paid, paid_at,
   subtotal, service_charge_pct, service_charge_amt,
-  discount_type, discount_value, discount_amt,
+  discount_type, discount_value, discount_amt, discount_reason,
   final_amount, table_name_snapshot,
-  order_items(quantity, price_at_order, food_items(name))
+  order_items(quantity, price_at_order, food_items(name, category_id, categories(name)))
 `
 
-// Group multiple order rows that belong to the same table session into one bill.
-// Sessions share the same table_name_snapshot + paid_at minute (set in one handlePrintAndSave call).
 const groupOrdersIntoBills = (orders) => {
   const map = {}
   orders.forEach(order => {
     const minuteKey = order.paid_at ? order.paid_at.substring(0, 16) : order.id
     const key = `${order.table_name_snapshot || ''}__${minuteKey}`
-
     if (!map[key]) {
       map[key] = {
-        // Keep all order ids so settlement/reporting can reference them
-        _orderIds: [order.id],
-        _key: key,
-        id: order.id,               // representative id (first round)
-        payment_type: order.payment_type,
-        paid_at: order.paid_at,
+        _orderIds: [order.id], _key: key, id: order.id,
+        payment_type: order.payment_type, paid_at: order.paid_at,
         table_name_snapshot: order.table_name_snapshot,
-        // Financials are identical across rounds (set once at print time)
         subtotal: order.subtotal || 0,
         service_charge_pct: order.service_charge_pct || 0,
         service_charge_amt: order.service_charge_amt || 0,
         discount_type: order.discount_type,
         discount_value: order.discount_value || 0,
         discount_amt: order.discount_amt || 0,
+        discount_reason: order.discount_reason || '',
         final_amount: order.final_amount || 0,
-        // Merge all items from all rounds
         order_items: [...(order.order_items || [])],
       }
     } else {
       map[key]._orderIds.push(order.id)
-      map[key].order_items = [
-        ...map[key].order_items,
-        ...(order.order_items || [])
-      ]
+      map[key].order_items = [...map[key].order_items, ...(order.order_items || [])]
     }
   })
   return Object.values(map)
 }
+
+const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 
 export default function Reports() {
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState('today')
   const [loading, setLoading] = useState(false)
 
+  // Today
   const [todayOrders, setTodayOrders] = useState([])
   const [todayReport, setTodayReport] = useState(null)
 
+  // Date Range
   const [fromDate, setFromDate] = useState(todayIST())
   const [toDate, setToDate] = useState(todayIST())
   const [rangeOrders, setRangeOrders] = useState([])
   const [rangeReport, setRangeReport] = useState(null)
 
-  const [itemStats, setItemStats] = useState([])
+  // Item Search
   const [itemFromDate, setItemFromDate] = useState(todayIST())
   const [itemToDate, setItemToDate] = useState(todayIST())
+  const [itemStats, setItemStats] = useState([])
+  const [itemSearchQuery, setItemSearchQuery] = useState('')
 
+  // Category
+  const [catFromDate, setCatFromDate] = useState(todayIST())
+  const [catToDate, setCatToDate] = useState(todayIST())
+  const [catStats, setCatStats] = useState([])
+
+  // Table-wise
+  const [tableFromDate, setTableFromDate] = useState(todayIST())
+  const [tableToDate, setTableToDate] = useState(todayIST())
+  const [tableStats, setTableStats] = useState([])
+
+  // Monthly
+  const [monthlyYear, setMonthlyYear] = useState(new Date().getFullYear())
+  const [monthlyData, setMonthlyData] = useState([])
+
+  // Discounts
+  const [discFromDate, setDiscFromDate] = useState(todayIST())
+  const [discToDate, setDiscToDate] = useState(todayIST())
+  const [discData, setDiscData] = useState(null)
+
+  // Settlement
   const [settlFromDate, setSettlFromDate] = useState(todayIST())
   const [settlToDate, setSettlToDate] = useState(todayIST())
   const [settlData, setSettlData] = useState(null)
 
   useEffect(() => { fetchToday() }, [])
 
-  // Build summary from already-grouped bills (one entry = one table session)
-  const buildSummary = (bills) => {
-    const totalRevenue = bills.reduce((s, b) => s + (b.final_amount || 0), 0)
-    const cashRev = bills.filter(b => b.payment_type === 'cash')
-      .reduce((s, b) => s + (b.final_amount || 0), 0)
-    const upiRev = bills.filter(b => b.payment_type === 'upi')
-      .reduce((s, b) => s + (b.final_amount || 0), 0)
-    const cardRev = bills.filter(b => b.payment_type === 'card')
-      .reduce((s, b) => s + (b.final_amount || 0), 0)
-    const scTotal = bills.reduce((s, b) => s + (b.service_charge_amt || 0), 0)
-    const discountTotal = bills.reduce((s, b) => s + (b.discount_amt || 0), 0)
-    return {
-      totalRevenue, cashRev, upiRev, cardRev,
-      scTotal, discountTotal, totalOrders: bills.length
-    }
-  }
-
   const toRange = (from, to) => ({
     startISO: new Date(from + 'T00:00:00+05:30').toISOString(),
     endISO: new Date(to + 'T23:59:59+05:30').toISOString(),
   })
 
+  const buildSummary = (bills) => {
+    const totalRevenue = bills.reduce((s, b) => s + (b.final_amount || 0), 0)
+    const cashRev = bills.filter(b => b.payment_type === 'cash').reduce((s, b) => s + (b.final_amount || 0), 0)
+    const upiRev = bills.filter(b => b.payment_type === 'upi').reduce((s, b) => s + (b.final_amount || 0), 0)
+    const cardRev = bills.filter(b => b.payment_type === 'card').reduce((s, b) => s + (b.final_amount || 0), 0)
+    const scTotal = bills.reduce((s, b) => s + (b.service_charge_amt || 0), 0)
+    const discountTotal = bills.reduce((s, b) => s + (b.discount_amt || 0), 0)
+    return { totalRevenue, cashRev, upiRev, cardRev, scTotal, discountTotal, totalOrders: bills.length }
+  }
+
+  // ── Fetch Functions ───────────────────────────────────────
+
   const fetchToday = async () => {
     setLoading(true)
     const today = todayIST()
     const { startISO, endISO } = toRange(today, today)
-
     const { data: orders, error } = await supabase
-      .from('orders')
-      .select(ORDER_SELECT)
-      .eq('is_paid', true)
-      .gte('paid_at', startISO)
-      .lte('paid_at', endISO)
+      .from('orders').select(ORDER_SELECT)
+      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
-
     if (error) console.error('fetchToday:', error.message)
     const bills = groupOrdersIntoBills(orders || [])
     setTodayOrders(bills)
@@ -129,15 +130,10 @@ export default function Reports() {
   const fetchRange = async () => {
     setLoading(true)
     const { startISO, endISO } = toRange(fromDate, toDate)
-
     const { data: orders, error } = await supabase
-      .from('orders')
-      .select(ORDER_SELECT)
-      .eq('is_paid', true)
-      .gte('paid_at', startISO)
-      .lte('paid_at', endISO)
+      .from('orders').select(ORDER_SELECT)
+      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
-
     if (error) console.error('fetchRange:', error.message)
     const bills = groupOrdersIntoBills(orders || [])
     setRangeOrders(bills)
@@ -148,30 +144,14 @@ export default function Reports() {
   const fetchItemStats = async () => {
     setLoading(true)
     const { startISO, endISO } = toRange(itemFromDate, itemToDate)
-
-    const { data: orders, error: ordErr } = await supabase
-      .from('orders').select('id')
-      .eq('is_paid', true)
-      .gte('paid_at', startISO)
-      .lte('paid_at', endISO)
-
-    if (ordErr) console.error('fetchItemStats:', ordErr.message)
-
-    if (!orders || orders.length === 0) {
-      setItemStats([])
-      setLoading(false)
-      return
-    }
-
-    const { data: items, error: itemErr } = await supabase
+    const { data: orders } = await supabase
+      .from('orders').select('id').eq('is_paid', true)
+      .gte('paid_at', startISO).lte('paid_at', endISO)
+    if (!orders || orders.length === 0) { setItemStats([]); setLoading(false); return }
+    const { data: items } = await supabase
       .from('order_items')
       .select('quantity, price_at_order, food_items(name)')
       .in('order_id', orders.map(o => o.id))
-
-    if (itemErr) console.error('fetchItemStats items:', itemErr.message)
-
-    // Item stats operate on raw order_items rows — no grouping needed here
-    // because we're aggregating by item name across all rounds anyway
     const map = {}
     items?.forEach(i => {
       const name = i.food_items?.name || 'Unknown'
@@ -179,63 +159,152 @@ export default function Reports() {
       map[name].qty += i.quantity
       map[name].revenue += i.price_at_order * i.quantity
     })
-
     setItemStats(Object.values(map).sort((a, b) => b.qty - a.qty))
+    setLoading(false)
+  }
+
+  const fetchCategoryStats = async () => {
+    setLoading(true)
+    const { startISO, endISO } = toRange(catFromDate, catToDate)
+    const { data: orders } = await supabase
+      .from('orders').select('id').eq('is_paid', true)
+      .gte('paid_at', startISO).lte('paid_at', endISO)
+    if (!orders || orders.length === 0) { setCatStats([]); setLoading(false); return }
+    const { data: items } = await supabase
+      .from('order_items')
+      .select('quantity, price_at_order, food_items(name, categories(name))')
+      .in('order_id', orders.map(o => o.id))
+    const map = {}
+    items?.forEach(i => {
+      const cat = i.food_items?.categories?.name || 'Uncategorized'
+      if (!map[cat]) map[cat] = { name: cat, qty: 0, revenue: 0 }
+      map[cat].qty += i.quantity
+      map[cat].revenue += i.price_at_order * i.quantity
+    })
+    setCatStats(Object.values(map).sort((a, b) => b.revenue - a.revenue))
+    setLoading(false)
+  }
+
+  const fetchTableStats = async () => {
+    setLoading(true)
+    const { startISO, endISO } = toRange(tableFromDate, tableToDate)
+    const { data: orders, error } = await supabase
+      .from('orders')
+      .select('table_name_snapshot, final_amount, paid_at, payment_type')
+      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
+    if (error) console.error('fetchTableStats:', error.message)
+    const map = {}
+    orders?.forEach(o => {
+      const tbl = o.table_name_snapshot || 'Unknown'
+      if (!map[tbl]) map[tbl] = { name: tbl, bills: 0, revenue: 0, lastVisit: o.paid_at }
+      map[tbl].bills += 1
+      map[tbl].revenue += o.final_amount || 0
+      if (o.paid_at > map[tbl].lastVisit) map[tbl].lastVisit = o.paid_at
+    })
+    setTableStats(Object.values(map).sort((a, b) => b.revenue - a.revenue))
+    setLoading(false)
+  }
+
+  const fetchMonthly = async () => {
+    setLoading(true)
+    const startISO = new Date(`${monthlyYear}-01-01T00:00:00+05:30`).toISOString()
+    const endISO = new Date(`${monthlyYear}-12-31T23:59:59+05:30`).toISOString()
+    const { data: orders, error } = await supabase
+      .from('orders')
+      .select('paid_at, final_amount, payment_type, service_charge_amt, discount_amt')
+      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
+    if (error) console.error('fetchMonthly:', error.message)
+
+    const months = Array.from({ length: 12 }, (_, i) => ({
+      month: i, name: MONTH_NAMES[i],
+      revenue: 0, bills: 0, cash: 0, upi: 0, card: 0,
+      serviceCharge: 0, discounts: 0
+    }))
+
+    orders?.forEach(o => {
+      const m = new Date(o.paid_at).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
+      const monthIdx = parseInt(m.split('-')[1]) - 1
+      months[monthIdx].revenue += o.final_amount || 0
+      months[monthIdx].bills += 1
+      months[monthIdx].serviceCharge += o.service_charge_amt || 0
+      months[monthIdx].discounts += o.discount_amt || 0
+      if (o.payment_type === 'cash') months[monthIdx].cash += o.final_amount || 0
+      if (o.payment_type === 'upi') months[monthIdx].upi += o.final_amount || 0
+      if (o.payment_type === 'card') months[monthIdx].card += o.final_amount || 0
+    })
+
+    setMonthlyData(months)
+    setLoading(false)
+  }
+
+  const fetchDiscounts = async () => {
+    setLoading(true)
+    const { startISO, endISO } = toRange(discFromDate, discToDate)
+    const { data: orders, error } = await supabase
+      .from('orders')
+      .select('id, payment_type, paid_at, table_name_snapshot, subtotal, discount_type, discount_value, discount_amt, discount_reason, final_amount')
+      .eq('is_paid', true).gt('discount_amt', 0)
+      .gte('paid_at', startISO).lte('paid_at', endISO)
+      .order('paid_at', { ascending: false })
+    if (error) console.error('fetchDiscounts:', error.message)
+    if (!orders || orders.length === 0) { setDiscData(null); setLoading(false); return }
+    const bills = groupOrdersIntoBills(orders)
+    const discountedBills = bills.filter(b => b.discount_amt > 0)
+    const totalDiscount = discountedBills.reduce((s, b) => s + (b.discount_amt || 0), 0)
+    const grossRevenue = discountedBills.reduce((s, b) => s + (b.subtotal || 0), 0)
+
+    // Group by reason
+    const reasonMap = {}
+    discountedBills.forEach(b => {
+      const r = b.discount_reason || 'No reason given'
+      if (!reasonMap[r]) reasonMap[r] = { reason: r, count: 0, total: 0 }
+      reasonMap[r].count += 1
+      reasonMap[r].total += b.discount_amt || 0
+    })
+
+    setDiscData({
+      bills: discountedBills,
+      totalDiscount, grossRevenue,
+      reasonBreakdown: Object.values(reasonMap).sort((a, b) => b.total - a.total)
+    })
     setLoading(false)
   }
 
   const fetchSettlement = async () => {
     setLoading(true)
     const { startISO, endISO } = toRange(settlFromDate, settlToDate)
-
     const { data: orders, error } = await supabase
       .from('orders')
-      .select(`
-        id, payment_type, paid_at, table_name_snapshot,
-        subtotal, service_charge_pct, service_charge_amt,
-        discount_type, discount_value, discount_amt,
-        final_amount
-      `)
-      .eq('is_paid', true)
-      .gte('paid_at', startISO)
-      .lte('paid_at', endISO)
+      .select('id, payment_type, paid_at, table_name_snapshot, subtotal, service_charge_pct, service_charge_amt, discount_type, discount_value, discount_amt, final_amount')
+      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
-
     if (error) console.error('fetchSettlement:', error.message)
-
-    if (!orders || orders.length === 0) {
-      setSettlData(null)
-      setLoading(false)
-      return
-    }
-
-    // Group into sessions — settlement table shows one row per table session
+    if (!orders || orders.length === 0) { setSettlData(null); setLoading(false); return }
     const bills = groupOrdersIntoBills(orders)
-
     const cash = bills.filter(b => b.payment_type === 'cash')
-    const upi  = bills.filter(b => b.payment_type === 'upi')
+    const upi = bills.filter(b => b.payment_type === 'upi')
     const card = bills.filter(b => b.payment_type === 'card')
-
     setSettlData({
       bills,
       cash: { count: cash.length, total: cash.reduce((s, b) => s + (b.final_amount || 0), 0) },
-      upi:  { count: upi.length,  total: upi.reduce((s, b) => s + (b.final_amount || 0), 0) },
+      upi: { count: upi.length, total: upi.reduce((s, b) => s + (b.final_amount || 0), 0) },
       card: { count: card.length, total: card.reduce((s, b) => s + (b.final_amount || 0), 0) },
-      grandTotal:    bills.reduce((s, b) => s + (b.final_amount || 0), 0),
-      serviceTotal:  bills.reduce((s, b) => s + (b.service_charge_amt || 0), 0),
+      grandTotal: bills.reduce((s, b) => s + (b.final_amount || 0), 0),
+      serviceTotal: bills.reduce((s, b) => s + (b.service_charge_amt || 0), 0),
       discountTotal: bills.reduce((s, b) => s + (b.discount_amt || 0), 0)
     })
     setLoading(false)
   }
 
-  const printReport = () => window.print()
+  // ── Reusable Components ───────────────────────────────────
 
   const PayBadge = ({ type }) => (
     <span className={`text-xs px-2 py-0.5 rounded-full font-medium
       ${type === 'cash' ? 'bg-green-100 text-green-600'
         : type === 'upi' ? 'bg-blue-100 text-blue-600'
-        : 'bg-purple-100 text-purple-600'}`}>
-      {type === 'cash' ? '💵 Cash' : type === 'upi' ? '📱 UPI' : '💳 Card'}
+        : type === 'card' ? 'bg-purple-100 text-purple-600'
+        : 'bg-gray-100 text-gray-500'}`}>
+      {type === 'cash' ? '💵 Cash' : type === 'upi' ? '📱 UPI' : type === 'card' ? '💳 Card' : type}
     </span>
   )
 
@@ -253,37 +322,25 @@ export default function Reports() {
         <p className="text-xs text-gray-500 mb-1">Service Charge</p>
         <p className="text-2xl font-bold text-gray-600">₹{data.scTotal}</p>
         {data.discountTotal > 0 && (
-          <p className="text-xs text-green-600 mt-1">Discount: -₹{data.discountTotal}</p>
+          <p className="text-xs text-green-600 mt-1">Disc: -₹{data.discountTotal}</p>
         )}
       </div>
       <div className="bg-white border border-gray-200 rounded-2xl p-4">
         <p className="text-xs text-gray-500 mb-2">By Payment</p>
         <div className="space-y-1 text-xs">
-          <div className="flex justify-between">
-            <span className="text-green-600">💵 Cash</span>
-            <span className="font-bold">₹{data.cashRev}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-blue-600">📱 UPI</span>
-            <span className="font-bold">₹{data.upiRev}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-purple-600">💳 Card</span>
-            <span className="font-bold">₹{data.cardRev}</span>
-          </div>
+          <div className="flex justify-between"><span className="text-green-600">💵 Cash</span><span className="font-bold">₹{data.cashRev}</span></div>
+          <div className="flex justify-between"><span className="text-blue-600">📱 UPI</span><span className="font-bold">₹{data.upiRev}</span></div>
+          <div className="flex justify-between"><span className="text-purple-600">💳 Card</span><span className="font-bold">₹{data.cardRev}</span></div>
         </div>
       </div>
     </div>
   )
 
-  // bill here is already a grouped session object
   const OrderCard = ({ bill, showDate = false }) => (
     <div className="border border-gray-100 rounded-xl p-4">
       <div className="flex justify-between items-start mb-2 flex-wrap gap-2">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="font-semibold text-gray-700">
-            {bill.table_name_snapshot || 'Table'}
-          </span>
+          <span className="font-semibold text-gray-700">{bill.table_name_snapshot || 'Table'}</span>
           <PayBadge type={bill.payment_type} />
         </div>
         <div className="text-right">
@@ -293,7 +350,6 @@ export default function Reports() {
           </p>
         </div>
       </div>
-
       <div className="space-y-1 mb-2">
         {bill.order_items?.map((item, j) => (
           <div key={j} className="flex justify-between text-xs text-gray-500">
@@ -302,32 +358,23 @@ export default function Reports() {
           </div>
         ))}
       </div>
-
       <div className="border-t pt-2 space-y-0.5">
         <div className="flex justify-between text-xs text-gray-400">
-          <span>Subtotal</span>
-          <span>₹{bill.subtotal || 0}</span>
+          <span>Subtotal</span><span>₹{bill.subtotal || 0}</span>
         </div>
         {bill.service_charge_amt > 0 && (
           <div className="flex justify-between text-xs text-gray-400">
-            <span>Service ({bill.service_charge_pct}%)</span>
-            <span>₹{bill.service_charge_amt}</span>
+            <span>Service ({bill.service_charge_pct}%)</span><span>₹{bill.service_charge_amt}</span>
           </div>
         )}
         {bill.discount_amt > 0 && (
           <div className="flex justify-between text-xs text-green-600">
-            <span>
-              Discount
-              {bill.discount_type === 'percent'
-                ? ` (${bill.discount_value}%)`
-                : ` (₹${bill.discount_value} flat)`}
-            </span>
+            <span>Discount {bill.discount_type === 'percent' ? `(${bill.discount_value}%)` : `(₹${bill.discount_value} flat)`}</span>
             <span>-₹{bill.discount_amt}</span>
           </div>
         )}
         <div className="flex justify-between text-xs font-bold text-gray-700 pt-1 border-t">
-          <span>Final</span>
-          <span className="text-orange-500">₹{bill.final_amount}</span>
+          <span>Final</span><span className="text-orange-500">₹{bill.final_amount}</span>
         </div>
       </div>
     </div>
@@ -361,6 +408,25 @@ export default function Reports() {
     </div>
   )
 
+  const TABS = [
+    { id: 'today', label: '📅 Today' },
+    { id: 'range', label: '📆 Date Range' },
+    { id: 'items', label: '🔍 Item Search' },
+    { id: 'category', label: '📊 Category' },
+    { id: 'tables', label: '🪑 Table-wise' },
+    { id: 'monthly', label: '📅 Monthly' },
+    { id: 'discounts', label: '🎁 Discounts' },
+    { id: 'settlement', label: '💰 Settlement' },
+  ]
+
+  const filteredItems = itemSearchQuery.trim()
+    ? itemStats.filter(i => i.name.toLowerCase().includes(itemSearchQuery.toLowerCase()))
+    : itemStats
+
+  const maxMonthRevenue = Math.max(...monthlyData.map(m => m.revenue), 1)
+  const yearTotal = monthlyData.reduce((s, m) => s + m.revenue, 0)
+  const yearBills = monthlyData.reduce((s, m) => s + m.bills, 0)
+
   return (
     <div className="min-h-screen bg-gray-50">
 
@@ -371,7 +437,7 @@ export default function Reports() {
           <h1 className="text-lg font-bold text-orange-500">Reports</h1>
         </div>
         <div className="flex gap-2">
-          <button onClick={printReport}
+          <button onClick={() => window.print()}
             className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">
             🖨️ Print
           </button>
@@ -385,18 +451,11 @@ export default function Reports() {
       <div className="p-4 md:p-6 max-w-5xl mx-auto">
 
         {/* Tabs */}
-        <div className="flex gap-2 mb-6 overflow-x-auto pb-1 print:hidden">
-          {[
-            { id: 'today',      label: '📅 Today' },
-            { id: 'range',      label: '📆 Date Range' },
-            { id: 'items',      label: '🍴 Items' },
-            { id: 'settlement', label: '💰 Settlement' }
-          ].map(tab => (
+        <div className="flex gap-2 mb-6 overflow-x-auto pb-2 print:hidden">
+          {TABS.map(tab => (
             <button key={tab.id} onClick={() => setActiveTab(tab.id)}
-              className={`px-4 py-2 rounded-full font-medium text-sm whitespace-nowrap transition
-                ${activeTab === tab.id
-                  ? 'bg-orange-500 text-white'
-                  : 'bg-white text-gray-500 border hover:bg-orange-50'}`}>
+              className={`px-4 py-2 rounded-full font-medium text-sm whitespace-nowrap transition flex-shrink-0
+                ${activeTab === tab.id ? 'bg-orange-500 text-white' : 'bg-white text-gray-500 border hover:bg-orange-50'}`}>
               {tab.label}
             </button>
           ))}
@@ -404,31 +463,24 @@ export default function Reports() {
 
         {loading && <div className="text-center py-8 text-gray-400">Loading...</div>}
 
-        {/* ── Today ── */}
+        {/* ── TODAY ── */}
         {activeTab === 'today' && !loading && (
           <div>
             <div className="flex justify-between items-center mb-4">
-              <h2 className="text-lg font-bold text-gray-700">
-                📅 Today — {formatDate(new Date())}
-              </h2>
+              <h2 className="text-lg font-bold text-gray-700">📅 Today — {formatDate(new Date())}</h2>
               <button onClick={fetchToday}
                 className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">
                 🔄 Refresh
               </button>
             </div>
-
             {!todayReport
               ? <EmptyState icon="📭" text="No paid orders today yet." />
               : <>
                   <ReportSummary data={todayReport} />
                   <div className="bg-white rounded-2xl shadow p-5">
-                    <h3 className="font-bold text-gray-700 mb-3">
-                      Bill Details ({todayOrders.length})
-                    </h3>
+                    <h3 className="font-bold text-gray-700 mb-3">Bill Details ({todayOrders.length})</h3>
                     <div className="space-y-3">
-                      {todayOrders.map(bill => (
-                        <OrderCard key={bill._key} bill={bill} showDate={false} />
-                      ))}
+                      {todayOrders.map(bill => <OrderCard key={bill._key} bill={bill} />)}
                     </div>
                   </div>
                 </>
@@ -436,31 +488,21 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── Date Range ── */}
+        {/* ── DATE RANGE ── */}
         {activeTab === 'range' && !loading && (
           <div>
-            <DateRangeFilter
-              from={fromDate} to={toDate}
-              onFrom={setFromDate} onTo={setToDate}
-              onFetch={fetchRange} btnText="View Report"
-            />
+            <DateRangeFilter from={fromDate} to={toDate} onFrom={setFromDate} onTo={setToDate} onFetch={fetchRange} />
             {!rangeReport
               ? <EmptyState icon="📊" text="Select a date range and click View Report" />
               : <>
-                  <div className="flex justify-between items-center mb-4">
-                    <h2 className="text-lg font-bold text-gray-700">
-                      {formatDate(fromDate)} → {formatDate(toDate)}
-                    </h2>
-                  </div>
+                  <h2 className="text-lg font-bold text-gray-700 mb-4">
+                    {formatDate(fromDate)} → {formatDate(toDate)}
+                  </h2>
                   <ReportSummary data={rangeReport} />
                   <div className="bg-white rounded-2xl shadow p-5">
-                    <h3 className="font-bold text-gray-700 mb-3">
-                      All Bills ({rangeOrders.length})
-                    </h3>
+                    <h3 className="font-bold text-gray-700 mb-3">All Bills ({rangeOrders.length})</h3>
                     <div className="space-y-3">
-                      {rangeOrders.map(bill => (
-                        <OrderCard key={bill._key} bill={bill} showDate={true} />
-                      ))}
+                      {rangeOrders.map(bill => <OrderCard key={bill._key} bill={bill} showDate />)}
                     </div>
                   </div>
                 </>
@@ -468,36 +510,151 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── Item Stats ── */}
+        {/* ── ITEM SEARCH ── */}
         {activeTab === 'items' && !loading && (
           <div>
             <DateRangeFilter
               from={itemFromDate} to={itemToDate}
               onFrom={setItemFromDate} onTo={setItemToDate}
-              onFetch={fetchItemStats} btnText="View Items"
+              onFetch={fetchItemStats} btnText="Search Items"
             />
+            {itemStats.length > 0 && (
+              <div className="bg-white rounded-2xl shadow p-4 mb-4">
+                <input
+                  type="text"
+                  value={itemSearchQuery}
+                  onChange={e => setItemSearchQuery(e.target.value)}
+                  placeholder="🔍 Search item name e.g. Ice Cream, Chicken..."
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50"
+                />
+                {itemSearchQuery && (
+                  <p className="text-xs text-gray-400 mt-2">
+                    Showing {filteredItems.length} of {itemStats.length} items
+                  </p>
+                )}
+              </div>
+            )}
             {itemStats.length === 0
-              ? <EmptyState icon="🍴" text="Select date range and click View Items" />
-              : <div className="bg-white rounded-2xl shadow p-5">
-                  <h3 className="font-bold text-gray-700 mb-4">
-                    🏆 Best Sellers ({itemStats.length} items)
-                  </h3>
-                  <div className="space-y-3">
-                    {itemStats.map((item, index) => (
-                      <div key={item.name} className="flex items-center gap-4 p-3 rounded-xl bg-gray-50">
-                        <span className="text-lg font-bold w-8 text-center">
-                          {index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `#${index + 1}`}
-                        </span>
-                        <div className="flex-1">
-                          <p className="font-semibold text-gray-700">{item.name}</p>
-                          <div className="w-full bg-gray-200 rounded-full h-1.5 mt-1">
-                            <div className="bg-orange-400 h-1.5 rounded-full"
-                              style={{ width: `${Math.min((item.qty / itemStats[0].qty) * 100, 100)}%` }} />
+              ? <EmptyState icon="🔍" text="Select date range and click Search Items" />
+              : filteredItems.length === 0
+                ? <EmptyState icon="😕" text={`No item found for "${itemSearchQuery}"`} />
+                : <div className="bg-white rounded-2xl shadow p-5">
+                    <h3 className="font-bold text-gray-700 mb-4">
+                      {itemSearchQuery ? `Results for "${itemSearchQuery}"` : `🏆 All Items (${filteredItems.length})`}
+                    </h3>
+                    <div className="space-y-3">
+                      {filteredItems.map((item, index) => (
+                        <div key={item.name} className="flex items-center gap-4 p-3 rounded-xl bg-gray-50">
+                          <span className="text-lg font-bold w-8 text-center flex-shrink-0">
+                            {!itemSearchQuery
+                              ? (index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `#${index + 1}`)
+                              : '🔍'}
+                          </span>
+                          <div className="flex-1">
+                            <p className="font-semibold text-gray-700">{item.name}</p>
+                            <div className="w-full bg-gray-200 rounded-full h-1.5 mt-1">
+                              <div className="bg-orange-400 h-1.5 rounded-full"
+                                style={{ width: `${Math.min((item.qty / (itemStats[0]?.qty || 1)) * 100, 100)}%` }} />
+                            </div>
+                          </div>
+                          <div className="text-right flex-shrink-0">
+                            <p className="font-bold text-orange-500">{item.qty} sold</p>
+                            <p className="text-xs text-gray-400">₹{item.revenue}</p>
                           </div>
                         </div>
-                        <div className="text-right">
-                          <p className="font-bold text-orange-500">{item.qty} sold</p>
-                          <p className="text-xs text-gray-400">₹{item.revenue}</p>
+                      ))}
+                    </div>
+                  </div>
+            }
+          </div>
+        )}
+
+        {/* ── CATEGORY ── */}
+        {activeTab === 'category' && !loading && (
+          <div>
+            <DateRangeFilter
+              from={catFromDate} to={catToDate}
+              onFrom={setCatFromDate} onTo={setCatToDate}
+              onFetch={fetchCategoryStats} btnText="View Categories"
+            />
+            {catStats.length === 0
+              ? <EmptyState icon="📊" text="Select date range and click View Categories" />
+              : <>
+                  {/* Summary bar */}
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-4">
+                    {catStats.map((cat, i) => (
+                      <div key={cat.name} className="bg-white border border-gray-200 rounded-2xl p-4">
+                        <p className="text-xs text-gray-500 mb-1 truncate">{cat.name}</p>
+                        <p className="text-xl font-bold text-orange-600">₹{cat.revenue}</p>
+                        <p className="text-xs text-gray-400">{cat.qty} items sold</p>
+                        <div className="w-full bg-gray-100 rounded-full h-1.5 mt-2">
+                          <div className="bg-orange-400 h-1.5 rounded-full"
+                            style={{ width: `${Math.min((cat.revenue / catStats[0].revenue) * 100, 100)}%` }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="bg-white rounded-2xl shadow p-5">
+                    <h3 className="font-bold text-gray-700 mb-3">Category Breakdown</h3>
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b">
+                          <th className="text-left py-2 text-xs text-gray-500">Category</th>
+                          <th className="text-right py-2 text-xs text-gray-500">Items Sold</th>
+                          <th className="text-right py-2 text-xs text-gray-500">Revenue</th>
+                          <th className="text-right py-2 text-xs text-gray-500">Share</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {catStats.map(cat => {
+                          const total = catStats.reduce((s, c) => s + c.revenue, 0)
+                          const share = total > 0 ? ((cat.revenue / total) * 100).toFixed(1) : 0
+                          return (
+                            <tr key={cat.name} className="border-b border-gray-50 hover:bg-gray-50">
+                              <td className="py-2 font-medium text-gray-700">{cat.name}</td>
+                              <td className="py-2 text-right text-gray-500">{cat.qty}</td>
+                              <td className="py-2 text-right font-bold text-orange-500">₹{cat.revenue}</td>
+                              <td className="py-2 text-right text-gray-400">{share}%</td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+            }
+          </div>
+        )}
+
+        {/* ── TABLE-WISE ── */}
+        {activeTab === 'tables' && !loading && (
+          <div>
+            <DateRangeFilter
+              from={tableFromDate} to={tableToDate}
+              onFrom={setTableFromDate} onTo={setTableToDate}
+              onFetch={fetchTableStats} btnText="View Tables"
+            />
+            {tableStats.length === 0
+              ? <EmptyState icon="🪑" text="Select date range and click View Tables" />
+              : <div className="bg-white rounded-2xl shadow p-5">
+                  <h3 className="font-bold text-gray-700 mb-4">Table Performance ({tableStats.length} tables)</h3>
+                  <div className="space-y-3">
+                    {tableStats.map((tbl, i) => (
+                      <div key={tbl.name} className="flex items-center gap-4 p-3 rounded-xl bg-gray-50">
+                        <span className="text-lg font-bold w-8 text-center flex-shrink-0">
+                          {i === 0 ? '🏆' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i + 1}`}
+                        </span>
+                        <div className="flex-1">
+                          <p className="font-bold text-gray-700">{tbl.name}</p>
+                          <div className="w-full bg-gray-200 rounded-full h-1.5 mt-1">
+                            <div className="bg-orange-400 h-1.5 rounded-full"
+                              style={{ width: `${Math.min((tbl.revenue / tableStats[0].revenue) * 100, 100)}%` }} />
+                          </div>
+                          <p className="text-xs text-gray-400 mt-1">Last visit: {formatDate(tbl.lastVisit)}</p>
+                        </div>
+                        <div className="text-right flex-shrink-0">
+                          <p className="font-bold text-orange-500">₹{tbl.revenue}</p>
+                          <p className="text-xs text-gray-400">{tbl.bills} bills</p>
                         </div>
                       </div>
                     ))}
@@ -507,7 +664,195 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── Settlement ── */}
+        {/* ── MONTHLY ── */}
+        {activeTab === 'monthly' && !loading && (
+          <div>
+            <div className="bg-white rounded-2xl shadow p-5 mb-4">
+              <div className="flex gap-3 items-end flex-wrap">
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Year</label>
+                  <select value={monthlyYear} onChange={e => setMonthlyYear(Number(e.target.value))}
+                    className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
+                    {[2024, 2025, 2026, 2027].map(y => (
+                      <option key={y} value={y}>{y}</option>
+                    ))}
+                  </select>
+                </div>
+                <button onClick={fetchMonthly}
+                  className="bg-orange-500 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-orange-600">
+                  View Year
+                </button>
+              </div>
+            </div>
+
+            {monthlyData.length === 0
+              ? <EmptyState icon="📅" text="Select a year and click View Year" />
+              : <>
+                  {/* Year summary */}
+                  <div className="grid grid-cols-2 gap-3 mb-4">
+                    <div className="bg-orange-50 border border-orange-200 rounded-2xl p-4">
+                      <p className="text-xs text-gray-500 mb-1">Year {monthlyYear} Total Revenue</p>
+                      <p className="text-3xl font-bold text-orange-600">₹{yearTotal}</p>
+                    </div>
+                    <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4">
+                      <p className="text-xs text-gray-500 mb-1">Total Bills</p>
+                      <p className="text-3xl font-bold text-blue-600">{yearBills}</p>
+                    </div>
+                  </div>
+
+                  {/* Monthly chart */}
+                  <div className="bg-white rounded-2xl shadow p-5 mb-4">
+                    <h3 className="font-bold text-gray-700 mb-4">Monthly Revenue Bar Chart</h3>
+                    <div className="flex items-end gap-1 h-40">
+                      {monthlyData.map(m => (
+                        <div key={m.month} className="flex-1 flex flex-col items-center gap-1">
+                          <div className="w-full flex items-end" style={{ height: '120px' }}>
+                            <div
+                              className="w-full bg-orange-400 rounded-t-lg hover:bg-orange-500 transition"
+                              style={{ height: `${(m.revenue / maxMonthRevenue) * 100}%`, minHeight: m.revenue > 0 ? '4px' : '0' }}
+                              title={`₹${m.revenue}`}
+                            />
+                          </div>
+                          <p className="text-xs text-gray-500">{m.name}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Monthly table */}
+                  <div className="bg-white rounded-2xl shadow p-5">
+                    <h3 className="font-bold text-gray-700 mb-3">Month-by-Month Breakdown</h3>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b">
+                            <th className="text-left py-2 text-xs text-gray-500">Month</th>
+                            <th className="text-right py-2 text-xs text-gray-500">Bills</th>
+                            <th className="text-right py-2 text-xs text-gray-500">Revenue</th>
+                            <th className="text-right py-2 text-xs text-gray-500">Cash</th>
+                            <th className="text-right py-2 text-xs text-gray-500">UPI</th>
+                            <th className="text-right py-2 text-xs text-gray-500">Card</th>
+                            <th className="text-right py-2 text-xs text-gray-500">SC</th>
+                            <th className="text-right py-2 text-xs text-gray-500">Disc</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {monthlyData.map(m => (
+                            <tr key={m.month} className={`border-b border-gray-50 hover:bg-gray-50 ${m.revenue === 0 ? 'opacity-40' : ''}`}>
+                              <td className="py-2 font-medium text-gray-700">{m.name} {monthlyYear}</td>
+                              <td className="py-2 text-right text-gray-500">{m.bills}</td>
+                              <td className="py-2 text-right font-bold text-orange-500">₹{m.revenue}</td>
+                              <td className="py-2 text-right text-green-600">₹{m.cash}</td>
+                              <td className="py-2 text-right text-blue-600">₹{m.upi}</td>
+                              <td className="py-2 text-right text-purple-600">₹{m.card}</td>
+                              <td className="py-2 text-right text-gray-400">{m.serviceCharge > 0 ? `₹${m.serviceCharge}` : '—'}</td>
+                              <td className="py-2 text-right text-green-600">{m.discounts > 0 ? `-₹${m.discounts}` : '—'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                        <tfoot>
+                          <tr className="border-t-2 border-gray-200 font-bold">
+                            <td className="py-2 text-gray-700">Total</td>
+                            <td className="py-2 text-right text-gray-700">{yearBills}</td>
+                            <td className="py-2 text-right text-orange-500">₹{yearTotal}</td>
+                            <td className="py-2 text-right text-green-600">₹{monthlyData.reduce((s,m) => s+m.cash,0)}</td>
+                            <td className="py-2 text-right text-blue-600">₹{monthlyData.reduce((s,m) => s+m.upi,0)}</td>
+                            <td className="py-2 text-right text-purple-600">₹{monthlyData.reduce((s,m) => s+m.card,0)}</td>
+                            <td className="py-2 text-right text-gray-400">₹{monthlyData.reduce((s,m) => s+m.serviceCharge,0)}</td>
+                            <td className="py-2 text-right text-green-600">-₹{monthlyData.reduce((s,m) => s+m.discounts,0)}</td>
+                          </tr>
+                        </tfoot>
+                      </table>
+                    </div>
+                  </div>
+                </>
+            }
+          </div>
+        )}
+
+        {/* ── DISCOUNTS ── */}
+        {activeTab === 'discounts' && !loading && (
+          <div>
+            <DateRangeFilter
+              from={discFromDate} to={discToDate}
+              onFrom={setDiscFromDate} onTo={setDiscToDate}
+              onFetch={fetchDiscounts} btnText="View Discounts"
+            />
+            {!discData
+              ? <EmptyState icon="🎁" text="Select date range and click View Discounts" />
+              : <>
+                  {/* Summary */}
+                  <div className="grid grid-cols-2 gap-3 mb-4">
+                    <div className="bg-green-50 border border-green-200 rounded-2xl p-4">
+                      <p className="text-xs text-gray-500 mb-1">Total Discounts Given</p>
+                      <p className="text-3xl font-bold text-green-600">₹{discData.totalDiscount}</p>
+                      <p className="text-xs text-gray-400 mt-1">{discData.bills.length} bills had discount</p>
+                    </div>
+                    <div className="bg-orange-50 border border-orange-200 rounded-2xl p-4">
+                      <p className="text-xs text-gray-500 mb-1">Gross Before Discount</p>
+                      <p className="text-3xl font-bold text-orange-600">₹{discData.grossRevenue}</p>
+                      <p className="text-xs text-gray-400 mt-1">
+                        Saved {discData.grossRevenue > 0 ? ((discData.totalDiscount / discData.grossRevenue) * 100).toFixed(1) : 0}% given away
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Reason breakdown */}
+                  {discData.reasonBreakdown.length > 0 && (
+                    <div className="bg-white rounded-2xl shadow p-5 mb-4">
+                      <h3 className="font-bold text-gray-700 mb-3">By Reason</h3>
+                      <div className="space-y-2">
+                        {discData.reasonBreakdown.map(r => (
+                          <div key={r.reason} className="flex justify-between items-center p-3 bg-gray-50 rounded-xl">
+                            <div>
+                              <p className="font-medium text-gray-700 text-sm">{r.reason}</p>
+                              <p className="text-xs text-gray-400">{r.count} bill(s)</p>
+                            </div>
+                            <p className="font-bold text-green-600">-₹{r.total}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* All discounted bills */}
+                  <div className="bg-white rounded-2xl shadow p-5">
+                    <h3 className="font-bold text-gray-700 mb-3">All Discounted Bills</h3>
+                    <div className="space-y-3">
+                      {discData.bills.map(bill => (
+                        <div key={bill._key} className="border border-green-100 rounded-xl p-4 bg-green-50">
+                          <div className="flex justify-between items-start mb-2">
+                            <div>
+                              <p className="font-semibold text-gray-700">{bill.table_name_snapshot || 'Table'}</p>
+                              <p className="text-xs text-gray-400">{formatDate(bill.paid_at)} • {toIST(bill.paid_at)}</p>
+                            </div>
+                            <div className="text-right">
+                              <p className="text-green-600 font-bold text-lg">-₹{bill.discount_amt}</p>
+                              <p className="text-xs text-gray-400">
+                                {bill.discount_type === 'percent' ? `${bill.discount_value}% off` : `₹${bill.discount_value} flat`}
+                              </p>
+                            </div>
+                          </div>
+                          <div className="bg-white rounded-lg px-3 py-2 mb-2">
+                            <p className="text-xs text-gray-700">
+                              <span className="font-medium">📝 Reason: </span>
+                              {bill.discount_reason || <span className="text-gray-400 italic">No reason given</span>}
+                            </p>
+                          </div>
+                          <div className="flex justify-between text-xs text-gray-500">
+                            <span>Subtotal: ₹{bill.subtotal}</span>
+                            <span className="text-orange-500 font-bold">Final: ₹{bill.final_amount}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </>
+            }
+          </div>
+        )}
+
+        {/* ── SETTLEMENT ── */}
         {activeTab === 'settlement' && !loading && (
           <div>
             <DateRangeFilter
@@ -543,7 +888,7 @@ export default function Reports() {
 
                   <div className="bg-white rounded-2xl shadow p-5 mb-4 space-y-2 text-sm">
                     <div className="flex justify-between text-gray-600">
-                      <span>Total Service Charges Collected</span>
+                      <span>Service Charges Collected</span>
                       <span className="font-bold">₹{settlData.serviceTotal}</span>
                     </div>
                     {settlData.discountTotal > 0 && (
@@ -579,35 +924,23 @@ export default function Reports() {
                               <td className="py-2 text-xs text-gray-400">
                                 {formatDate(bill.paid_at)}<br />{toIST(bill.paid_at)}
                               </td>
-                              <td className="py-2 font-medium text-gray-700">
-                                {bill.table_name_snapshot || 'Table'}
-                              </td>
-                              <td className="py-2">
-                                <PayBadge type={bill.payment_type} />
-                              </td>
-                              <td className="py-2 text-right text-gray-600">
-                                ₹{bill.subtotal || 0}
-                              </td>
+                              <td className="py-2 font-medium text-gray-700">{bill.table_name_snapshot || 'Table'}</td>
+                              <td className="py-2"><PayBadge type={bill.payment_type} /></td>
+                              <td className="py-2 text-right text-gray-600">₹{bill.subtotal || 0}</td>
                               <td className="py-2 text-right text-gray-400">
                                 {bill.service_charge_amt > 0 ? `₹${bill.service_charge_amt}` : '—'}
                               </td>
                               <td className="py-2 text-right text-green-600">
                                 {bill.discount_amt > 0 ? `-₹${bill.discount_amt}` : '—'}
                               </td>
-                              <td className="py-2 text-right font-bold text-orange-500">
-                                ₹{bill.final_amount}
-                              </td>
+                              <td className="py-2 text-right font-bold text-orange-500">₹{bill.final_amount}</td>
                             </tr>
                           ))}
                         </tbody>
                         <tfoot>
                           <tr className="border-t-2 border-gray-200">
-                            <td colSpan={6} className="py-2 font-bold text-gray-700">
-                              Grand Total
-                            </td>
-                            <td className="py-2 text-right font-bold text-orange-500 text-lg">
-                              ₹{settlData.grandTotal}
-                            </td>
+                            <td colSpan={6} className="py-2 font-bold text-gray-700">Grand Total</td>
+                            <td className="py-2 text-right font-bold text-orange-500 text-lg">₹{settlData.grandTotal}</td>
                           </tr>
                         </tfoot>
                       </table>
@@ -617,7 +950,6 @@ export default function Reports() {
             }
           </div>
         )}
-
       </div>
     </div>
   )
