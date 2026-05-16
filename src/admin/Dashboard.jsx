@@ -19,6 +19,25 @@ const LIQUOR_KEYWORDS = [
 const isLiquorItem = (name = '') =>
   LIQUOR_KEYWORDS.some(k => name.toLowerCase().includes(k))
 
+// Merge duplicate items by name — combine quantities
+const mergeItems = (items) => {
+  const map = {}
+  items.forEach(item => {
+    const name = item.food_items?.name || 'Unknown'
+    if (map[name]) {
+      map[name].quantity += item.quantity
+      map[name].total += item.price_at_order * item.quantity
+    } else {
+      map[name] = {
+        ...item,
+        quantity: item.quantity,
+        total: item.price_at_order * item.quantity
+      }
+    }
+  })
+  return Object.values(map)
+}
+
 const buildHtmlReceipt = (lines) => `
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
@@ -49,6 +68,7 @@ ${lines.liquorItems.map(i => `<div class="row"><span>${i.name} x${i.qty}</span><
 <div class="row"><span>Subtotal</span><span>Rs.${lines.subtotal}</span></div>
 ${lines.serviceChargeAmt > 0 ? `<div class="row"><span>Service (${lines.serviceChargePct}%)</span><span>Rs.${lines.serviceChargeAmt}</span></div>` : ''}
 ${lines.discountAmt > 0 ? `<div class="row"><span>Discount${lines.discountType === 'percent' ? ` (${lines.discountValue}%)` : ' (Flat)'}</span><span>-Rs.${lines.discountAmt}</span></div>` : ''}
+${lines.discountAmt > 0 && lines.discountReason ? `<div class="center" style="font-size:11px;color:#666">Reason: ${lines.discountReason}</div>` : ''}
 <div class="div"></div>
 <div class="row big"><span>TOTAL</span><span>Rs.${lines.finalAmount}</span></div>
 <div class="div"></div>
@@ -68,7 +88,6 @@ export default function Dashboard() {
   const [soundReady, setSoundReady] = useState(false)
   const [sessionStart] = useState(() => new Date().toISOString())
 
-  // Restaurant settings from DB
   const [restaurant, setRestaurant] = useState({
     name: 'My Restaurant',
     address: '',
@@ -77,23 +96,22 @@ export default function Dashboard() {
     footer_note: 'Thank you! Visit again!'
   })
 
-  // Bill preview modal
   const [showPreview, setShowPreview] = useState(false)
   const [payTableId, setPayTableId] = useState(null)
   const [editMode, setEditMode] = useState(false)
   const [removedItems, setRemovedItems] = useState(new Set())
   const [billPrinted, setBillPrinted] = useState(false)
 
-  // Service charge & discount
   const [serviceChargePct, setServiceChargePct] = useState(0)
   const [discountType, setDiscountType] = useState('percent')
   const [discountValue, setDiscountValue] = useState('')
+  const [discountReason, setDiscountReason] = useState('')
+  const [discountReasonError, setDiscountReasonError] = useState(false)
 
   const prevOrderIds = useRef(new Set())
   const audioCtxRef = useRef(null)
   const navigate = useNavigate()
 
-  // ── Load restaurant settings ────────────────────────────
   useEffect(() => {
     supabase.from('settings').select('*').eq('id', 'main').single()
       .then(({ data }) => {
@@ -196,10 +214,15 @@ export default function Dashboard() {
 
   const computeTotals = useCallback((tableId) => {
     const items = getEffectiveItems(tableId)
-    const foodItems = items.filter(i => !isLiquorItem(i.food_items?.name))
-    const liquorItems = items.filter(i => isLiquorItem(i.food_items?.name))
-    const foodSubtotal = foodItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
-    const liquorSubtotal = liquorItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
+    const rawFoodItems = items.filter(i => !isLiquorItem(i.food_items?.name))
+    const rawLiquorItems = items.filter(i => isLiquorItem(i.food_items?.name))
+
+    // Merge duplicates before display
+    const foodItems = mergeItems(rawFoodItems)
+    const liquorItems = mergeItems(rawLiquorItems)
+
+    const foodSubtotal = foodItems.reduce((s, i) => s + i.total, 0)
+    const liquorSubtotal = liquorItems.reduce((s, i) => s + i.total, 0)
     const subtotal = foodSubtotal + liquorSubtotal
     const serviceChargeAmt = Math.round(subtotal * serviceChargePct / 100)
     const afterService = subtotal + serviceChargeAmt
@@ -208,7 +231,13 @@ export default function Dashboard() {
       ? Math.round(afterService * dv / 100)
       : Math.min(dv, afterService)
     const finalAmount = afterService - discountAmt
-    return { items, foodItems, liquorItems, foodSubtotal, liquorSubtotal, subtotal, serviceChargeAmt, discountAmt, finalAmount }
+
+    return {
+      items, rawFoodItems, rawLiquorItems,
+      foodItems, liquorItems,
+      foodSubtotal, liquorSubtotal, subtotal,
+      serviceChargeAmt, discountAmt, finalAmount
+    }
   }, [getEffectiveItems, serviceChargePct, discountType, discountValue])
 
   const openPreview = (tableId) => {
@@ -219,14 +248,29 @@ export default function Dashboard() {
     setServiceChargePct(0)
     setDiscountType('percent')
     setDiscountValue('')
+    setDiscountReason('')
+    setDiscountReasonError(false)
     setShowPreview(true)
   }
 
   const handlePrintAndSave = async () => {
-    const tblData = tables.find(t => t.id === payTableId)
-    const { foodItems, liquorItems, foodSubtotal, liquorSubtotal, subtotal, serviceChargeAmt, discountAmt, finalAmount } = computeTotals(payTableId)
-    const now = new Date()
     const dv = parseFloat(discountValue) || 0
+
+    // Validate discount reason if discount is given
+    if (dv > 0 && !discountReason.trim()) {
+      setDiscountReasonError(true)
+      return
+    }
+    setDiscountReasonError(false)
+
+    const tblData = tables.find(t => t.id === payTableId)
+    const {
+      foodItems, liquorItems,
+      foodSubtotal, liquorSubtotal, subtotal,
+      serviceChargeAmt, discountAmt, finalAmount
+    } = computeTotals(payTableId)
+
+    const now = new Date()
 
     const lines = {
       restaurantName: restaurant.name,
@@ -237,11 +281,20 @@ export default function Dashboard() {
       tableName: tblData?.table_name || '',
       date: toISTDate(now.toISOString()),
       time: toIST(now.toISOString()),
-      foodItems: foodItems.map(i => ({ name: i.food_items?.name, qty: i.quantity, total: i.price_at_order * i.quantity })),
-      liquorItems: liquorItems.map(i => ({ name: i.food_items?.name, qty: i.quantity, total: i.price_at_order * i.quantity })),
+      foodItems: foodItems.map(i => ({
+        name: i.food_items?.name || i.name,
+        qty: i.quantity,
+        total: i.total
+      })),
+      liquorItems: liquorItems.map(i => ({
+        name: i.food_items?.name || i.name,
+        qty: i.quantity,
+        total: i.total
+      })),
       foodSubtotal, liquorSubtotal, subtotal,
       serviceChargePct, serviceChargeAmt,
       discountType, discountValue: dv, discountAmt,
+      discountReason: discountReason.trim(),
       finalAmount,
     }
 
@@ -265,6 +318,7 @@ export default function Dashboard() {
         discount_type: discountType,
         discount_value: dv,
         discount_amt: discountAmt,
+        discount_reason: discountReason.trim(),
         final_amount: finalAmount,
         settlement_status: 'pending',
         table_name_snapshot: tblData?.table_name || '',
@@ -331,6 +385,7 @@ export default function Dashboard() {
   const currentPin = selectedTableData?.pin || '----'
   const previewTotals = payTableId ? computeTotals(payTableId) : null
   const previewTableName = tables.find(t => t.id === payTableId)?.table_name || ''
+  const dv = parseFloat(discountValue) || 0
 
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col" onClick={initAudio}>
@@ -346,6 +401,7 @@ export default function Dashboard() {
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl max-h-[92vh] flex flex-col">
 
+            {/* Receipt Header */}
             <div className="p-5 border-b">
               <div className="text-center">
                 <p className="font-bold text-lg text-gray-800">{restaurant.name}</p>
@@ -363,7 +419,7 @@ export default function Dashboard() {
 
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
 
-              {/* Food */}
+              {/* Food — merged quantities */}
               {previewTotals.foodItems.length > 0 && (
                 <div>
                   <div className="flex items-center gap-2 mb-2">
@@ -371,26 +427,40 @@ export default function Dashboard() {
                     <div className="flex-1 border-t border-dashed border-gray-200" />
                   </div>
                   {previewTotals.foodItems.map((item, i) => {
-                    const key = item._key
+                    const name = item.food_items?.name || item.name
                     return (
-                      <div key={i} className={`flex justify-between items-center text-sm py-1 px-1 rounded
-                        ${editMode && removedItems.has(key) ? 'opacity-30 line-through bg-red-50' : ''}`}>
+                      <div key={i} className={`flex justify-between items-center text-sm py-1.5 px-1 rounded
+                        ${editMode ? 'hover:bg-gray-50' : ''}`}>
                         <div className="flex items-center gap-2 flex-1">
                           {editMode && (
-                            <button onClick={() => setRemovedItems(prev => {
-                              const n = new Set(prev)
-                              n.has(key) ? n.delete(key) : n.add(key)
-                              return n
-                            })}
-                              className={`w-5 h-5 rounded-full border-2 flex items-center justify-center text-xs font-bold
-                                ${removedItems.has(key) ? 'border-green-500 text-green-500' : 'border-red-400 text-red-400'}`}>
-                              {removedItems.has(key) ? '+' : '−'}
+                            <button
+                              onClick={() => {
+                                // In edit mode, mark all raw items with this name as removed
+                                setRemovedItems(prev => {
+                                  const n = new Set(prev)
+                                  previewTotals.rawFoodItems.forEach(raw => {
+                                    if (raw.food_items?.name === name) {
+                                      n.has(raw._key) ? n.delete(raw._key) : n.add(raw._key)
+                                    }
+                                  })
+                                  return n
+                                })
+                              }}
+                              className={`w-5 h-5 rounded-full border-2 flex items-center justify-center text-xs font-bold flex-shrink-0
+                                ${previewTotals.rawFoodItems.some(r => r.food_items?.name === name && removedItems.has(r._key))
+                                  ? 'border-green-500 text-green-500'
+                                  : 'border-red-400 text-red-400'}`}>
+                              {previewTotals.rawFoodItems.some(r => r.food_items?.name === name && removedItems.has(r._key)) ? '+' : '−'}
                             </button>
                           )}
-                          <span className="text-gray-700">{item.food_items?.name}</span>
-                          <span className="text-gray-400 text-xs">×{item.quantity}</span>
+                          <span className={`text-gray-700 ${editMode && previewTotals.rawFoodItems.some(r => r.food_items?.name === name && removedItems.has(r._key)) ? 'line-through opacity-40' : ''}`}>
+                            {name}
+                          </span>
+                          <span className="bg-orange-100 text-orange-600 text-xs font-bold px-1.5 py-0.5 rounded-full">
+                            ×{item.quantity}
+                          </span>
                         </div>
-                        <span className="text-gray-700 font-medium">₹{item.price_at_order * item.quantity}</span>
+                        <span className="text-gray-700 font-medium">₹{item.total}</span>
                       </div>
                     )
                   })}
@@ -401,7 +471,7 @@ export default function Dashboard() {
                 </div>
               )}
 
-              {/* Liquor */}
+              {/* Liquor — merged quantities */}
               {previewTotals.liquorItems.length > 0 && (
                 <div>
                   <div className="flex items-center gap-2 mb-2">
@@ -409,26 +479,39 @@ export default function Dashboard() {
                     <div className="flex-1 border-t border-dashed border-gray-200" />
                   </div>
                   {previewTotals.liquorItems.map((item, i) => {
-                    const key = item._key
+                    const name = item.food_items?.name || item.name
                     return (
-                      <div key={i} className={`flex justify-between items-center text-sm py-1 px-1 rounded
-                        ${editMode && removedItems.has(key) ? 'opacity-30 line-through bg-red-50' : ''}`}>
+                      <div key={i} className={`flex justify-between items-center text-sm py-1.5 px-1 rounded
+                        ${editMode ? 'hover:bg-gray-50' : ''}`}>
                         <div className="flex items-center gap-2 flex-1">
                           {editMode && (
-                            <button onClick={() => setRemovedItems(prev => {
-                              const n = new Set(prev)
-                              n.has(key) ? n.delete(key) : n.add(key)
-                              return n
-                            })}
-                              className={`w-5 h-5 rounded-full border-2 flex items-center justify-center text-xs font-bold
-                                ${removedItems.has(key) ? 'border-green-500 text-green-500' : 'border-red-400 text-red-400'}`}>
-                              {removedItems.has(key) ? '+' : '−'}
+                            <button
+                              onClick={() => {
+                                setRemovedItems(prev => {
+                                  const n = new Set(prev)
+                                  previewTotals.rawLiquorItems.forEach(raw => {
+                                    if (raw.food_items?.name === name) {
+                                      n.has(raw._key) ? n.delete(raw._key) : n.add(raw._key)
+                                    }
+                                  })
+                                  return n
+                                })
+                              }}
+                              className={`w-5 h-5 rounded-full border-2 flex items-center justify-center text-xs font-bold flex-shrink-0
+                                ${previewTotals.rawLiquorItems.some(r => r.food_items?.name === name && removedItems.has(r._key))
+                                  ? 'border-green-500 text-green-500'
+                                  : 'border-red-400 text-red-400'}`}>
+                              {previewTotals.rawLiquorItems.some(r => r.food_items?.name === name && removedItems.has(r._key)) ? '+' : '−'}
                             </button>
                           )}
-                          <span className="text-gray-700">{item.food_items?.name}</span>
-                          <span className="text-gray-400 text-xs">×{item.quantity}</span>
+                          <span className={`text-gray-700 ${editMode && previewTotals.rawLiquorItems.some(r => r.food_items?.name === name && removedItems.has(r._key)) ? 'line-through opacity-40' : ''}`}>
+                            {name}
+                          </span>
+                          <span className="bg-blue-100 text-blue-600 text-xs font-bold px-1.5 py-0.5 rounded-full">
+                            ×{item.quantity}
+                          </span>
                         </div>
-                        <span className="text-gray-700 font-medium">₹{item.price_at_order * item.quantity}</span>
+                        <span className="text-gray-700 font-medium">₹{item.total}</span>
                       </div>
                     )
                   })}
@@ -439,10 +522,11 @@ export default function Dashboard() {
                 </div>
               )}
 
-              {/* Charges */}
+              {/* Charges & Discount */}
               {!editMode && (
                 <div className="bg-gray-50 rounded-xl p-3 space-y-3">
                   <p className="text-xs font-bold text-gray-500 uppercase">Charges & Discount</p>
+
                   <div className="flex justify-between items-center text-sm text-gray-600">
                     <span>Service Charge</span>
                     <div className="flex items-center gap-2">
@@ -460,17 +544,18 @@ export default function Dashboard() {
                       )}
                     </div>
                   </div>
+
                   <div className="flex justify-between items-center text-sm text-gray-600">
                     <span>Discount</span>
                     <div className="flex items-center gap-2">
                       <select value={discountType}
-                        onChange={e => { setDiscountType(e.target.value); setDiscountValue('') }}
+                        onChange={e => { setDiscountType(e.target.value); setDiscountValue(''); setDiscountReason('') }}
                         className="border rounded px-2 py-0.5 text-xs">
                         <option value="percent">%</option>
                         <option value="flat">₹ flat</option>
                       </select>
                       <input type="number" min="0" value={discountValue}
-                        onChange={e => setDiscountValue(e.target.value)}
+                        onChange={e => { setDiscountValue(e.target.value); setDiscountReasonError(false) }}
                         placeholder="0"
                         className="border rounded px-2 py-0.5 text-xs w-16 text-right" />
                       {previewTotals.discountAmt > 0 && (
@@ -478,10 +563,32 @@ export default function Dashboard() {
                       )}
                     </div>
                   </div>
+
+                  {/* Discount Reason — required when discount > 0 */}
+                  {dv > 0 && (
+                    <div>
+                      <label className="text-xs text-gray-500 mb-1 block">
+                        Discount Reason <span className="text-red-500">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={discountReason}
+                        onChange={e => { setDiscountReason(e.target.value); setDiscountReasonError(false) }}
+                        placeholder="e.g. Regular customer, Birthday, Referral by owner..."
+                        className={`w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-orange-400
+                          ${discountReasonError ? 'border-red-500 bg-red-50' : 'border-gray-300'}`}
+                      />
+                      {discountReasonError && (
+                        <p className="text-red-500 text-xs mt-1">
+                          ⚠️ Reason is required when giving a discount
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
-              {/* Total */}
+              {/* Totals */}
               <div className="bg-gray-50 rounded-xl p-3">
                 {!editMode && (
                   <>
@@ -496,7 +603,7 @@ export default function Dashboard() {
                     )}
                     {previewTotals.discountAmt > 0 && (
                       <div className="flex justify-between text-xs text-green-600 mb-1">
-                        <span>Discount</span>
+                        <span>Discount {discountReason ? `(${discountReason})` : ''}</span>
                         <span>-₹{previewTotals.discountAmt}</span>
                       </div>
                     )}
@@ -514,7 +621,7 @@ export default function Dashboard() {
 
               {editMode && (
                 <p className="text-xs text-center text-red-400 italic">
-                  Tap − to remove items from bill
+                  Tap − to remove all quantities of that item from bill
                 </p>
               )}
             </div>
@@ -609,8 +716,6 @@ export default function Dashboard() {
       </div>
 
       <div className="flex flex-1 overflow-hidden relative">
-
-        {/* Sidebar */}
         <div className={`${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
           transition-all duration-300 bg-white shadow-lg flex-shrink-0
           fixed md:relative h-[calc(100vh-56px)] w-64
@@ -666,7 +771,6 @@ export default function Dashboard() {
             onClick={() => setSidebarOpen(false)} />
         )}
 
-        {/* Main Content */}
         <div className="flex-1 overflow-y-auto p-4 md:p-6">
           {!selectedTable && (
             <div className="flex flex-col items-center justify-center h-full min-h-64 text-gray-400">
