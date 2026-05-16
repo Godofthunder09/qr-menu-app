@@ -22,6 +22,45 @@ const ORDER_SELECT = `
   order_items(quantity, price_at_order, food_items(name))
 `
 
+// Group multiple order rows that belong to the same table session into one bill.
+// Sessions share the same table_name_snapshot + paid_at minute (set in one handlePrintAndSave call).
+const groupOrdersIntoBills = (orders) => {
+  const map = {}
+  orders.forEach(order => {
+    const minuteKey = order.paid_at ? order.paid_at.substring(0, 16) : order.id
+    const key = `${order.table_name_snapshot || ''}__${minuteKey}`
+
+    if (!map[key]) {
+      map[key] = {
+        // Keep all order ids so settlement/reporting can reference them
+        _orderIds: [order.id],
+        _key: key,
+        id: order.id,               // representative id (first round)
+        payment_type: order.payment_type,
+        paid_at: order.paid_at,
+        table_name_snapshot: order.table_name_snapshot,
+        // Financials are identical across rounds (set once at print time)
+        subtotal: order.subtotal || 0,
+        service_charge_pct: order.service_charge_pct || 0,
+        service_charge_amt: order.service_charge_amt || 0,
+        discount_type: order.discount_type,
+        discount_value: order.discount_value || 0,
+        discount_amt: order.discount_amt || 0,
+        final_amount: order.final_amount || 0,
+        // Merge all items from all rounds
+        order_items: [...(order.order_items || [])],
+      }
+    } else {
+      map[key]._orderIds.push(order.id)
+      map[key].order_items = [
+        ...map[key].order_items,
+        ...(order.order_items || [])
+      ]
+    }
+  })
+  return Object.values(map)
+}
+
 export default function Reports() {
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState('today')
@@ -45,19 +84,20 @@ export default function Reports() {
 
   useEffect(() => { fetchToday() }, [])
 
-  const buildSummary = (orders) => {
-    const totalRevenue = orders.reduce((s, o) => s + (o.final_amount || 0), 0)
-    const cashRev = orders.filter(o => o.payment_type === 'cash')
-      .reduce((s, o) => s + (o.final_amount || 0), 0)
-    const upiRev = orders.filter(o => o.payment_type === 'upi')
-      .reduce((s, o) => s + (o.final_amount || 0), 0)
-    const cardRev = orders.filter(o => o.payment_type === 'card')
-      .reduce((s, o) => s + (o.final_amount || 0), 0)
-    const scTotal = orders.reduce((s, o) => s + (o.service_charge_amt || 0), 0)
-    const discountTotal = orders.reduce((s, o) => s + (o.discount_amt || 0), 0)
+  // Build summary from already-grouped bills (one entry = one table session)
+  const buildSummary = (bills) => {
+    const totalRevenue = bills.reduce((s, b) => s + (b.final_amount || 0), 0)
+    const cashRev = bills.filter(b => b.payment_type === 'cash')
+      .reduce((s, b) => s + (b.final_amount || 0), 0)
+    const upiRev = bills.filter(b => b.payment_type === 'upi')
+      .reduce((s, b) => s + (b.final_amount || 0), 0)
+    const cardRev = bills.filter(b => b.payment_type === 'card')
+      .reduce((s, b) => s + (b.final_amount || 0), 0)
+    const scTotal = bills.reduce((s, b) => s + (b.service_charge_amt || 0), 0)
+    const discountTotal = bills.reduce((s, b) => s + (b.discount_amt || 0), 0)
     return {
       totalRevenue, cashRev, upiRev, cardRev,
-      scTotal, discountTotal, totalOrders: orders.length
+      scTotal, discountTotal, totalOrders: bills.length
     }
   }
 
@@ -80,9 +120,9 @@ export default function Reports() {
       .order('paid_at', { ascending: false })
 
     if (error) console.error('fetchToday:', error.message)
-    const list = orders || []
-    setTodayOrders(list)
-    setTodayReport(list.length > 0 ? buildSummary(list) : null)
+    const bills = groupOrdersIntoBills(orders || [])
+    setTodayOrders(bills)
+    setTodayReport(bills.length > 0 ? buildSummary(bills) : null)
     setLoading(false)
   }
 
@@ -99,9 +139,9 @@ export default function Reports() {
       .order('paid_at', { ascending: false })
 
     if (error) console.error('fetchRange:', error.message)
-    const list = orders || []
-    setRangeOrders(list)
-    setRangeReport(list.length > 0 ? buildSummary(list) : null)
+    const bills = groupOrdersIntoBills(orders || [])
+    setRangeOrders(bills)
+    setRangeReport(bills.length > 0 ? buildSummary(bills) : null)
     setLoading(false)
   }
 
@@ -130,6 +170,8 @@ export default function Reports() {
 
     if (itemErr) console.error('fetchItemStats items:', itemErr.message)
 
+    // Item stats operate on raw order_items rows — no grouping needed here
+    // because we're aggregating by item name across all rounds anyway
     const map = {}
     items?.forEach(i => {
       const name = i.food_items?.name || 'Unknown'
@@ -167,18 +209,21 @@ export default function Reports() {
       return
     }
 
-    const cash = orders.filter(o => o.payment_type === 'cash')
-    const upi = orders.filter(o => o.payment_type === 'upi')
-    const card = orders.filter(o => o.payment_type === 'card')
+    // Group into sessions — settlement table shows one row per table session
+    const bills = groupOrdersIntoBills(orders)
+
+    const cash = bills.filter(b => b.payment_type === 'cash')
+    const upi  = bills.filter(b => b.payment_type === 'upi')
+    const card = bills.filter(b => b.payment_type === 'card')
 
     setSettlData({
-      orders,
-      cash: { count: cash.length, total: cash.reduce((s, o) => s + (o.final_amount || 0), 0) },
-      upi: { count: upi.length, total: upi.reduce((s, o) => s + (o.final_amount || 0), 0) },
-      card: { count: card.length, total: card.reduce((s, o) => s + (o.final_amount || 0), 0) },
-      grandTotal: orders.reduce((s, o) => s + (o.final_amount || 0), 0),
-      serviceTotal: orders.reduce((s, o) => s + (o.service_charge_amt || 0), 0),
-      discountTotal: orders.reduce((s, o) => s + (o.discount_amt || 0), 0)
+      bills,
+      cash: { count: cash.length, total: cash.reduce((s, b) => s + (b.final_amount || 0), 0) },
+      upi:  { count: upi.length,  total: upi.reduce((s, b) => s + (b.final_amount || 0), 0) },
+      card: { count: card.length, total: card.reduce((s, b) => s + (b.final_amount || 0), 0) },
+      grandTotal:    bills.reduce((s, b) => s + (b.final_amount || 0), 0),
+      serviceTotal:  bills.reduce((s, b) => s + (b.service_charge_amt || 0), 0),
+      discountTotal: bills.reduce((s, b) => s + (b.discount_amt || 0), 0)
     })
     setLoading(false)
   }
@@ -201,7 +246,7 @@ export default function Reports() {
         <p className="text-2xl font-bold text-orange-600">₹{data.totalRevenue}</p>
       </div>
       <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4">
-        <p className="text-xs text-gray-500 mb-1">Total Orders</p>
+        <p className="text-xs text-gray-500 mb-1">Total Bills</p>
         <p className="text-2xl font-bold text-blue-600">{data.totalOrders}</p>
       </div>
       <div className="bg-gray-50 border border-gray-200 rounded-2xl p-4">
@@ -231,25 +276,26 @@ export default function Reports() {
     </div>
   )
 
-  const OrderCard = ({ order, showDate = false }) => (
+  // bill here is already a grouped session object
+  const OrderCard = ({ bill, showDate = false }) => (
     <div className="border border-gray-100 rounded-xl p-4">
       <div className="flex justify-between items-start mb-2 flex-wrap gap-2">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-semibold text-gray-700">
-            {order.table_name_snapshot || 'Table'}
+            {bill.table_name_snapshot || 'Table'}
           </span>
-          <PayBadge type={order.payment_type} />
+          <PayBadge type={bill.payment_type} />
         </div>
         <div className="text-right">
-          <p className="font-bold text-orange-500">₹{order.final_amount}</p>
+          <p className="font-bold text-orange-500">₹{bill.final_amount}</p>
           <p className="text-xs text-gray-400">
-            {showDate ? `${formatDate(order.paid_at)} ` : ''}{toIST(order.paid_at)}
+            {showDate ? `${formatDate(bill.paid_at)} ` : ''}{toIST(bill.paid_at)}
           </p>
         </div>
       </div>
 
       <div className="space-y-1 mb-2">
-        {order.order_items?.map((item, j) => (
+        {bill.order_items?.map((item, j) => (
           <div key={j} className="flex justify-between text-xs text-gray-500">
             <span>{item.food_items?.name} × {item.quantity}</span>
             <span>₹{item.price_at_order * item.quantity}</span>
@@ -260,28 +306,28 @@ export default function Reports() {
       <div className="border-t pt-2 space-y-0.5">
         <div className="flex justify-between text-xs text-gray-400">
           <span>Subtotal</span>
-          <span>₹{order.subtotal || 0}</span>
+          <span>₹{bill.subtotal || 0}</span>
         </div>
-        {order.service_charge_amt > 0 && (
+        {bill.service_charge_amt > 0 && (
           <div className="flex justify-between text-xs text-gray-400">
-            <span>Service ({order.service_charge_pct}%)</span>
-            <span>₹{order.service_charge_amt}</span>
+            <span>Service ({bill.service_charge_pct}%)</span>
+            <span>₹{bill.service_charge_amt}</span>
           </div>
         )}
-        {order.discount_amt > 0 && (
+        {bill.discount_amt > 0 && (
           <div className="flex justify-between text-xs text-green-600">
             <span>
               Discount
-              {order.discount_type === 'percent'
-                ? ` (${order.discount_value}%)`
-                : ` (₹${order.discount_value} flat)`}
+              {bill.discount_type === 'percent'
+                ? ` (${bill.discount_value}%)`
+                : ` (₹${bill.discount_value} flat)`}
             </span>
-            <span>-₹{order.discount_amt}</span>
+            <span>-₹{bill.discount_amt}</span>
           </div>
         )}
         <div className="flex justify-between text-xs font-bold text-gray-700 pt-1 border-t">
           <span>Final</span>
-          <span className="text-orange-500">₹{order.final_amount}</span>
+          <span className="text-orange-500">₹{bill.final_amount}</span>
         </div>
       </div>
     </div>
@@ -341,9 +387,9 @@ export default function Reports() {
         {/* Tabs */}
         <div className="flex gap-2 mb-6 overflow-x-auto pb-1 print:hidden">
           {[
-            { id: 'today', label: '📅 Today' },
-            { id: 'range', label: '📆 Date Range' },
-            { id: 'items', label: '🍴 Items' },
+            { id: 'today',      label: '📅 Today' },
+            { id: 'range',      label: '📆 Date Range' },
+            { id: 'items',      label: '🍴 Items' },
             { id: 'settlement', label: '💰 Settlement' }
           ].map(tab => (
             <button key={tab.id} onClick={() => setActiveTab(tab.id)}
@@ -377,11 +423,11 @@ export default function Reports() {
                   <ReportSummary data={todayReport} />
                   <div className="bg-white rounded-2xl shadow p-5">
                     <h3 className="font-bold text-gray-700 mb-3">
-                      Order Details ({todayOrders.length})
+                      Bill Details ({todayOrders.length})
                     </h3>
                     <div className="space-y-3">
-                      {todayOrders.map(order => (
-                        <OrderCard key={order.id} order={order} showDate={false} />
+                      {todayOrders.map(bill => (
+                        <OrderCard key={bill._key} bill={bill} showDate={false} />
                       ))}
                     </div>
                   </div>
@@ -409,11 +455,11 @@ export default function Reports() {
                   <ReportSummary data={rangeReport} />
                   <div className="bg-white rounded-2xl shadow p-5">
                     <h3 className="font-bold text-gray-700 mb-3">
-                      All Orders ({rangeOrders.length})
+                      All Bills ({rangeOrders.length})
                     </h3>
                     <div className="space-y-3">
-                      {rangeOrders.map(order => (
-                        <OrderCard key={order.id} order={order} showDate={true} />
+                      {rangeOrders.map(bill => (
+                        <OrderCard key={bill._key} bill={bill} showDate={true} />
                       ))}
                     </div>
                   </div>
@@ -476,22 +522,22 @@ export default function Reports() {
                     <div className="bg-orange-50 border border-orange-200 rounded-2xl p-4 col-span-2 md:col-span-1">
                       <p className="text-xs text-gray-500 mb-1">Grand Total</p>
                       <p className="text-3xl font-bold text-orange-600">₹{settlData.grandTotal}</p>
-                      <p className="text-xs text-gray-400 mt-1">{settlData.orders.length} transactions</p>
+                      <p className="text-xs text-gray-400 mt-1">{settlData.bills.length} bills</p>
                     </div>
                     <div className="bg-green-50 border border-green-200 rounded-2xl p-4">
                       <p className="text-xs text-gray-500 mb-1">💵 Cash</p>
                       <p className="text-2xl font-bold text-green-600">₹{settlData.cash.total}</p>
-                      <p className="text-xs text-gray-400">{settlData.cash.count} orders</p>
+                      <p className="text-xs text-gray-400">{settlData.cash.count} bills</p>
                     </div>
                     <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4">
                       <p className="text-xs text-gray-500 mb-1">📱 UPI</p>
                       <p className="text-2xl font-bold text-blue-600">₹{settlData.upi.total}</p>
-                      <p className="text-xs text-gray-400">{settlData.upi.count} orders</p>
+                      <p className="text-xs text-gray-400">{settlData.upi.count} bills</p>
                     </div>
                     <div className="bg-purple-50 border border-purple-200 rounded-2xl p-4">
                       <p className="text-xs text-gray-500 mb-1">💳 Card</p>
                       <p className="text-2xl font-bold text-purple-600">₹{settlData.card.total}</p>
-                      <p className="text-xs text-gray-400">{settlData.card.count} orders</p>
+                      <p className="text-xs text-gray-400">{settlData.card.count} bills</p>
                     </div>
                   </div>
 
@@ -528,28 +574,28 @@ export default function Reports() {
                           </tr>
                         </thead>
                         <tbody>
-                          {settlData.orders.map(order => (
-                            <tr key={order.id} className="border-b border-gray-50 hover:bg-gray-50">
+                          {settlData.bills.map(bill => (
+                            <tr key={bill._key} className="border-b border-gray-50 hover:bg-gray-50">
                               <td className="py-2 text-xs text-gray-400">
-                                {formatDate(order.paid_at)}<br />{toIST(order.paid_at)}
+                                {formatDate(bill.paid_at)}<br />{toIST(bill.paid_at)}
                               </td>
                               <td className="py-2 font-medium text-gray-700">
-                                {order.table_name_snapshot || 'Table'}
+                                {bill.table_name_snapshot || 'Table'}
                               </td>
                               <td className="py-2">
-                                <PayBadge type={order.payment_type} />
+                                <PayBadge type={bill.payment_type} />
                               </td>
                               <td className="py-2 text-right text-gray-600">
-                                ₹{order.subtotal || 0}
+                                ₹{bill.subtotal || 0}
                               </td>
                               <td className="py-2 text-right text-gray-400">
-                                {order.service_charge_amt > 0 ? `₹${order.service_charge_amt}` : '—'}
+                                {bill.service_charge_amt > 0 ? `₹${bill.service_charge_amt}` : '—'}
                               </td>
                               <td className="py-2 text-right text-green-600">
-                                {order.discount_amt > 0 ? `-₹${order.discount_amt}` : '—'}
+                                {bill.discount_amt > 0 ? `-₹${bill.discount_amt}` : '—'}
                               </td>
                               <td className="py-2 text-right font-bold text-orange-500">
-                                ₹{order.final_amount}
+                                ₹{bill.final_amount}
                               </td>
                             </tr>
                           ))}
