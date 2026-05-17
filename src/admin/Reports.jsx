@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-exist'
 import { supabase } from '../supabase/client'
 
 const toIST = (d) => new Date(d).toLocaleTimeString('en-IN', {
@@ -10,12 +10,13 @@ const formatDate = (d) => new Date(d).toLocaleDateString('en-IN', {
 })
 const todayIST = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
 
+// Simplified select — no nested category join to avoid Supabase errors
 const ORDER_SELECT = `
   id, payment_type, is_paid, paid_at,
   subtotal, service_charge_pct, service_charge_amt,
   discount_type, discount_value, discount_amt, discount_reason,
   final_amount, table_name_snapshot,
-  order_items(quantity, price_at_order, food_items(name, category_id, categories(name)))
+  order_items(quantity, price_at_order, food_items(name))
 `
 
 const groupOrdersIntoBills = (orders) => {
@@ -53,42 +54,34 @@ export default function Reports() {
   const [activeTab, setActiveTab] = useState('today')
   const [loading, setLoading] = useState(false)
 
-  // Today
   const [todayOrders, setTodayOrders] = useState([])
   const [todayReport, setTodayReport] = useState(null)
 
-  // Date Range
   const [fromDate, setFromDate] = useState(todayIST())
   const [toDate, setToDate] = useState(todayIST())
   const [rangeOrders, setRangeOrders] = useState([])
   const [rangeReport, setRangeReport] = useState(null)
 
-  // Item Search
   const [itemFromDate, setItemFromDate] = useState(todayIST())
   const [itemToDate, setItemToDate] = useState(todayIST())
   const [itemStats, setItemStats] = useState([])
   const [itemSearchQuery, setItemSearchQuery] = useState('')
 
-  // Category
   const [catFromDate, setCatFromDate] = useState(todayIST())
   const [catToDate, setCatToDate] = useState(todayIST())
   const [catStats, setCatStats] = useState([])
 
-  // Table-wise
   const [tableFromDate, setTableFromDate] = useState(todayIST())
   const [tableToDate, setTableToDate] = useState(todayIST())
   const [tableStats, setTableStats] = useState([])
 
-  // Monthly
   const [monthlyYear, setMonthlyYear] = useState(new Date().getFullYear())
   const [monthlyData, setMonthlyData] = useState([])
 
-  // Discounts
   const [discFromDate, setDiscFromDate] = useState(todayIST())
   const [discToDate, setDiscToDate] = useState(todayIST())
   const [discData, setDiscData] = useState(null)
 
-  // Settlement
   const [settlFromDate, setSettlFromDate] = useState(todayIST())
   const [settlToDate, setSettlToDate] = useState(todayIST())
   const [settlData, setSettlData] = useState(null)
@@ -117,10 +110,13 @@ export default function Reports() {
     const today = todayIST()
     const { startISO, endISO } = toRange(today, today)
     const { data: orders, error } = await supabase
-      .from('orders').select(ORDER_SELECT)
-      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
+      .from('orders')
+      .select(ORDER_SELECT)
+      .eq('is_paid', true)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
-    if (error) console.error('fetchToday:', error.message)
+    if (error) console.error('fetchToday error:', error.message)
     const bills = groupOrdersIntoBills(orders || [])
     setTodayOrders(bills)
     setTodayReport(bills.length > 0 ? buildSummary(bills) : null)
@@ -131,10 +127,13 @@ export default function Reports() {
     setLoading(true)
     const { startISO, endISO } = toRange(fromDate, toDate)
     const { data: orders, error } = await supabase
-      .from('orders').select(ORDER_SELECT)
-      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
+      .from('orders')
+      .select(ORDER_SELECT)
+      .eq('is_paid', true)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
-    if (error) console.error('fetchRange:', error.message)
+    if (error) console.error('fetchRange error:', error.message)
     const bills = groupOrdersIntoBills(orders || [])
     setRangeOrders(bills)
     setRangeReport(bills.length > 0 ? buildSummary(bills) : null)
@@ -144,14 +143,30 @@ export default function Reports() {
   const fetchItemStats = async () => {
     setLoading(true)
     const { startISO, endISO } = toRange(itemFromDate, itemToDate)
-    const { data: orders } = await supabase
-      .from('orders').select('id').eq('is_paid', true)
-      .gte('paid_at', startISO).lte('paid_at', endISO)
-    if (!orders || orders.length === 0) { setItemStats([]); setLoading(false); return }
-    const { data: items } = await supabase
+
+    // Step 1: get paid order IDs in range
+    const { data: orders, error: ordErr } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('is_paid', true)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
+
+    if (ordErr) console.error('fetchItemStats orders error:', ordErr.message)
+    if (!orders || orders.length === 0) {
+      setItemStats([])
+      setLoading(false)
+      return
+    }
+
+    // Step 2: get order items
+    const { data: items, error: itemErr } = await supabase
       .from('order_items')
       .select('quantity, price_at_order, food_items(name)')
       .in('order_id', orders.map(o => o.id))
+
+    if (itemErr) console.error('fetchItemStats items error:', itemErr.message)
+
     const map = {}
     items?.forEach(i => {
       const name = i.food_items?.name || 'Unknown'
@@ -166,20 +181,47 @@ export default function Reports() {
   const fetchCategoryStats = async () => {
     setLoading(true)
     const { startISO, endISO } = toRange(catFromDate, catToDate)
-    const { data: orders } = await supabase
-      .from('orders').select('id').eq('is_paid', true)
-      .gte('paid_at', startISO).lte('paid_at', endISO)
-    if (!orders || orders.length === 0) { setCatStats([]); setLoading(false); return }
-    const { data: items } = await supabase
+
+    const { data: orders, error: ordErr } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('is_paid', true)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
+
+    if (ordErr) console.error('fetchCategoryStats orders error:', ordErr.message)
+    if (!orders || orders.length === 0) {
+      setCatStats([])
+      setLoading(false)
+      return
+    }
+
+    // Get order items with food item category
+    const { data: items, error: itemErr } = await supabase
       .from('order_items')
-      .select('quantity, price_at_order, food_items(name, categories(name))')
+      .select('quantity, price_at_order, food_item_id, food_items(name, category_id)')
       .in('order_id', orders.map(o => o.id))
+
+    if (itemErr) console.error('fetchCategoryStats items error:', itemErr.message)
+
+    // Get all category names separately
+    const { data: cats, error: catErr } = await supabase
+      .from('categories')
+      .select('id, name')
+      .eq('is_subcategory', false)
+
+    if (catErr) console.error('fetchCategoryStats cats error:', catErr.message)
+
+    const catMap = {}
+    cats?.forEach(c => { catMap[c.id] = c.name })
+
     const map = {}
     items?.forEach(i => {
-      const cat = i.food_items?.categories?.name || 'Uncategorized'
-      if (!map[cat]) map[cat] = { name: cat, qty: 0, revenue: 0 }
-      map[cat].qty += i.quantity
-      map[cat].revenue += i.price_at_order * i.quantity
+      const catId = i.food_items?.category_id
+      const catName = catId ? (catMap[catId] || 'Uncategorized') : 'Uncategorized'
+      if (!map[catName]) map[catName] = { name: catName, qty: 0, revenue: 0 }
+      map[catName].qty += i.quantity
+      map[catName].revenue += i.price_at_order * i.quantity
     })
     setCatStats(Object.values(map).sort((a, b) => b.revenue - a.revenue))
     setLoading(false)
@@ -188,11 +230,16 @@ export default function Reports() {
   const fetchTableStats = async () => {
     setLoading(true)
     const { startISO, endISO } = toRange(tableFromDate, tableToDate)
+
     const { data: orders, error } = await supabase
       .from('orders')
       .select('table_name_snapshot, final_amount, paid_at, payment_type')
-      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
-    if (error) console.error('fetchTableStats:', error.message)
+      .eq('is_paid', true)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
+
+    if (error) console.error('fetchTableStats error:', error.message)
+
     const map = {}
     orders?.forEach(o => {
       const tbl = o.table_name_snapshot || 'Unknown'
@@ -209,11 +256,15 @@ export default function Reports() {
     setLoading(true)
     const startISO = new Date(`${monthlyYear}-01-01T00:00:00+05:30`).toISOString()
     const endISO = new Date(`${monthlyYear}-12-31T23:59:59+05:30`).toISOString()
+
     const { data: orders, error } = await supabase
       .from('orders')
       .select('paid_at, final_amount, payment_type, service_charge_amt, discount_amt')
-      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
-    if (error) console.error('fetchMonthly:', error.message)
+      .eq('is_paid', true)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
+
+    if (error) console.error('fetchMonthly error:', error.message)
 
     const months = Array.from({ length: 12 }, (_, i) => ({
       month: i, name: MONTH_NAMES[i],
@@ -222,15 +273,17 @@ export default function Reports() {
     }))
 
     orders?.forEach(o => {
-      const m = new Date(o.paid_at).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
-      const monthIdx = parseInt(m.split('-')[1]) - 1
-      months[monthIdx].revenue += o.final_amount || 0
-      months[monthIdx].bills += 1
-      months[monthIdx].serviceCharge += o.service_charge_amt || 0
-      months[monthIdx].discounts += o.discount_amt || 0
-      if (o.payment_type === 'cash') months[monthIdx].cash += o.final_amount || 0
-      if (o.payment_type === 'upi') months[monthIdx].upi += o.final_amount || 0
-      if (o.payment_type === 'card') months[monthIdx].card += o.final_amount || 0
+      const dateStr = new Date(o.paid_at).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
+      const monthIdx = parseInt(dateStr.split('-')[1]) - 1
+      if (monthIdx >= 0 && monthIdx < 12) {
+        months[monthIdx].revenue += o.final_amount || 0
+        months[monthIdx].bills += 1
+        months[monthIdx].serviceCharge += o.service_charge_amt || 0
+        months[monthIdx].discounts += o.discount_amt || 0
+        if (o.payment_type === 'cash') months[monthIdx].cash += o.final_amount || 0
+        if (o.payment_type === 'upi') months[monthIdx].upi += o.final_amount || 0
+        if (o.payment_type === 'card') months[monthIdx].card += o.final_amount || 0
+      }
     })
 
     setMonthlyData(months)
@@ -240,23 +293,32 @@ export default function Reports() {
   const fetchDiscounts = async () => {
     setLoading(true)
     const { startISO, endISO } = toRange(discFromDate, discToDate)
+
     const { data: orders, error } = await supabase
       .from('orders')
       .select('id, payment_type, paid_at, table_name_snapshot, subtotal, discount_type, discount_value, discount_amt, discount_reason, final_amount')
-      .eq('is_paid', true).gt('discount_amt', 0)
-      .gte('paid_at', startISO).lte('paid_at', endISO)
+      .eq('is_paid', true)
+      .gt('discount_amt', 0)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
-    if (error) console.error('fetchDiscounts:', error.message)
-    if (!orders || orders.length === 0) { setDiscData(null); setLoading(false); return }
+
+    if (error) console.error('fetchDiscounts error:', error.message)
+
+    if (!orders || orders.length === 0) {
+      setDiscData(null)
+      setLoading(false)
+      return
+    }
+
     const bills = groupOrdersIntoBills(orders)
     const discountedBills = bills.filter(b => b.discount_amt > 0)
     const totalDiscount = discountedBills.reduce((s, b) => s + (b.discount_amt || 0), 0)
     const grossRevenue = discountedBills.reduce((s, b) => s + (b.subtotal || 0), 0)
 
-    // Group by reason
     const reasonMap = {}
     discountedBills.forEach(b => {
-      const r = b.discount_reason || 'No reason given'
+      const r = b.discount_reason?.trim() || 'No reason given'
       if (!reasonMap[r]) reasonMap[r] = { reason: r, count: 0, total: 0 }
       reasonMap[r].count += 1
       reasonMap[r].total += b.discount_amt || 0
@@ -273,17 +335,28 @@ export default function Reports() {
   const fetchSettlement = async () => {
     setLoading(true)
     const { startISO, endISO } = toRange(settlFromDate, settlToDate)
+
     const { data: orders, error } = await supabase
       .from('orders')
       .select('id, payment_type, paid_at, table_name_snapshot, subtotal, service_charge_pct, service_charge_amt, discount_type, discount_value, discount_amt, final_amount')
-      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
+      .eq('is_paid', true)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
-    if (error) console.error('fetchSettlement:', error.message)
-    if (!orders || orders.length === 0) { setSettlData(null); setLoading(false); return }
+
+    if (error) console.error('fetchSettlement error:', error.message)
+
+    if (!orders || orders.length === 0) {
+      setSettlData(null)
+      setLoading(false)
+      return
+    }
+
     const bills = groupOrdersIntoBills(orders)
     const cash = bills.filter(b => b.payment_type === 'cash')
     const upi = bills.filter(b => b.payment_type === 'upi')
     const card = bills.filter(b => b.payment_type === 'card')
+
     setSettlData({
       bills,
       cash: { count: cash.length, total: cash.reduce((s, b) => s + (b.final_amount || 0), 0) },
@@ -304,7 +377,7 @@ export default function Reports() {
         : type === 'upi' ? 'bg-blue-100 text-blue-600'
         : type === 'card' ? 'bg-purple-100 text-purple-600'
         : 'bg-gray-100 text-gray-500'}`}>
-      {type === 'cash' ? '💵 Cash' : type === 'upi' ? '📱 UPI' : type === 'card' ? '💳 Card' : type}
+      {type === 'cash' ? '💵 Cash' : type === 'upi' ? '📱 UPI' : type === 'card' ? '💳 Card' : type || '—'}
     </span>
   )
 
@@ -430,7 +503,6 @@ export default function Reports() {
   return (
     <div className="min-h-screen bg-gray-50">
 
-      {/* Navbar */}
       <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30 print:hidden">
         <div className="flex items-center gap-3">
           <span className="text-xl">📊</span>
@@ -450,7 +522,6 @@ export default function Reports() {
 
       <div className="p-4 md:p-6 max-w-5xl mx-auto">
 
-        {/* Tabs */}
         <div className="flex gap-2 mb-6 overflow-x-auto pb-2 print:hidden">
           {TABS.map(tab => (
             <button key={tab.id} onClick={() => setActiveTab(tab.id)}
@@ -463,7 +534,7 @@ export default function Reports() {
 
         {loading && <div className="text-center py-8 text-gray-400">Loading...</div>}
 
-        {/* ── TODAY ── */}
+        {/* TODAY */}
         {activeTab === 'today' && !loading && (
           <div>
             <div className="flex justify-between items-center mb-4">
@@ -488,7 +559,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── DATE RANGE ── */}
+        {/* DATE RANGE */}
         {activeTab === 'range' && !loading && (
           <div>
             <DateRangeFilter from={fromDate} to={toDate} onFrom={setFromDate} onTo={setToDate} onFetch={fetchRange} />
@@ -510,7 +581,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── ITEM SEARCH ── */}
+        {/* ITEM SEARCH */}
         {activeTab === 'items' && !loading && (
           <div>
             <DateRangeFilter
@@ -524,7 +595,7 @@ export default function Reports() {
                   type="text"
                   value={itemSearchQuery}
                   onChange={e => setItemSearchQuery(e.target.value)}
-                  placeholder="🔍 Search item name e.g. Ice Cream, Chicken..."
+                  placeholder="🔍 Search item e.g. Ice Cream, Chicken Tikka..."
                   className="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50"
                 />
                 {itemSearchQuery && (
@@ -569,7 +640,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── CATEGORY ── */}
+        {/* CATEGORY */}
         {activeTab === 'category' && !loading && (
           <div>
             <DateRangeFilter
@@ -580,16 +651,15 @@ export default function Reports() {
             {catStats.length === 0
               ? <EmptyState icon="📊" text="Select date range and click View Categories" />
               : <>
-                  {/* Summary bar */}
                   <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-4">
-                    {catStats.map((cat, i) => (
+                    {catStats.map(cat => (
                       <div key={cat.name} className="bg-white border border-gray-200 rounded-2xl p-4">
                         <p className="text-xs text-gray-500 mb-1 truncate">{cat.name}</p>
                         <p className="text-xl font-bold text-orange-600">₹{cat.revenue}</p>
                         <p className="text-xs text-gray-400">{cat.qty} items sold</p>
                         <div className="w-full bg-gray-100 rounded-full h-1.5 mt-2">
                           <div className="bg-orange-400 h-1.5 rounded-full"
-                            style={{ width: `${Math.min((cat.revenue / catStats[0].revenue) * 100, 100)}%` }} />
+                            style={{ width: `${Math.min((cat.revenue / (catStats[0]?.revenue || 1)) * 100, 100)}%` }} />
                         </div>
                       </div>
                     ))}
@@ -626,7 +696,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── TABLE-WISE ── */}
+        {/* TABLE-WISE */}
         {activeTab === 'tables' && !loading && (
           <div>
             <DateRangeFilter
@@ -648,7 +718,7 @@ export default function Reports() {
                           <p className="font-bold text-gray-700">{tbl.name}</p>
                           <div className="w-full bg-gray-200 rounded-full h-1.5 mt-1">
                             <div className="bg-orange-400 h-1.5 rounded-full"
-                              style={{ width: `${Math.min((tbl.revenue / tableStats[0].revenue) * 100, 100)}%` }} />
+                              style={{ width: `${Math.min((tbl.revenue / (tableStats[0]?.revenue || 1)) * 100, 100)}%` }} />
                           </div>
                           <p className="text-xs text-gray-400 mt-1">Last visit: {formatDate(tbl.lastVisit)}</p>
                         </div>
@@ -664,7 +734,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── MONTHLY ── */}
+        {/* MONTHLY */}
         {activeTab === 'monthly' && !loading && (
           <div>
             <div className="bg-white rounded-2xl shadow p-5 mb-4">
@@ -684,14 +754,12 @@ export default function Reports() {
                 </button>
               </div>
             </div>
-
             {monthlyData.length === 0
               ? <EmptyState icon="📅" text="Select a year and click View Year" />
               : <>
-                  {/* Year summary */}
                   <div className="grid grid-cols-2 gap-3 mb-4">
                     <div className="bg-orange-50 border border-orange-200 rounded-2xl p-4">
-                      <p className="text-xs text-gray-500 mb-1">Year {monthlyYear} Total Revenue</p>
+                      <p className="text-xs text-gray-500 mb-1">Year {monthlyYear} Revenue</p>
                       <p className="text-3xl font-bold text-orange-600">₹{yearTotal}</p>
                     </div>
                     <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4">
@@ -699,18 +767,19 @@ export default function Reports() {
                       <p className="text-3xl font-bold text-blue-600">{yearBills}</p>
                     </div>
                   </div>
-
-                  {/* Monthly chart */}
                   <div className="bg-white rounded-2xl shadow p-5 mb-4">
-                    <h3 className="font-bold text-gray-700 mb-4">Monthly Revenue Bar Chart</h3>
-                    <div className="flex items-end gap-1 h-40">
+                    <h3 className="font-bold text-gray-700 mb-4">Monthly Revenue</h3>
+                    <div className="flex items-end gap-1" style={{ height: '140px' }}>
                       {monthlyData.map(m => (
                         <div key={m.month} className="flex-1 flex flex-col items-center gap-1">
-                          <div className="w-full flex items-end" style={{ height: '120px' }}>
+                          <div className="w-full flex items-end" style={{ height: '110px' }}>
                             <div
-                              className="w-full bg-orange-400 rounded-t-lg hover:bg-orange-500 transition"
-                              style={{ height: `${(m.revenue / maxMonthRevenue) * 100}%`, minHeight: m.revenue > 0 ? '4px' : '0' }}
-                              title={`₹${m.revenue}`}
+                              className="w-full bg-orange-400 rounded-t-lg hover:bg-orange-500 transition cursor-pointer"
+                              style={{
+                                height: `${(m.revenue / maxMonthRevenue) * 100}%`,
+                                minHeight: m.revenue > 0 ? '4px' : '0'
+                              }}
+                              title={`${m.name}: ₹${m.revenue}`}
                             />
                           </div>
                           <p className="text-xs text-gray-500">{m.name}</p>
@@ -718,10 +787,8 @@ export default function Reports() {
                       ))}
                     </div>
                   </div>
-
-                  {/* Monthly table */}
                   <div className="bg-white rounded-2xl shadow p-5">
-                    <h3 className="font-bold text-gray-700 mb-3">Month-by-Month Breakdown</h3>
+                    <h3 className="font-bold text-gray-700 mb-3">Month-by-Month</h3>
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm">
                         <thead>
@@ -738,7 +805,8 @@ export default function Reports() {
                         </thead>
                         <tbody>
                           {monthlyData.map(m => (
-                            <tr key={m.month} className={`border-b border-gray-50 hover:bg-gray-50 ${m.revenue === 0 ? 'opacity-40' : ''}`}>
+                            <tr key={m.month}
+                              className={`border-b border-gray-50 hover:bg-gray-50 ${m.revenue === 0 ? 'opacity-40' : ''}`}>
                               <td className="py-2 font-medium text-gray-700">{m.name} {monthlyYear}</td>
                               <td className="py-2 text-right text-gray-500">{m.bills}</td>
                               <td className="py-2 text-right font-bold text-orange-500">₹{m.revenue}</td>
@@ -755,11 +823,11 @@ export default function Reports() {
                             <td className="py-2 text-gray-700">Total</td>
                             <td className="py-2 text-right text-gray-700">{yearBills}</td>
                             <td className="py-2 text-right text-orange-500">₹{yearTotal}</td>
-                            <td className="py-2 text-right text-green-600">₹{monthlyData.reduce((s,m) => s+m.cash,0)}</td>
-                            <td className="py-2 text-right text-blue-600">₹{monthlyData.reduce((s,m) => s+m.upi,0)}</td>
-                            <td className="py-2 text-right text-purple-600">₹{monthlyData.reduce((s,m) => s+m.card,0)}</td>
-                            <td className="py-2 text-right text-gray-400">₹{monthlyData.reduce((s,m) => s+m.serviceCharge,0)}</td>
-                            <td className="py-2 text-right text-green-600">-₹{monthlyData.reduce((s,m) => s+m.discounts,0)}</td>
+                            <td className="py-2 text-right text-green-600">₹{monthlyData.reduce((s, m) => s + m.cash, 0)}</td>
+                            <td className="py-2 text-right text-blue-600">₹{monthlyData.reduce((s, m) => s + m.upi, 0)}</td>
+                            <td className="py-2 text-right text-purple-600">₹{monthlyData.reduce((s, m) => s + m.card, 0)}</td>
+                            <td className="py-2 text-right text-gray-400">₹{monthlyData.reduce((s, m) => s + m.serviceCharge, 0)}</td>
+                            <td className="py-2 text-right text-green-600">-₹{monthlyData.reduce((s, m) => s + m.discounts, 0)}</td>
                           </tr>
                         </tfoot>
                       </table>
@@ -770,7 +838,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── DISCOUNTS ── */}
+        {/* DISCOUNTS */}
         {activeTab === 'discounts' && !loading && (
           <div>
             <DateRangeFilter
@@ -781,7 +849,6 @@ export default function Reports() {
             {!discData
               ? <EmptyState icon="🎁" text="Select date range and click View Discounts" />
               : <>
-                  {/* Summary */}
                   <div className="grid grid-cols-2 gap-3 mb-4">
                     <div className="bg-green-50 border border-green-200 rounded-2xl p-4">
                       <p className="text-xs text-gray-500 mb-1">Total Discounts Given</p>
@@ -792,12 +859,13 @@ export default function Reports() {
                       <p className="text-xs text-gray-500 mb-1">Gross Before Discount</p>
                       <p className="text-3xl font-bold text-orange-600">₹{discData.grossRevenue}</p>
                       <p className="text-xs text-gray-400 mt-1">
-                        Saved {discData.grossRevenue > 0 ? ((discData.totalDiscount / discData.grossRevenue) * 100).toFixed(1) : 0}% given away
+                        {discData.grossRevenue > 0
+                          ? `${((discData.totalDiscount / discData.grossRevenue) * 100).toFixed(1)}% given away`
+                          : ''}
                       </p>
                     </div>
                   </div>
 
-                  {/* Reason breakdown */}
                   {discData.reasonBreakdown.length > 0 && (
                     <div className="bg-white rounded-2xl shadow p-5 mb-4">
                       <h3 className="font-bold text-gray-700 mb-3">By Reason</h3>
@@ -815,7 +883,6 @@ export default function Reports() {
                     </div>
                   )}
 
-                  {/* All discounted bills */}
                   <div className="bg-white rounded-2xl shadow p-5">
                     <h3 className="font-bold text-gray-700 mb-3">All Discounted Bills</h3>
                     <div className="space-y-3">
@@ -829,7 +896,9 @@ export default function Reports() {
                             <div className="text-right">
                               <p className="text-green-600 font-bold text-lg">-₹{bill.discount_amt}</p>
                               <p className="text-xs text-gray-400">
-                                {bill.discount_type === 'percent' ? `${bill.discount_value}% off` : `₹${bill.discount_value} flat`}
+                                {bill.discount_type === 'percent'
+                                  ? `${bill.discount_value}% off`
+                                  : `₹${bill.discount_value} flat`}
                               </p>
                             </div>
                           </div>
@@ -852,7 +921,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ── SETTLEMENT ── */}
+        {/* SETTLEMENT */}
         {activeTab === 'settlement' && !loading && (
           <div>
             <DateRangeFilter
@@ -940,7 +1009,9 @@ export default function Reports() {
                         <tfoot>
                           <tr className="border-t-2 border-gray-200">
                             <td colSpan={6} className="py-2 font-bold text-gray-700">Grand Total</td>
-                            <td className="py-2 text-right font-bold text-orange-500 text-lg">₹{settlData.grandTotal}</td>
+                            <td className="py-2 text-right font-bold text-orange-500 text-lg">
+                              ₹{settlData.grandTotal}
+                            </td>
                           </tr>
                         </tfoot>
                       </table>
