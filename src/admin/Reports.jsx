@@ -403,88 +403,98 @@ export default function Reports() {
   }
 
   // ── Excel Export ──────────────────────────────────────────
-  const exportToExcel = (type) => {
-    const wb = XLSX.utils.book_new()
+  // Replace: import * as XLSX from 'xlsx'
+// With this pure JS CSV export — no package needed:
 
-    if (type === 'today' || type === 'range') {
-      const data = type === 'today' ? { summary: todayReport, depts: todayDepts, bills: todayOrders, title: `Today ${formatDate(new Date())}` }
-        : { summary: rangeReport, depts: rangeDepts, bills: rangeOrders, title: `${formatDate(fromDate)} to ${formatDate(toDate)}` }
-      if (!data.summary) return
-
-      // Summary sheet
-      const summaryRows = [
-        ['Sales Summary', data.title],
-        [],
-        ['Total Revenue', `Rs.${data.summary.totalRevenue}`],
-        ['Total Bills', data.summary.totalOrders],
-        ['Cash', `Rs.${data.summary.cashRev}`],
-        ['UPI', `Rs.${data.summary.upiRev}`],
-        ['Card', `Rs.${data.summary.cardRev}`],
-        ['Service Charge', `Rs.${data.summary.scTotal}`],
-        ['Discounts', `-Rs.${data.summary.discountTotal}`],
-        [],
-        ['Department Breakdown'],
-        ['Department', 'Revenue', 'Items Sold'],
-      ]
-      if (data.depts) {
-        Object.entries(data.depts).forEach(([dept, d]) => {
-          summaryRows.push([dept, `Rs.${d.revenue}`, d.qty])
-        })
-      }
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summaryRows), 'Summary')
-
-      // Bill Details sheet
-      const billRows = [['Table', 'Time', 'Payment', 'Subtotal', 'Service Charge', 'Discount', 'Final Amount', 'Items']]
-      data.bills.forEach(bill => {
-        const itemStr = bill.order_items?.map(i => `${i.food_items?.name} x${i.quantity}`).join(', ') || ''
-        billRows.push([
-          bill.table_name_snapshot || 'Table',
-          toIST(bill.paid_at),
-          bill.payment_type,
-          bill.subtotal,
-          bill.service_charge_amt,
-          bill.discount_amt,
-          bill.final_amount,
-          itemStr
-        ])
-      })
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(billRows), 'Bill Details')
-
-      XLSX.writeFile(wb, `Report_${data.title.replace(/[^a-zA-Z0-9]/g, '_')}.xlsx`)
-
-    } else if (type === 'monthly') {
-      if (!monthlyLoaded) return
-      const rows = [
-        ['Monthly Sales Summary — Last 4 Months'],
-        [],
-        ['Month', 'Bills', 'Revenue', 'Cash', 'UPI', 'Card', 'Service Charge', 'Discounts', 'Kitchen', 'Bakery', 'Beverage', 'Liquor']
-      ]
-      monthlyData.forEach(m => {
-        rows.push([
-          `${m.name} ${m.year}`, m.bills, m.revenue, m.cash, m.upi, m.card,
-          m.serviceCharge, m.discounts,
-          m.depts.Kitchen.revenue, m.depts.Bakery.revenue,
-          m.depts.Beverage.revenue, m.depts.Liquor.revenue
-        ])
-      })
-      const totalRow = ['TOTAL',
-        monthlyData.reduce((s,m) => s+m.bills, 0),
-        monthlyData.reduce((s,m) => s+m.revenue, 0),
-        monthlyData.reduce((s,m) => s+m.cash, 0),
-        monthlyData.reduce((s,m) => s+m.upi, 0),
-        monthlyData.reduce((s,m) => s+m.card, 0),
-        monthlyData.reduce((s,m) => s+m.serviceCharge, 0),
-        monthlyData.reduce((s,m) => s+m.discounts, 0),
-        monthlyData.reduce((s,m) => s+m.depts.Kitchen.revenue, 0),
-        monthlyData.reduce((s,m) => s+m.depts.Bakery.revenue, 0),
-        monthlyData.reduce((s,m) => s+m.depts.Beverage.revenue, 0),
-        monthlyData.reduce((s,m) => s+m.depts.Liquor.revenue, 0),
-      ]
-      rows.push(totalRow)
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), 'Monthly Summary')
-      XLSX.writeFile(wb, 'Monthly_Summary.xlsx')
-    }
+const exportToExcel = (type) => {
+  const downloadCSV = (rows, filename) => {
+    const csv = rows.map(r =>
+      r.map(cell => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(',')
+    ).join('\n')
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
   }
+
+  if (type === 'today' || type === 'range') {
+    const data = type === 'today'
+      ? { summary: todayReport, depts: todayDepts, bills: todayOrders, title: `Today_${formatDate(new Date())}` }
+      : { summary: rangeReport, depts: rangeDepts, bills: rangeOrders, title: `${formatDate(fromDate)}_to_${formatDate(toDate)}` }
+    if (!data.summary) return
+
+    const rows = [
+      ['Sales Summary', data.title],
+      [],
+      ['Total Revenue', data.summary.totalRevenue],
+      ['Total Bills', data.summary.totalOrders],
+      ['Cash', data.summary.cashRev],
+      ['UPI', data.summary.upiRev],
+      ['Card', data.summary.cardRev],
+      ['Service Charge', data.summary.scTotal],
+      ['Discounts', data.summary.discountTotal],
+      [],
+      ['Department Breakdown'],
+      ['Department', 'Revenue', 'Items Sold'],
+    ]
+    if (data.depts) {
+      Object.entries(data.depts).forEach(([dept, d]) => {
+        rows.push([dept, d.revenue, d.qty])
+      })
+    }
+    rows.push([], ['Bill Details'])
+    rows.push(['Table', 'Date', 'Time', 'Payment', 'Subtotal', 'Service Charge', 'Discount', 'Final Amount', 'Items'])
+    data.bills.forEach(bill => {
+      const itemStr = bill.order_items?.map(i => `${i.food_items?.name} x${i.quantity}`).join(' | ') || ''
+      rows.push([
+        bill.table_name_snapshot || 'Table',
+        formatDate(bill.paid_at),
+        toIST(bill.paid_at),
+        bill.payment_type,
+        bill.subtotal,
+        bill.service_charge_amt,
+        bill.discount_amt,
+        bill.final_amount,
+        itemStr
+      ])
+    })
+    downloadCSV(rows, `Report_${data.title.replace(/[^a-zA-Z0-9]/g, '_')}.csv`)
+
+  } else if (type === 'monthly') {
+    if (!monthlyLoaded) return
+    const rows = [
+      ['Monthly Sales Summary — Last 4 Months'],
+      [],
+      ['Month', 'Bills', 'Revenue', 'Cash', 'UPI', 'Card', 'Service Charge', 'Discounts', 'Kitchen', 'Bakery', 'Beverage', 'Liquor']
+    ]
+    monthlyData.forEach(m => {
+      rows.push([
+        `${m.name} ${m.year}`, m.bills, m.revenue, m.cash, m.upi, m.card,
+        m.serviceCharge, m.discounts,
+        m.depts.Kitchen.revenue, m.depts.Bakery.revenue,
+        m.depts.Beverage.revenue, m.depts.Liquor.revenue
+      ])
+    })
+    rows.push([
+      'TOTAL',
+      monthlyData.reduce((s, m) => s + m.bills, 0),
+      monthlyData.reduce((s, m) => s + m.revenue, 0),
+      monthlyData.reduce((s, m) => s + m.cash, 0),
+      monthlyData.reduce((s, m) => s + m.upi, 0),
+      monthlyData.reduce((s, m) => s + m.card, 0),
+      monthlyData.reduce((s, m) => s + m.serviceCharge, 0),
+      monthlyData.reduce((s, m) => s + m.discounts, 0),
+      monthlyData.reduce((s, m) => s + m.depts.Kitchen.revenue, 0),
+      monthlyData.reduce((s, m) => s + m.depts.Bakery.revenue, 0),
+      monthlyData.reduce((s, m) => s + m.depts.Beverage.revenue, 0),
+      monthlyData.reduce((s, m) => s + m.depts.Liquor.revenue, 0),
+    ])
+    downloadCSV(rows, 'Monthly_Summary.csv')
+  }
+}
 
   // ── Reusable Components ───────────────────────────────────
 
