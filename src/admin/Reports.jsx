@@ -112,7 +112,7 @@ const buildSummary = (bills) => {
 
 const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 
-// ── CSV Download Helper (outside component, no XLSX needed) ──
+// ── CSV Download Helper ────────────────────────────────────
 const downloadCSV = (rows, filename) => {
   const csv = rows.map(r =>
     r.map(cell => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(',')
@@ -155,11 +155,6 @@ export default function Reports() {
   const [catFromDate, setCatFromDate] = useState(todayIST())
   const [catToDate, setCatToDate] = useState(todayIST())
   const [catStats, setCatStats] = useState([])
-
-  // Table-wise
-  const [tableFromDate, setTableFromDate] = useState(todayIST())
-  const [tableToDate, setTableToDate] = useState(todayIST())
-  const [tableStats, setTableStats] = useState([])
 
   // Monthly — last 4 months only
   const [monthlyData, setMonthlyData] = useState([])
@@ -262,28 +257,6 @@ export default function Reports() {
       map[catName].revenue += i.price_at_order * i.quantity
     })
     setCatStats(Object.values(map).sort((a, b) => b.revenue - a.revenue))
-    setLoading(false)
-  }
-
-  // ── Fetch Table Stats ─────────────────────────────────────
-  const fetchTableStats = async () => {
-    setLoading(true)
-    const { startISO, endISO } = toRange(tableFromDate, tableToDate)
-    const { data: orders, error } = await supabase
-      .from('orders')
-      .select('table_name_snapshot, final_amount, paid_at, payment_type')
-      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
-    if (error) console.error('fetchTableStats:', error.message)
-    const bills = groupOrdersIntoBills(orders || [])
-    const map = {}
-    bills.forEach(b => {
-      const tbl = b.table_name_snapshot || 'Unknown'
-      if (!map[tbl]) map[tbl] = { name: tbl, bills: 0, revenue: 0, lastVisit: b.paid_at }
-      map[tbl].bills += 1
-      map[tbl].revenue += b.final_amount || 0
-      if (b.paid_at > map[tbl].lastVisit) map[tbl].lastVisit = b.paid_at
-    })
-    setTableStats(Object.values(map).sort((a, b) => b.revenue - a.revenue))
     setLoading(false)
   }
 
@@ -408,9 +381,7 @@ export default function Reports() {
     setShowPrintPreview(true)
   }
 
-  const doPrint = () => {
-    window.print()
-  }
+  const doPrint = () => { window.print() }
 
   // ── CSV Export ────────────────────────────────────────────
   const exportToExcel = (type) => {
@@ -619,14 +590,15 @@ export default function Reports() {
     ) : null
   )
 
+  // ── Tab definitions — Table-wise links out to dedicated page ──
   const TABS = [
-    { id: 'today', label: '📅 Today' },
-    { id: 'range', label: '📆 Date Range' },
-    { id: 'items', label: '🔍 Item Search' },
-    { id: 'category', label: '📊 Category' },
-    { id: 'tables', label: '🪑 Table-wise' },
-    { id: 'monthly', label: '📅 Monthly' },
-    { id: 'discounts', label: '🎁 Discounts' },
+    { id: 'today',      label: '📅 Today' },
+    { id: 'range',      label: '📆 Date Range' },
+    { id: 'items',      label: '🔍 Item Search' },
+    { id: 'category',   label: '📊 Category' },
+    { id: 'tables',     label: '🪑 Table-wise' },
+    { id: 'monthly',    label: '📅 Monthly' },
+    { id: 'discounts',  label: '🎁 Discounts' },
     { id: 'settlement', label: '💰 Settlement' },
   ]
 
@@ -665,7 +637,6 @@ export default function Reports() {
             </div>
 
             <div className="flex-1 overflow-y-auto p-5 print:block" id="print-content">
-              {/* Header */}
               <div className="text-center mb-4 border-b pb-3">
                 <p className="font-bold text-xl">HOTEL KHALASI SEAFOOD & BAR</p>
                 <p className="text-sm text-gray-500">DETAILED SALES SUMMARY</p>
@@ -673,7 +644,6 @@ export default function Reports() {
                 <p className="text-xs text-gray-400">Print Date: {formatDate(new Date())} {toIST(new Date().toISOString())}</p>
               </div>
 
-              {/* Summary / Monthly */}
               {(printData.type === 'today' || printData.type === 'range') && printData.summary && (
                 <>
                   <div className="mb-4">
@@ -941,37 +911,23 @@ export default function Reports() {
           </div>
         )}
 
-        {/* TABLE-WISE */}
+        {/* ── TABLE-WISE — links to dedicated page ─────────────── */}
         {activeTab === 'tables' && !loading && (
-          <div>
-            <DateRangeFilter from={tableFromDate} to={tableToDate} onFrom={setTableFromDate} onTo={setTableToDate} onFetch={fetchTableStats} btnText="View Tables" />
-            {tableStats.length === 0
-              ? <EmptyState icon="🪑" text="Select date range and click View Tables" />
-              : <div className="bg-white rounded-2xl shadow p-5">
-                  <h3 className="font-bold text-gray-700 mb-4">Table Performance ({tableStats.length} tables)</h3>
-                  <div className="space-y-3">
-                    {tableStats.map((tbl, i) => (
-                      <div key={tbl.name} className="flex items-center gap-4 p-3 rounded-xl bg-gray-50">
-                        <span className="text-lg font-bold w-8 text-center flex-shrink-0">
-                          {i === 0 ? '🏆' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i + 1}`}
-                        </span>
-                        <div className="flex-1">
-                          <p className="font-bold text-gray-700">{tbl.name}</p>
-                          <div className="w-full bg-gray-200 rounded-full h-1.5 mt-1">
-                            <div className="bg-orange-400 h-1.5 rounded-full"
-                              style={{ width: `${Math.min((tbl.revenue / (tableStats[0]?.revenue || 1)) * 100, 100)}%` }} />
-                          </div>
-                          <p className="text-xs text-gray-400 mt-1">Last visit: {formatDate(tbl.lastVisit)}</p>
-                        </div>
-                        <div className="text-right flex-shrink-0">
-                          <p className="font-bold text-orange-500">₹{tbl.revenue}</p>
-                          <p className="text-xs text-gray-400">{tbl.bills} bills</p>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-            }
+          <div className="flex flex-col items-center justify-center py-16">
+            <div className="bg-white rounded-2xl shadow-lg p-8 max-w-sm w-full text-center">
+              <div className="w-16 h-16 bg-orange-100 rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4">
+                🪑
+              </div>
+              <h2 className="text-xl font-bold text-gray-800 mb-2">Table-wise Report</h2>
+              <p className="text-sm text-gray-500 mb-6 leading-relaxed">
+                Full table-wise breakdown with activation time, duration, itemised bills in serial order, and CSV / print export — all in a dedicated page.
+              </p>
+              <button
+                onClick={() => navigate('/admin/reports/tablewise')}
+                className="w-full bg-orange-500 text-white py-3 rounded-xl font-semibold hover:bg-orange-600 transition text-sm flex items-center justify-center gap-2">
+                Open Table-wise Report →
+              </button>
+            </div>
           </div>
         )}
 
@@ -994,7 +950,6 @@ export default function Reports() {
               : <>
                   <PrintExportBar type="monthly" hasData={monthlyLoaded} />
 
-                  {/* Overall totals */}
                   <div className="grid grid-cols-2 gap-3 mb-4">
                     <div className="bg-orange-50 border border-orange-200 rounded-2xl p-4">
                       <p className="text-xs text-gray-500 mb-1">4-Month Total Revenue</p>
@@ -1006,7 +961,6 @@ export default function Reports() {
                     </div>
                   </div>
 
-                  {/* Bar chart */}
                   <div className="bg-white rounded-2xl shadow p-5 mb-4">
                     <h3 className="font-bold text-gray-700 mb-4">Revenue Chart</h3>
                     <div className="flex items-end gap-3" style={{ height: '140px' }}>
@@ -1024,7 +978,6 @@ export default function Reports() {
                     </div>
                   </div>
 
-                  {/* Per month cards with dept breakdown */}
                   <div className="space-y-4 mb-4">
                     {monthlyData.map(m => (
                       <div key={`${m.year}-${m.month}`} className="bg-white rounded-2xl shadow p-5">
@@ -1075,7 +1028,6 @@ export default function Reports() {
                     ))}
                   </div>
 
-                  {/* Summary table */}
                   <div className="bg-white rounded-2xl shadow p-5">
                     <h3 className="font-bold text-gray-700 mb-3">Comparison Table</h3>
                     <div className="overflow-x-auto">
