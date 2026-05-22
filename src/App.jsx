@@ -9,6 +9,11 @@ import Settings from './admin/Settings'
 import ReportTablewise from './admin/Report/Report-Tablewise'
 import MenuPage from './customer/MenuPage'
 import OrderConfirmation from './customer/OrderConfirmation'
+import ReportToday from './admin/Report/Report-Today'
+import ReportDateRange from './admin/Report/Report-DateRange'
+import ReportCategory from './admin/Report/Report-Category'
+import ReportDiscounts from './admin/Report/Report-Discounts'
+import ReportSettlement from './admin/Report/Report-Settlement'
 
 function App() {
   return (
@@ -25,6 +30,11 @@ function App() {
         <Route path="/admin/settings" element={<Settings />} />
         <Route path="/menu" element={<MenuPage />} />
         <Route path="/order-confirmation" element={<OrderConfirmation />} />
+        <Route path="/admin/report/today" element={<ProtectedRoute><ReportToday /></ProtectedRoute>} />
+        <Route path="/admin/report/daterange" element={<ProtectedRoute><ReportDateRange /></ProtectedRoute>} />
+        <Route path="/admin/report/category" element={<ProtectedRoute><ReportCategory /></ProtectedRoute>} />
+        <Route path="/admin/report/discounts" element={<ProtectedRoute><ReportDiscounts /></ProtectedRoute>} />
+        <Route path="/admin/report/settlement" element={<ProtectedRoute><ReportSettlement /></ProtectedRoute>} />
       </Routes>
     </BrowserRouter>
   )
