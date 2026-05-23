@@ -6,14 +6,13 @@ import ReportDateRange  from './Report/Report-DateRange'
 import ReportCategory   from './Report/Report-Category'
 import ReportDiscounts  from './Report/Report-Discounts'
 import ReportSettlement from './Report/Report-Settlement'
+import ReportTablewise  from './Report/Report-Tablewise'
 
 const TABS = [
   { id: 'today',      label: '📅 Today' },
   { id: 'range',      label: '📆 Date Range' },
-  { id: 'items',      label: '🔍 Item Search' },
   { id: 'category',   label: '📊 Category' },
   { id: 'tables',     label: '🪑 Table-wise' },
-  { id: 'monthly',    label: '📅 Monthly' },
   { id: 'discounts',  label: '🎁 Discounts' },
   { id: 'settlement', label: '💰 Settlement' },
 ]
@@ -24,49 +23,13 @@ export default function Reports() {
 
   const renderTab = () => {
     switch (activeTab) {
-      case 'today':
-        return <ReportToday />
-
-      case 'range':
-      case 'items':
-        return <ReportDateRange defaultTab={activeTab} />
-
-      case 'category':
-        return <ReportCategory />
-
-      case 'tables':
-        return (
-          <div className="flex flex-col items-center justify-center py-16">
-            <div className="bg-white rounded-2xl shadow-lg p-8 max-w-sm w-full text-center">
-              <div className="w-16 h-16 bg-orange-100 rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4">
-                🪑
-              </div>
-              <h2 className="text-xl font-bold text-gray-800 mb-2">Table-wise Report</h2>
-              <p className="text-sm text-gray-500 mb-6 leading-relaxed">
-                Full table-wise breakdown with activation time, duration, itemised bills in serial
-                order, and CSV / print export — all in a dedicated page.
-              </p>
-              <button
-                onClick={() => navigate('/admin/reports/tablewise')}
-                className="w-full bg-orange-500 text-white py-3 rounded-xl font-semibold hover:bg-orange-600 transition text-sm flex items-center justify-center gap-2">
-                Open Table-wise Report →
-              </button>
-            </div>
-          </div>
-        )
-
-      case 'monthly':
-        // Monthly is handled inside ReportDateRange as a sub-tab, or redirect
-        return <ReportDateRange defaultTab="monthly" />
-
-      case 'discounts':
-        return <ReportDiscounts />
-
-      case 'settlement':
-        return <ReportSettlement />
-
-      default:
-        return null
+      case 'today':      return <ReportToday />
+      case 'range':      return <ReportDateRange />
+      case 'category':   return <ReportCategory />
+      case 'tables':     return <ReportTablewise />
+      case 'discounts':  return <ReportDiscounts />
+      case 'settlement': return <ReportSettlement />
+      default:           return null
     }
   }
 
@@ -104,7 +67,9 @@ export default function Reports() {
         </div>
 
         {/* Active Tab Content */}
-        {renderTab()}
+        <div key={activeTab}>
+          {renderTab()}
+        </div>
 
       </div>
     </div>
