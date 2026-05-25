@@ -14,6 +14,7 @@ import ReportDateRange from './admin/Report/Report-DateRange'
 import ReportCategory from './admin/Report/Report-Category'
 import ReportDiscounts from './admin/Report/Report-Discounts'
 import ReportSettlement from './admin/Report/Report-Settlement'
+import ProtectedRoute from './admin/ProtectedRoute'
 
 function App() {
   return (
