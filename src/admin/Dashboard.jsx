@@ -19,7 +19,6 @@ const LIQUOR_KEYWORDS = [
 const isLiquorItem = (name = '') =>
   LIQUOR_KEYWORDS.some(k => name.toLowerCase().includes(k))
 
-// Merge duplicate items by name — combine quantities
 const mergeItems = (items) => {
   const map = {}
   items.forEach(item => {
@@ -28,11 +27,7 @@ const mergeItems = (items) => {
       map[name].quantity += item.quantity
       map[name].total += item.price_at_order * item.quantity
     } else {
-      map[name] = {
-        ...item,
-        quantity: item.quantity,
-        total: item.price_at_order * item.quantity
-      }
+      map[name] = { ...item, quantity: item.quantity, total: item.price_at_order * item.quantity }
     }
   })
   return Object.values(map)
@@ -89,10 +84,7 @@ export default function Dashboard() {
   const [sessionStart] = useState(() => new Date().toISOString())
 
   const [restaurant, setRestaurant] = useState({
-    name: 'My Restaurant',
-    address: '',
-    phone: '',
-    gst_number: '',
+    name: 'My Restaurant', address: '', phone: '', gst_number: '',
     footer_note: 'Thank you! Visit again!'
   })
 
@@ -100,7 +92,8 @@ export default function Dashboard() {
   const [payTableId, setPayTableId] = useState(null)
   const [editMode, setEditMode] = useState(false)
   const [removedItems, setRemovedItems] = useState(new Set())
-  const [billPrinted, setBillPrinted] = useState(false)
+  // ── NEW: bill locked after print ──────────────────────────
+  const [billLocked, setBillLocked] = useState(false)
 
   const [serviceChargePct, setServiceChargePct] = useState(0)
   const [discountType, setDiscountType] = useState('percent')
@@ -108,10 +101,17 @@ export default function Dashboard() {
   const [discountReason, setDiscountReason] = useState('')
   const [discountReasonError, setDiscountReasonError] = useState(false)
 
+  // ── NEW: add-item state ───────────────────────────────────
+  const [showAddItem, setShowAddItem] = useState(false)
+  const [allFoodItems, setAllFoodItems] = useState([])
+  const [addItemSearch, setAddItemSearch] = useState('')
+  const [manualItems, setManualItems] = useState([]) // [{food_item, qty}]
+
   const prevOrderIds = useRef(new Set())
   const audioCtxRef = useRef(null)
   const navigate = useNavigate()
 
+  // Load restaurant settings
   useEffect(() => {
     supabase.from('settings').select('*').eq('id', 'main').single()
       .then(({ data }) => {
@@ -123,6 +123,13 @@ export default function Dashboard() {
           footer_note: data.footer_note || 'Thank you! Visit again!'
         })
       })
+  }, [])
+
+  // Load all food items for add-item panel
+  useEffect(() => {
+    supabase.from('food_items').select('id, name, price, is_available')
+      .eq('is_available', true).order('name')
+      .then(({ data }) => setAllFoodItems(data || []))
   }, [])
 
   const initAudio = () => {
@@ -138,37 +145,29 @@ export default function Dashboard() {
       if (!audioCtxRef.current) return
       const ctx = audioCtxRef.current
       const bell = (t, freq) => {
-        const o = ctx.createOscillator()
-        const g = ctx.createGain()
+        const o = ctx.createOscillator(); const g = ctx.createGain()
         o.connect(g); g.connect(ctx.destination)
         o.type = 'sine'; o.frequency.value = freq
         g.gain.setValueAtTime(0.5, t)
         g.gain.exponentialRampToValueAtTime(0.001, t + 1.0)
         o.start(t); o.stop(t + 1.0)
       }
-      bell(ctx.currentTime, 880)
-      bell(ctx.currentTime + 0.6, 1100)
+      bell(ctx.currentTime, 880); bell(ctx.currentTime + 0.6, 1100)
     } catch (e) {}
   }, [])
 
   const fetchAll = useCallback(async () => {
-    const { data: tablesData } = await supabase
-      .from('tables').select('*').order('created_at')
+    const { data: tablesData } = await supabase.from('tables').select('*').order('created_at')
     setTables(tablesData || [])
-
     const { data: ordersData } = await supabase
       .from('orders')
       .select(`*, tables(table_name), order_items(quantity, price_at_order, note, food_items(name))`)
-      .eq('is_paid', false)
-      .order('created_at', { ascending: false })
-
+      .eq('is_paid', false).order('created_at', { ascending: false })
     if (ordersData) {
-      const addedOrderIds = new Set()
-      const addedTableIds = new Set()
+      const addedOrderIds = new Set(); const addedTableIds = new Set()
       ordersData.forEach(o => {
         if (!prevOrderIds.current.has(o.id) && o.created_at > sessionStart) {
-          addedOrderIds.add(o.id)
-          addedTableIds.add(o.table_id)
+          addedOrderIds.add(o.id); addedTableIds.add(o.table_id)
         }
       })
       if (addedOrderIds.size > 0) {
@@ -198,6 +197,17 @@ export default function Dashboard() {
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
+  // ── Manual items converted to order_items shape for totals ─
+  const manualAsItems = manualItems.map(mi => ({
+    food_items: { name: mi.name },
+    price_at_order: mi.price,
+    quantity: mi.qty,
+    _key: `manual:${mi.id}`,
+    _orderId: 'manual',
+    _idx: mi.id,
+    _isManual: true
+  }))
+
   const getEffectiveItems = useCallback((tableId) => {
     const tOrders = orders.filter(o => o.table_id === tableId)
     const result = []
@@ -209,18 +219,17 @@ export default function Dashboard() {
         }
       })
     })
+    // Append manual items
+    manualAsItems.forEach(mi => result.push(mi))
     return result
-  }, [orders, removedItems])
+  }, [orders, removedItems, manualAsItems])
 
   const computeTotals = useCallback((tableId) => {
     const items = getEffectiveItems(tableId)
     const rawFoodItems = items.filter(i => !isLiquorItem(i.food_items?.name))
     const rawLiquorItems = items.filter(i => isLiquorItem(i.food_items?.name))
-
-    // Merge duplicates before display
     const foodItems = mergeItems(rawFoodItems)
     const liquorItems = mergeItems(rawLiquorItems)
-
     const foodSubtotal = foodItems.reduce((s, i) => s + i.total, 0)
     const liquorSubtotal = liquorItems.reduce((s, i) => s + i.total, 0)
     const subtotal = foodSubtotal + liquorSubtotal
@@ -228,15 +237,11 @@ export default function Dashboard() {
     const afterService = subtotal + serviceChargeAmt
     const dv = parseFloat(discountValue) || 0
     const discountAmt = discountType === 'percent'
-      ? Math.round(afterService * dv / 100)
-      : Math.min(dv, afterService)
+      ? Math.round(afterService * dv / 100) : Math.min(dv, afterService)
     const finalAmount = afterService - discountAmt
-
     return {
-      items, rawFoodItems, rawLiquorItems,
-      foodItems, liquorItems,
-      foodSubtotal, liquorSubtotal, subtotal,
-      serviceChargeAmt, discountAmt, finalAmount
+      items, rawFoodItems, rawLiquorItems, foodItems, liquorItems,
+      foodSubtotal, liquorSubtotal, subtotal, serviceChargeAmt, discountAmt, finalAmount
     }
   }, [getEffectiveItems, serviceChargePct, discountType, discountValue])
 
@@ -244,97 +249,98 @@ export default function Dashboard() {
     setPayTableId(tableId)
     setEditMode(false)
     setRemovedItems(new Set())
-    setBillPrinted(false)
+    setManualItems([])
+    // ── Reset lock when opening a fresh bill ──────────────
+    setBillLocked(false)
     setServiceChargePct(0)
     setDiscountType('percent')
     setDiscountValue('')
     setDiscountReason('')
     setDiscountReasonError(false)
+    setShowAddItem(false)
+    setAddItemSearch('')
     setShowPreview(true)
+  }
+
+  // ── Add manual item ───────────────────────────────────────
+  const addManualItem = (foodItem) => {
+    setManualItems(prev => {
+      const existing = prev.find(m => m.id === foodItem.id)
+      if (existing) {
+        return prev.map(m => m.id === foodItem.id ? { ...m, qty: m.qty + 1 } : m)
+      }
+      return [...prev, { id: foodItem.id, name: foodItem.name, price: foodItem.price, qty: 1 }]
+    })
+  }
+
+  const changeManualQty = (id, delta) => {
+    setManualItems(prev => {
+      const updated = prev.map(m => m.id === id ? { ...m, qty: m.qty + delta } : m)
+      return updated.filter(m => m.qty > 0)
+    })
   }
 
   const handlePrintAndSave = async () => {
     const dv = parseFloat(discountValue) || 0
-
-    // Validate discount reason if discount is given
-    if (dv > 0 && !discountReason.trim()) {
-      setDiscountReasonError(true)
-      return
-    }
+    if (dv > 0 && !discountReason.trim()) { setDiscountReasonError(true); return }
     setDiscountReasonError(false)
 
     const tblData = tables.find(t => t.id === payTableId)
     const {
-      foodItems, liquorItems,
-      foodSubtotal, liquorSubtotal, subtotal,
-      serviceChargeAmt, discountAmt, finalAmount
+      foodItems, liquorItems, foodSubtotal, liquorSubtotal,
+      subtotal, serviceChargeAmt, discountAmt, finalAmount
     } = computeTotals(payTableId)
 
     const now = new Date()
-
     const lines = {
-      restaurantName: restaurant.name,
-      address: restaurant.address,
-      phone: restaurant.phone,
-      gstNumber: restaurant.gst_number,
-      footerNote: restaurant.footer_note,
-      tableName: tblData?.table_name || '',
-      date: toISTDate(now.toISOString()),
-      time: toIST(now.toISOString()),
-      foodItems: foodItems.map(i => ({
-        name: i.food_items?.name || i.name,
-        qty: i.quantity,
-        total: i.total
-      })),
-      liquorItems: liquorItems.map(i => ({
-        name: i.food_items?.name || i.name,
-        qty: i.quantity,
-        total: i.total
-      })),
-      foodSubtotal, liquorSubtotal, subtotal,
-      serviceChargePct, serviceChargeAmt,
+      restaurantName: restaurant.name, address: restaurant.address,
+      phone: restaurant.phone, gstNumber: restaurant.gst_number,
+      footerNote: restaurant.footer_note, tableName: tblData?.table_name || '',
+      date: toISTDate(now.toISOString()), time: toIST(now.toISOString()),
+      foodItems: foodItems.map(i => ({ name: i.food_items?.name || i.name, qty: i.quantity, total: i.total })),
+      liquorItems: liquorItems.map(i => ({ name: i.food_items?.name || i.name, qty: i.quantity, total: i.total })),
+      foodSubtotal, liquorSubtotal, subtotal, serviceChargePct, serviceChargeAmt,
       discountType, discountValue: dv, discountAmt,
-      discountReason: discountReason.trim(),
-      finalAmount,
+      discountReason: discountReason.trim(), finalAmount,
     }
 
     const w = window.open('', '_blank', 'width=400,height=600')
     w.document.write(buildHtmlReceipt(lines))
-    w.document.close()
-    w.focus()
-    w.print()
-    w.close()
+    w.document.close(); w.focus(); w.print(); w.close()
 
     const tOrders = orders.filter(o => o.table_id === payTableId)
     const nowIST = now.toISOString()
 
+    // If there are manual items, insert them as order_items first
+    if (manualItems.length > 0 && tOrders.length > 0) {
+      const firstOrderId = tOrders[0].id
+      const manualRows = manualItems.map(mi => ({
+        order_id: firstOrderId,
+        food_item_id: mi.id,
+        quantity: mi.qty,
+        price_at_order: mi.price,
+        note: 'Added at billing'
+      }))
+      await supabase.from('order_items').insert(manualRows)
+    }
+
     for (const order of tOrders) {
       await supabase.from('orders').update({
-        is_paid: true,
-        paid_at: nowIST,
-        subtotal,
-        service_charge_pct: serviceChargePct,
-        service_charge_amt: serviceChargeAmt,
-        discount_type: discountType,
-        discount_value: dv,
-        discount_amt: discountAmt,
-        discount_reason: discountReason.trim(),
-        final_amount: finalAmount,
-        settlement_status: 'pending',
-        table_name_snapshot: tblData?.table_name || '',
+        is_paid: true, paid_at: nowIST, subtotal,
+        service_charge_pct: serviceChargePct, service_charge_amt: serviceChargeAmt,
+        discount_type: discountType, discount_value: dv, discount_amt: discountAmt,
+        discount_reason: discountReason.trim(), final_amount: finalAmount,
+        settlement_status: 'pending', table_name_snapshot: tblData?.table_name || '',
         payment_type: 'pending'
       }).eq('id', order.id)
     }
 
     await nukeClearTable(payTableId)
+    setNewOrderIds(prev => { const n = new Set(prev); tOrders.forEach(o => n.delete(o.id)); return n })
 
-    setNewOrderIds(prev => {
-      const n = new Set(prev)
-      tOrders.forEach(o => n.delete(o.id))
-      return n
-    })
-
-    setBillPrinted(true)
+    // ── Lock the bill after print ─────────────────────────
+    setBillLocked(true)
+    setEditMode(false)
     setShowPreview(false)
     if (selectedTable?.id === payTableId) setSelectedTable(null)
     fetchAll()
@@ -360,21 +366,14 @@ export default function Dashboard() {
   }
 
   const clearAllTables = async () => {
-    setShowClearAllConfirm(false)
-    setClearing(true)
+    setShowClearAllConfirm(false); setClearing(true)
     const active = tables.filter(t => orders.some(o => o.table_id === t.id))
     for (const table of active) await nukeClearTable(table.id)
-    setNewOrderIds(new Set())
-    setNewOrderTables(new Set())
-    setSelectedTable(null)
-    setClearing(false)
-    fetchAll()
+    setNewOrderIds(new Set()); setNewOrderTables(new Set())
+    setSelectedTable(null); setClearing(false); fetchAll()
   }
 
-  const handleLogout = async () => {
-    await supabase.auth.signOut()
-    navigate('/')
-  }
+  const handleLogout = async () => { await supabase.auth.signOut(); navigate('/') }
 
   const tableOrders = selectedTable ? orders.filter(o => o.table_id === selectedTable.id) : []
   const allItems = tableOrders.flatMap(o => o.order_items || [])
@@ -387,6 +386,10 @@ export default function Dashboard() {
   const previewTableName = tables.find(t => t.id === payTableId)?.table_name || ''
   const dv = parseFloat(discountValue) || 0
 
+  const filteredFoodItems = allFoodItems.filter(f =>
+    f.name.toLowerCase().includes(addItemSearch.toLowerCase())
+  )
+
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col" onClick={initAudio}>
 
@@ -396,30 +399,36 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Bill Preview Modal */}
+      {/* ── Bill Preview Modal ─────────────────────────────── */}
       {showPreview && previewTotals && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl max-h-[92vh] flex flex-col">
 
-            {/* Receipt Header */}
+            {/* Header */}
             <div className="p-5 border-b">
               <div className="text-center">
                 <p className="font-bold text-lg text-gray-800">{restaurant.name}</p>
                 <p className="text-xs text-gray-400">{restaurant.address}</p>
                 <p className="text-xs text-gray-400">{restaurant.phone}</p>
-                {restaurant.gst_number && (
-                  <p className="text-xs text-gray-400">GST: {restaurant.gst_number}</p>
-                )}
+                {restaurant.gst_number && <p className="text-xs text-gray-400">GST: {restaurant.gst_number}</p>}
               </div>
               <div className="flex justify-between text-xs text-gray-500 mt-3">
                 <span>Table: <strong>{previewTableName}</strong></span>
                 <span>{toISTDate(new Date().toISOString())} {toIST(new Date().toISOString())}</span>
               </div>
+
+              {/* ── Locked banner ─────────────────────────── */}
+              {billLocked && (
+                <div className="mt-3 bg-red-50 border border-red-200 rounded-xl px-3 py-2 flex items-center gap-2">
+                  <span className="text-lg">🔒</span>
+                  <p className="text-xs text-red-600 font-medium">Bill printed & saved. No further edits allowed.</p>
+                </div>
+              )}
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
 
-              {/* Food — merged quantities */}
+              {/* Food items */}
               {previewTotals.foodItems.length > 0 && (
                 <div>
                   <div className="flex items-center gap-2 mb-2">
@@ -428,14 +437,13 @@ export default function Dashboard() {
                   </div>
                   {previewTotals.foodItems.map((item, i) => {
                     const name = item.food_items?.name || item.name
+                    const isRemoved = previewTotals.rawFoodItems.some(r => r.food_items?.name === name && removedItems.has(r._key))
                     return (
-                      <div key={i} className={`flex justify-between items-center text-sm py-1.5 px-1 rounded
-                        ${editMode ? 'hover:bg-gray-50' : ''}`}>
+                      <div key={i} className="flex justify-between items-center text-sm py-1.5 px-1 rounded">
                         <div className="flex items-center gap-2 flex-1">
-                          {editMode && (
+                          {editMode && !billLocked && (
                             <button
                               onClick={() => {
-                                // In edit mode, mark all raw items with this name as removed
                                 setRemovedItems(prev => {
                                   const n = new Set(prev)
                                   previewTotals.rawFoodItems.forEach(raw => {
@@ -447,31 +455,24 @@ export default function Dashboard() {
                                 })
                               }}
                               className={`w-5 h-5 rounded-full border-2 flex items-center justify-center text-xs font-bold flex-shrink-0
-                                ${previewTotals.rawFoodItems.some(r => r.food_items?.name === name && removedItems.has(r._key))
-                                  ? 'border-green-500 text-green-500'
-                                  : 'border-red-400 text-red-400'}`}>
-                              {previewTotals.rawFoodItems.some(r => r.food_items?.name === name && removedItems.has(r._key)) ? '+' : '−'}
+                                ${isRemoved ? 'border-green-500 text-green-500' : 'border-red-400 text-red-400'}`}>
+                              {isRemoved ? '+' : '−'}
                             </button>
                           )}
-                          <span className={`text-gray-700 ${editMode && previewTotals.rawFoodItems.some(r => r.food_items?.name === name && removedItems.has(r._key)) ? 'line-through opacity-40' : ''}`}>
-                            {name}
-                          </span>
-                          <span className="bg-orange-100 text-orange-600 text-xs font-bold px-1.5 py-0.5 rounded-full">
-                            ×{item.quantity}
-                          </span>
+                          <span className={`text-gray-700 ${isRemoved ? 'line-through opacity-40' : ''}`}>{name}</span>
+                          <span className="bg-orange-100 text-orange-600 text-xs font-bold px-1.5 py-0.5 rounded-full">×{item.quantity}</span>
                         </div>
                         <span className="text-gray-700 font-medium">₹{item.total}</span>
                       </div>
                     )
                   })}
                   <div className="flex justify-between text-xs font-semibold text-gray-500 mt-2 pt-1 border-t border-dashed">
-                    <span>Food Subtotal</span>
-                    <span>₹{previewTotals.foodSubtotal}</span>
+                    <span>Food Subtotal</span><span>₹{previewTotals.foodSubtotal}</span>
                   </div>
                 </div>
               )}
 
-              {/* Liquor — merged quantities */}
+              {/* Liquor items */}
               {previewTotals.liquorItems.length > 0 && (
                 <div>
                   <div className="flex items-center gap-2 mb-2">
@@ -480,11 +481,11 @@ export default function Dashboard() {
                   </div>
                   {previewTotals.liquorItems.map((item, i) => {
                     const name = item.food_items?.name || item.name
+                    const isRemoved = previewTotals.rawLiquorItems.some(r => r.food_items?.name === name && removedItems.has(r._key))
                     return (
-                      <div key={i} className={`flex justify-between items-center text-sm py-1.5 px-1 rounded
-                        ${editMode ? 'hover:bg-gray-50' : ''}`}>
+                      <div key={i} className="flex justify-between items-center text-sm py-1.5 px-1 rounded">
                         <div className="flex items-center gap-2 flex-1">
-                          {editMode && (
+                          {editMode && !billLocked && (
                             <button
                               onClick={() => {
                                 setRemovedItems(prev => {
@@ -498,40 +499,100 @@ export default function Dashboard() {
                                 })
                               }}
                               className={`w-5 h-5 rounded-full border-2 flex items-center justify-center text-xs font-bold flex-shrink-0
-                                ${previewTotals.rawLiquorItems.some(r => r.food_items?.name === name && removedItems.has(r._key))
-                                  ? 'border-green-500 text-green-500'
-                                  : 'border-red-400 text-red-400'}`}>
-                              {previewTotals.rawLiquorItems.some(r => r.food_items?.name === name && removedItems.has(r._key)) ? '+' : '−'}
+                                ${isRemoved ? 'border-green-500 text-green-500' : 'border-red-400 text-red-400'}`}>
+                              {isRemoved ? '+' : '−'}
                             </button>
                           )}
-                          <span className={`text-gray-700 ${editMode && previewTotals.rawLiquorItems.some(r => r.food_items?.name === name && removedItems.has(r._key)) ? 'line-through opacity-40' : ''}`}>
-                            {name}
-                          </span>
-                          <span className="bg-blue-100 text-blue-600 text-xs font-bold px-1.5 py-0.5 rounded-full">
-                            ×{item.quantity}
-                          </span>
+                          <span className={`text-gray-700 ${isRemoved ? 'line-through opacity-40' : ''}`}>{name}</span>
+                          <span className="bg-blue-100 text-blue-600 text-xs font-bold px-1.5 py-0.5 rounded-full">×{item.quantity}</span>
                         </div>
                         <span className="text-gray-700 font-medium">₹{item.total}</span>
                       </div>
                     )
                   })}
                   <div className="flex justify-between text-xs font-semibold text-gray-500 mt-2 pt-1 border-t border-dashed">
-                    <span>Liquor Subtotal</span>
-                    <span>₹{previewTotals.liquorSubtotal}</span>
+                    <span>Liquor Subtotal</span><span>₹{previewTotals.liquorSubtotal}</span>
                   </div>
                 </div>
               )}
 
-              {/* Charges & Discount */}
-              {!editMode && (
+              {/* ── Add Items Panel (edit mode only, not locked) ─── */}
+              {editMode && !billLocked && (
+                <div className="border border-dashed border-orange-300 rounded-xl overflow-hidden">
+                  <button
+                    onClick={() => { setShowAddItem(!showAddItem); setAddItemSearch('') }}
+                    className="w-full flex items-center justify-between px-4 py-3 bg-orange-50 text-orange-600 font-semibold text-sm hover:bg-orange-100 transition">
+                    <span>➕ Add Item to Bill</span>
+                    <span>{showAddItem ? '▲' : '▼'}</span>
+                  </button>
+
+                  {showAddItem && (
+                    <div className="p-3 bg-white">
+                      {/* Search */}
+                      <input
+                        type="text"
+                        value={addItemSearch}
+                        onChange={e => setAddItemSearch(e.target.value)}
+                        placeholder="🔍 Search item..."
+                        className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm mb-3 focus:outline-none focus:ring-2 focus:ring-orange-400"
+                      />
+
+                      {/* Manual items already added */}
+                      {manualItems.length > 0 && (
+                        <div className="mb-3 space-y-1">
+                          <p className="text-xs font-bold text-green-600 mb-1">✅ Added to bill:</p>
+                          {manualItems.map(mi => (
+                            <div key={mi.id} className="flex items-center justify-between bg-green-50 border border-green-100 rounded-lg px-3 py-2">
+                              <div>
+                                <p className="text-sm font-medium text-gray-700">{mi.name}</p>
+                                <p className="text-xs text-gray-400">₹{mi.price} × {mi.qty} = ₹{mi.price * mi.qty}</p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button onClick={() => changeManualQty(mi.id, -1)}
+                                  className="w-7 h-7 rounded-full bg-red-100 text-red-500 font-bold text-sm flex items-center justify-center hover:bg-red-200">−</button>
+                                <span className="font-bold text-gray-700 w-5 text-center">{mi.qty}</span>
+                                <button onClick={() => changeManualQty(mi.id, 1)}
+                                  className="w-7 h-7 rounded-full bg-green-100 text-green-600 font-bold text-sm flex items-center justify-center hover:bg-green-200">+</button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Item list */}
+                      <div className="max-h-44 overflow-y-auto space-y-1">
+                        {filteredFoodItems.length === 0 && (
+                          <p className="text-center text-gray-400 text-xs py-3">No items found</p>
+                        )}
+                        {filteredFoodItems.map(fi => {
+                          const alreadyAdded = manualItems.find(m => m.id === fi.id)
+                          return (
+                            <button key={fi.id} onClick={() => addManualItem(fi)}
+                              className="w-full flex justify-between items-center px-3 py-2 rounded-lg hover:bg-orange-50 transition text-left border border-transparent hover:border-orange-200">
+                              <span className="text-sm text-gray-700">{fi.name}</span>
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs text-orange-500 font-bold">₹{fi.price}</span>
+                                {alreadyAdded
+                                  ? <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full font-medium">×{alreadyAdded.qty} added</span>
+                                  : <span className="text-xs bg-orange-100 text-orange-600 px-2 py-0.5 rounded-full">+ Add</span>}
+                              </div>
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Charges & Discount — hide in edit mode and if locked */}
+              {!editMode && !billLocked && (
                 <div className="bg-gray-50 rounded-xl p-3 space-y-3">
                   <p className="text-xs font-bold text-gray-500 uppercase">Charges & Discount</p>
-
                   <div className="flex justify-between items-center text-sm text-gray-600">
                     <span>Service Charge</span>
                     <div className="flex items-center gap-2">
-                      <select value={serviceChargePct}
-                        onChange={e => setServiceChargePct(Number(e.target.value))}
+                      <select value={serviceChargePct} onChange={e => setServiceChargePct(Number(e.target.value))}
                         className="border rounded px-2 py-0.5 text-xs">
                         <option value={0}>0%</option>
                         <option value={5}>5%</option>
@@ -544,7 +605,6 @@ export default function Dashboard() {
                       )}
                     </div>
                   </div>
-
                   <div className="flex justify-between items-center text-sm text-gray-600">
                     <span>Discount</span>
                     <div className="flex items-center gap-2">
@@ -556,33 +616,21 @@ export default function Dashboard() {
                       </select>
                       <input type="number" min="0" value={discountValue}
                         onChange={e => { setDiscountValue(e.target.value); setDiscountReasonError(false) }}
-                        placeholder="0"
-                        className="border rounded px-2 py-0.5 text-xs w-16 text-right" />
+                        placeholder="0" className="border rounded px-2 py-0.5 text-xs w-16 text-right" />
                       {previewTotals.discountAmt > 0 && (
                         <span className="text-green-600 text-xs font-medium">-₹{previewTotals.discountAmt}</span>
                       )}
                     </div>
                   </div>
-
-                  {/* Discount Reason — required when discount > 0 */}
                   {dv > 0 && (
                     <div>
-                      <label className="text-xs text-gray-500 mb-1 block">
-                        Discount Reason <span className="text-red-500">*</span>
-                      </label>
-                      <input
-                        type="text"
-                        value={discountReason}
+                      <label className="text-xs text-gray-500 mb-1 block">Discount Reason <span className="text-red-500">*</span></label>
+                      <input type="text" value={discountReason}
                         onChange={e => { setDiscountReason(e.target.value); setDiscountReasonError(false) }}
-                        placeholder="e.g. Regular customer, Birthday, Referral by owner..."
+                        placeholder="e.g. Regular customer, Birthday..."
                         className={`w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-orange-400
-                          ${discountReasonError ? 'border-red-500 bg-red-50' : 'border-gray-300'}`}
-                      />
-                      {discountReasonError && (
-                        <p className="text-red-500 text-xs mt-1">
-                          ⚠️ Reason is required when giving a discount
-                        </p>
-                      )}
+                          ${discountReasonError ? 'border-red-500 bg-red-50' : 'border-gray-300'}`} />
+                      {discountReasonError && <p className="text-red-500 text-xs mt-1">⚠️ Reason is required when giving a discount</p>}
                     </div>
                   )}
                 </div>
@@ -597,8 +645,7 @@ export default function Dashboard() {
                     </div>
                     {previewTotals.serviceChargeAmt > 0 && (
                       <div className="flex justify-between text-xs text-gray-500 mb-1">
-                        <span>Service ({serviceChargePct}%)</span>
-                        <span>+₹{previewTotals.serviceChargeAmt}</span>
+                        <span>Service ({serviceChargePct}%)</span><span>+₹{previewTotals.serviceChargeAmt}</span>
                       </div>
                     )}
                     {previewTotals.discountAmt > 0 && (
@@ -614,26 +661,33 @@ export default function Dashboard() {
                   <span>Final Total</span>
                   <span className="text-orange-500 text-xl">₹{previewTotals.finalAmount}</span>
                 </div>
-                <p className="text-xs text-gray-400 mt-1 text-center">
-                  Payment method settled in Today's Report
-                </p>
+                {!billLocked && (
+                  <p className="text-xs text-gray-400 mt-1 text-center">Payment method settled in Today's Report</p>
+                )}
               </div>
 
-              {editMode && (
+              {editMode && !billLocked && (
                 <p className="text-xs text-center text-red-400 italic">
-                  Tap − to remove all quantities of that item from bill
+                  Tap − to remove items · Use ➕ Add Item to add unlisted items
                 </p>
               )}
             </div>
 
+            {/* ── Footer buttons ────────────────────────────── */}
             <div className="p-4 border-t space-y-2">
-              {editMode ? (
+              {/* Bill locked state */}
+              {billLocked ? (
+                <button onClick={() => setShowPreview(false)}
+                  className="w-full bg-gray-200 text-gray-600 py-3 rounded-xl font-bold">
+                  🔒 Close (Bill Locked)
+                </button>
+              ) : editMode ? (
                 <div className="flex gap-3">
-                  <button onClick={() => setEditMode(false)}
+                  <button onClick={() => { setEditMode(false); setShowAddItem(false) }}
                     className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold">
                     ✅ Done Editing
                   </button>
-                  <button onClick={() => { setRemovedItems(new Set()); setEditMode(false) }}
+                  <button onClick={() => { setRemovedItems(new Set()); setManualItems([]); setEditMode(false); setShowAddItem(false) }}
                     className="bg-gray-100 text-gray-600 px-4 py-3 rounded-xl text-sm font-medium">
                     Reset
                   </button>
@@ -650,7 +704,7 @@ export default function Dashboard() {
                   </button>
                 </div>
               )}
-              {!editMode && (
+              {!editMode && !billLocked && (
                 <button onClick={() => setShowPreview(false)}
                   className="w-full bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium">
                   Cancel
@@ -666,9 +720,7 @@ export default function Dashboard() {
         <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl">
             <h2 className="text-xl font-bold text-red-500 mb-2">⚠️ Clear All Active Tables?</h2>
-            <p className="text-gray-600 text-sm mb-4">
-              This will clear all {activeTables.length} active tables without printing bills.
-            </p>
+            <p className="text-gray-600 text-sm mb-4">This will clear all {activeTables.length} active tables without printing bills.</p>
             <div className="flex gap-3">
               <button onClick={() => setShowClearAllConfirm(false)}
                 className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium">Cancel</button>
@@ -747,9 +799,7 @@ export default function Dashboard() {
                     <div className="flex justify-between items-center">
                       <span className="font-semibold text-sm">{table.table_name}</span>
                       {newCount > 0 && !isSelected && (
-                        <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-bold">
-                          {newCount} New!
-                        </span>
+                        <span className="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full font-bold">{newCount} New!</span>
                       )}
                     </div>
                     <div className={`flex justify-between mt-1 text-xs ${isSelected ? 'text-orange-100' : 'text-gray-400'}`}>
@@ -822,9 +872,7 @@ export default function Dashboard() {
                             Round {groupedByOrder.length - index}
                           </span>
                           {isNewOrder && (
-                            <span className="bg-yellow-400 text-yellow-900 text-xs font-bold px-3 py-1 rounded-full animate-pulse">
-                              🆕 New!
-                            </span>
+                            <span className="bg-yellow-400 text-yellow-900 text-xs font-bold px-3 py-1 rounded-full animate-pulse">🆕 New!</span>
                           )}
                           {!isNewOrder && index === 0 && (
                             <span className="bg-green-100 text-green-600 text-xs font-bold px-3 py-1 rounded-full">Latest ✨</span>
