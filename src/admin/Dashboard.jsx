@@ -22,7 +22,7 @@ const isLiquorItem = (name = '') =>
 const mergeItems = (items) => {
   const map = {}
   items.forEach(item => {
-    const name = item.food_items?.name || 'Unknown'
+    const name = item.food_items?.name || item.name || 'Unknown'
     if (map[name]) {
       map[name].quantity += item.quantity
       map[name].total += item.price_at_order * item.quantity
@@ -84,34 +84,36 @@ export default function Dashboard() {
   const [sessionStart] = useState(() => new Date().toISOString())
 
   const [restaurant, setRestaurant] = useState({
-    name: 'My Restaurant', address: '', phone: '', gst_number: '',
-    footer_note: 'Thank you! Visit again!'
+    name: 'My Restaurant', address: '', phone: '',
+    gst_number: '', footer_note: 'Thank you! Visit again!'
   })
 
+  // Bill preview
   const [showPreview, setShowPreview] = useState(false)
   const [payTableId, setPayTableId] = useState(null)
-  const [editMode, setEditMode] = useState(false)
-  const [removedItems, setRemovedItems] = useState(new Set())
-  // ── NEW: bill locked after print ──────────────────────────
-  const [billLocked, setBillLocked] = useState(false)
-
   const [serviceChargePct, setServiceChargePct] = useState(0)
   const [discountType, setDiscountType] = useState('percent')
   const [discountValue, setDiscountValue] = useState('')
   const [discountReason, setDiscountReason] = useState('')
   const [discountReasonError, setDiscountReasonError] = useState(false)
 
-  // ── NEW: add-item state ───────────────────────────────────
-  const [showAddItem, setShowAddItem] = useState(false)
+  // ── Item editor (shown on table view, BEFORE preview) ─────
+  const [showItemEditor, setShowItemEditor] = useState(false)
   const [allFoodItems, setAllFoodItems] = useState([])
-  const [addItemSearch, setAddItemSearch] = useState('')
-  const [manualItems, setManualItems] = useState([]) // [{food_item, qty}]
+  const [menuSearch, setMenuSearch] = useState('')
+  const [removedItems, setRemovedItems] = useState(new Set())   // set of `orderId:idx` keys
+  const [manualItems, setManualItems] = useState([])            // [{tempId, name, price, qty, dept}]
+  // Open item form
+  const [showOpenForm, setShowOpenForm] = useState(false)
+  const [openDept, setOpenDept] = useState('Food')
+  const [openName, setOpenName] = useState('')
+  const [openPrice, setOpenPrice] = useState('')
+  const [openQty, setOpenQty] = useState(1)
 
   const prevOrderIds = useRef(new Set())
   const audioCtxRef = useRef(null)
   const navigate = useNavigate()
 
-  // Load restaurant settings
   useEffect(() => {
     supabase.from('settings').select('*').eq('id', 'main').single()
       .then(({ data }) => {
@@ -125,7 +127,6 @@ export default function Dashboard() {
       })
   }, [])
 
-  // Load all food items for add-item panel
   useEffect(() => {
     supabase.from('food_items').select('id, name, price, is_available')
       .eq('is_available', true).order('name')
@@ -133,9 +134,8 @@ export default function Dashboard() {
   }, [])
 
   const initAudio = () => {
-    if (!audioCtxRef.current) {
+    if (!audioCtxRef.current)
       audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)()
-    }
     if (audioCtxRef.current.state === 'suspended') audioCtxRef.current.resume()
     setSoundReady(true)
   }
@@ -194,17 +194,21 @@ export default function Dashboard() {
   const selectTable = (table) => {
     setSelectedTable(table)
     setNewOrderTables(prev => { const n = new Set(prev); n.delete(table.id); return n })
+    // Reset editor state when switching tables
+    setRemovedItems(new Set())
+    setManualItems([])
+    setShowItemEditor(false)
+    setShowOpenForm(false)
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
-  // ── Manual items converted to order_items shape for totals ─
-  const manualAsItems = manualItems.map(mi => ({
+  // ── Compute effective order items including manual items ───
+  const manualAsOrderItems = manualItems.map(mi => ({
     food_items: { name: mi.name },
     price_at_order: mi.price,
     quantity: mi.qty,
-    _key: `manual:${mi.id}`,
+    _key: `manual:${mi.tempId}`,
     _orderId: 'manual',
-    _idx: mi.id,
     _isManual: true
   }))
 
@@ -214,15 +218,13 @@ export default function Dashboard() {
     tOrders.forEach(order => {
       ;(order.order_items || []).forEach((item, idx) => {
         const key = `${order.id}:${idx}`
-        if (!removedItems.has(key)) {
+        if (!removedItems.has(key))
           result.push({ ...item, _orderId: order.id, _idx: idx, _key: key })
-        }
       })
     })
-    // Append manual items
-    manualAsItems.forEach(mi => result.push(mi))
+    manualAsOrderItems.forEach(mi => result.push(mi))
     return result
-  }, [orders, removedItems, manualAsItems])
+  }, [orders, removedItems, manualAsOrderItems])
 
   const computeTotals = useCallback((tableId) => {
     const items = getEffectiveItems(tableId)
@@ -245,41 +247,67 @@ export default function Dashboard() {
     }
   }, [getEffectiveItems, serviceChargePct, discountType, discountValue])
 
+  // ── Open preview (no edit mode needed — edits done before) ─
   const openPreview = (tableId) => {
     setPayTableId(tableId)
-    setEditMode(false)
-    setRemovedItems(new Set())
-    setManualItems([])
-    // ── Reset lock when opening a fresh bill ──────────────
-    setBillLocked(false)
     setServiceChargePct(0)
     setDiscountType('percent')
     setDiscountValue('')
     setDiscountReason('')
     setDiscountReasonError(false)
-    setShowAddItem(false)
-    setAddItemSearch('')
     setShowPreview(true)
   }
 
-  // ── Add manual item ───────────────────────────────────────
-  const addManualItem = (foodItem) => {
+  // ── Add menu item to manual list ───────────────────────────
+  const addMenuItemToOrder = (foodItem) => {
     setManualItems(prev => {
-      const existing = prev.find(m => m.id === foodItem.id)
-      if (existing) {
-        return prev.map(m => m.id === foodItem.id ? { ...m, qty: m.qty + 1 } : m)
-      }
-      return [...prev, { id: foodItem.id, name: foodItem.name, price: foodItem.price, qty: 1 }]
+      const existing = prev.find(m => m.foodItemId === foodItem.id)
+      if (existing)
+        return prev.map(m => m.foodItemId === foodItem.id ? { ...m, qty: m.qty + 1 } : m)
+      return [...prev, {
+        tempId: Date.now() + Math.random(),
+        foodItemId: foodItem.id,
+        name: foodItem.name,
+        price: foodItem.price,
+        qty: 1
+      }]
     })
   }
 
-  const changeManualQty = (id, delta) => {
-    setManualItems(prev => {
-      const updated = prev.map(m => m.id === id ? { ...m, qty: m.qty + delta } : m)
-      return updated.filter(m => m.qty > 0)
+  const changeMenuItemQty = (foodItemId, delta) => {
+    setManualItems(prev =>
+      prev.map(m => m.foodItemId === foodItemId ? { ...m, qty: m.qty + delta } : m)
+        .filter(m => m.qty > 0)
+    )
+  }
+
+  // ── Add open (custom) item ─────────────────────────────────
+  const addOpenItem = () => {
+    if (!openName.trim()) { alert('Enter item name'); return }
+    if (!openPrice || parseFloat(openPrice) <= 0) { alert('Enter valid price'); return }
+    setManualItems(prev => [...prev, {
+      tempId: Date.now() + Math.random(),
+      foodItemId: null,
+      name: openName.trim(),
+      price: parseFloat(openPrice),
+      qty: openQty,
+      isOpen: true,
+      dept: openDept
+    }])
+    setOpenName(''); setOpenPrice(''); setOpenQty(1)
+    setShowOpenForm(false)
+  }
+
+  // ── Remove an original order item ─────────────────────────
+  const toggleRemoveItem = (key) => {
+    setRemovedItems(prev => {
+      const n = new Set(prev)
+      n.has(key) ? n.delete(key) : n.add(key)
+      return n
     })
   }
 
+  // ── Print & Save ───────────────────────────────────────────
   const handlePrintAndSave = async () => {
     const dv = parseFloat(discountValue) || 0
     if (dv > 0 && !discountReason.trim()) { setDiscountReasonError(true); return }
@@ -311,17 +339,28 @@ export default function Dashboard() {
     const tOrders = orders.filter(o => o.table_id === payTableId)
     const nowIST = now.toISOString()
 
-    // If there are manual items, insert them as order_items first
+    // Insert manual items into DB (attach to first order)
     if (manualItems.length > 0 && tOrders.length > 0) {
       const firstOrderId = tOrders[0].id
-      const manualRows = manualItems.map(mi => ({
-        order_id: firstOrderId,
-        food_item_id: mi.id,
-        quantity: mi.qty,
-        price_at_order: mi.price,
-        note: 'Added at billing'
-      }))
-      await supabase.from('order_items').insert(manualRows)
+      const rows = manualItems
+        .filter(mi => mi.foodItemId) // menu items only
+        .map(mi => ({
+          order_id: firstOrderId,
+          food_item_id: mi.foodItemId,
+          quantity: mi.qty,
+          price_at_order: mi.price,
+          note: 'Added at billing'
+        }))
+      if (rows.length > 0) await supabase.from('order_items').insert(rows)
+
+      // Open items — insert with a special note (no food_item_id)
+      // We store them via a helper custom_order_items or just in note of a placeholder
+      // Simplest: store as order_items with food_item_id = null isn't allowed by FK,
+      // so we'll encode them in the note of the first order item
+      // OR we can create a placeholder food_item. Simplest approach:
+      // We use the price_at_order to encode open items as order_items pointing to
+      // an existing food item isn't safe. So we skip DB insert for open items and
+      // only include them on the printed receipt. They are captured in final_amount.
     }
 
     for (const order of tOrders) {
@@ -330,7 +369,8 @@ export default function Dashboard() {
         service_charge_pct: serviceChargePct, service_charge_amt: serviceChargeAmt,
         discount_type: discountType, discount_value: dv, discount_amt: discountAmt,
         discount_reason: discountReason.trim(), final_amount: finalAmount,
-        settlement_status: 'pending', table_name_snapshot: tblData?.table_name || '',
+        settlement_status: 'pending',
+        table_name_snapshot: tblData?.table_name || '',
         payment_type: 'pending'
       }).eq('id', order.id)
     }
@@ -338,9 +378,10 @@ export default function Dashboard() {
     await nukeClearTable(payTableId)
     setNewOrderIds(prev => { const n = new Set(prev); tOrders.forEach(o => n.delete(o.id)); return n })
 
-    // ── Lock the bill after print ─────────────────────────
-    setBillLocked(true)
-    setEditMode(false)
+    // Reset all editor state
+    setRemovedItems(new Set())
+    setManualItems([])
+    setShowItemEditor(false)
     setShowPreview(false)
     if (selectedTable?.id === payTableId) setSelectedTable(null)
     fetchAll()
@@ -350,9 +391,8 @@ export default function Dashboard() {
     try {
       const { data: ords } = await supabase
         .from('orders').select('id').eq('table_id', tableId).eq('is_paid', false)
-      if (ords && ords.length > 0) {
+      if (ords && ords.length > 0)
         await supabase.from('order_items').delete().in('order_id', ords.map(o => o.id))
-      }
       await supabase.from('orders').delete().eq('table_id', tableId).eq('is_paid', false)
       await supabase.from('table_sessions').delete().eq('table_id', tableId)
       const { data: tbl } = await supabase
@@ -376,9 +416,13 @@ export default function Dashboard() {
   const handleLogout = async () => { await supabase.auth.signOut(); navigate('/') }
 
   const tableOrders = selectedTable ? orders.filter(o => o.table_id === selectedTable.id) : []
-  const allItems = tableOrders.flatMap(o => o.order_items || [])
+  const allOrderItems = tableOrders.flatMap(o => o.order_items || [])
+
+  // Live subtotal including editor changes
+  const editorTotals = selectedTable ? computeTotals(selectedTable.id) : null
+  const displaySubtotal = editorTotals ? editorTotals.subtotal : 0
+
   const groupedByOrder = tableOrders.map(o => ({ ...o, items: o.order_items || [] }))
-  const tableSubtotal = allItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
   const activeTables = tables.filter(t => orders.some(o => o.table_id === t.id))
   const selectedTableData = tables.find(t => t.id === selectedTable?.id)
   const currentPin = selectedTableData?.pin || '----'
@@ -386,8 +430,8 @@ export default function Dashboard() {
   const previewTableName = tables.find(t => t.id === payTableId)?.table_name || ''
   const dv = parseFloat(discountValue) || 0
 
-  const filteredFoodItems = allFoodItems.filter(f =>
-    f.name.toLowerCase().includes(addItemSearch.toLowerCase())
+  const filteredMenuItems = allFoodItems.filter(f =>
+    f.name.toLowerCase().includes(menuSearch.toLowerCase())
   )
 
   return (
@@ -399,12 +443,11 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── Bill Preview Modal ─────────────────────────────── */}
+      {/* ── Bill Preview Modal (NO Edit button) ──────────── */}
       {showPreview && previewTotals && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl max-h-[92vh] flex flex-col">
 
-            {/* Header */}
             <div className="p-5 border-b">
               <div className="text-center">
                 <p className="font-bold text-lg text-gray-800">{restaurant.name}</p>
@@ -416,300 +459,149 @@ export default function Dashboard() {
                 <span>Table: <strong>{previewTableName}</strong></span>
                 <span>{toISTDate(new Date().toISOString())} {toIST(new Date().toISOString())}</span>
               </div>
-
-              {/* ── Locked banner ─────────────────────────── */}
-              {billLocked && (
-                <div className="mt-3 bg-red-50 border border-red-200 rounded-xl px-3 py-2 flex items-center gap-2">
-                  <span className="text-lg">🔒</span>
-                  <p className="text-xs text-red-600 font-medium">Bill printed & saved. No further edits allowed.</p>
-                </div>
-              )}
+              <div className="mt-2 bg-blue-50 border border-blue-200 rounded-lg px-3 py-1.5">
+                <p className="text-xs text-blue-600 text-center">
+                  ℹ️ All edits were made before. Print to finalize.
+                </p>
+              </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            <div className="flex-1 overflow-y-auto p-4 space-y-3">
 
-              {/* Food items */}
+              {/* Food */}
               {previewTotals.foodItems.length > 0 && (
                 <div>
                   <div className="flex items-center gap-2 mb-2">
                     <span className="text-xs font-bold text-gray-500 uppercase">🍽 Food</span>
                     <div className="flex-1 border-t border-dashed border-gray-200" />
                   </div>
-                  {previewTotals.foodItems.map((item, i) => {
-                    const name = item.food_items?.name || item.name
-                    const isRemoved = previewTotals.rawFoodItems.some(r => r.food_items?.name === name && removedItems.has(r._key))
-                    return (
-                      <div key={i} className="flex justify-between items-center text-sm py-1.5 px-1 rounded">
-                        <div className="flex items-center gap-2 flex-1">
-                          {editMode && !billLocked && (
-                            <button
-                              onClick={() => {
-                                setRemovedItems(prev => {
-                                  const n = new Set(prev)
-                                  previewTotals.rawFoodItems.forEach(raw => {
-                                    if (raw.food_items?.name === name) {
-                                      n.has(raw._key) ? n.delete(raw._key) : n.add(raw._key)
-                                    }
-                                  })
-                                  return n
-                                })
-                              }}
-                              className={`w-5 h-5 rounded-full border-2 flex items-center justify-center text-xs font-bold flex-shrink-0
-                                ${isRemoved ? 'border-green-500 text-green-500' : 'border-red-400 text-red-400'}`}>
-                              {isRemoved ? '+' : '−'}
-                            </button>
-                          )}
-                          <span className={`text-gray-700 ${isRemoved ? 'line-through opacity-40' : ''}`}>{name}</span>
-                          <span className="bg-orange-100 text-orange-600 text-xs font-bold px-1.5 py-0.5 rounded-full">×{item.quantity}</span>
-                        </div>
-                        <span className="text-gray-700 font-medium">₹{item.total}</span>
+                  {previewTotals.foodItems.map((item, i) => (
+                    <div key={i} className="flex justify-between items-center text-sm py-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-gray-700">{item.food_items?.name || item.name}</span>
+                        <span className="bg-orange-100 text-orange-600 text-xs font-bold px-1.5 py-0.5 rounded-full">
+                          ×{item.quantity}
+                        </span>
                       </div>
-                    )
-                  })}
+                      <span className="text-gray-700 font-medium">₹{item.total}</span>
+                    </div>
+                  ))}
                   <div className="flex justify-between text-xs font-semibold text-gray-500 mt-2 pt-1 border-t border-dashed">
                     <span>Food Subtotal</span><span>₹{previewTotals.foodSubtotal}</span>
                   </div>
                 </div>
               )}
 
-              {/* Liquor items */}
+              {/* Liquor */}
               {previewTotals.liquorItems.length > 0 && (
                 <div>
                   <div className="flex items-center gap-2 mb-2">
                     <span className="text-xs font-bold text-gray-500 uppercase">🍺 Liquor</span>
                     <div className="flex-1 border-t border-dashed border-gray-200" />
                   </div>
-                  {previewTotals.liquorItems.map((item, i) => {
-                    const name = item.food_items?.name || item.name
-                    const isRemoved = previewTotals.rawLiquorItems.some(r => r.food_items?.name === name && removedItems.has(r._key))
-                    return (
-                      <div key={i} className="flex justify-between items-center text-sm py-1.5 px-1 rounded">
-                        <div className="flex items-center gap-2 flex-1">
-                          {editMode && !billLocked && (
-                            <button
-                              onClick={() => {
-                                setRemovedItems(prev => {
-                                  const n = new Set(prev)
-                                  previewTotals.rawLiquorItems.forEach(raw => {
-                                    if (raw.food_items?.name === name) {
-                                      n.has(raw._key) ? n.delete(raw._key) : n.add(raw._key)
-                                    }
-                                  })
-                                  return n
-                                })
-                              }}
-                              className={`w-5 h-5 rounded-full border-2 flex items-center justify-center text-xs font-bold flex-shrink-0
-                                ${isRemoved ? 'border-green-500 text-green-500' : 'border-red-400 text-red-400'}`}>
-                              {isRemoved ? '+' : '−'}
-                            </button>
-                          )}
-                          <span className={`text-gray-700 ${isRemoved ? 'line-through opacity-40' : ''}`}>{name}</span>
-                          <span className="bg-blue-100 text-blue-600 text-xs font-bold px-1.5 py-0.5 rounded-full">×{item.quantity}</span>
-                        </div>
-                        <span className="text-gray-700 font-medium">₹{item.total}</span>
+                  {previewTotals.liquorItems.map((item, i) => (
+                    <div key={i} className="flex justify-between items-center text-sm py-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-gray-700">{item.food_items?.name || item.name}</span>
+                        <span className="bg-blue-100 text-blue-600 text-xs font-bold px-1.5 py-0.5 rounded-full">
+                          ×{item.quantity}
+                        </span>
                       </div>
-                    )
-                  })}
+                      <span className="text-gray-700 font-medium">₹{item.total}</span>
+                    </div>
+                  ))}
                   <div className="flex justify-between text-xs font-semibold text-gray-500 mt-2 pt-1 border-t border-dashed">
                     <span>Liquor Subtotal</span><span>₹{previewTotals.liquorSubtotal}</span>
                   </div>
                 </div>
               )}
 
-              {/* ── Add Items Panel (edit mode only, not locked) ─── */}
-              {editMode && !billLocked && (
-                <div className="border border-dashed border-orange-300 rounded-xl overflow-hidden">
-                  <button
-                    onClick={() => { setShowAddItem(!showAddItem); setAddItemSearch('') }}
-                    className="w-full flex items-center justify-between px-4 py-3 bg-orange-50 text-orange-600 font-semibold text-sm hover:bg-orange-100 transition">
-                    <span>➕ Add Item to Bill</span>
-                    <span>{showAddItem ? '▲' : '▼'}</span>
-                  </button>
-
-                  {showAddItem && (
-                    <div className="p-3 bg-white">
-                      {/* Search */}
-                      <input
-                        type="text"
-                        value={addItemSearch}
-                        onChange={e => setAddItemSearch(e.target.value)}
-                        placeholder="🔍 Search item..."
-                        className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm mb-3 focus:outline-none focus:ring-2 focus:ring-orange-400"
-                      />
-
-                      {/* Manual items already added */}
-                      {manualItems.length > 0 && (
-                        <div className="mb-3 space-y-1">
-                          <p className="text-xs font-bold text-green-600 mb-1">✅ Added to bill:</p>
-                          {manualItems.map(mi => (
-                            <div key={mi.id} className="flex items-center justify-between bg-green-50 border border-green-100 rounded-lg px-3 py-2">
-                              <div>
-                                <p className="text-sm font-medium text-gray-700">{mi.name}</p>
-                                <p className="text-xs text-gray-400">₹{mi.price} × {mi.qty} = ₹{mi.price * mi.qty}</p>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <button onClick={() => changeManualQty(mi.id, -1)}
-                                  className="w-7 h-7 rounded-full bg-red-100 text-red-500 font-bold text-sm flex items-center justify-center hover:bg-red-200">−</button>
-                                <span className="font-bold text-gray-700 w-5 text-center">{mi.qty}</span>
-                                <button onClick={() => changeManualQty(mi.id, 1)}
-                                  className="w-7 h-7 rounded-full bg-green-100 text-green-600 font-bold text-sm flex items-center justify-center hover:bg-green-200">+</button>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      {/* Item list */}
-                      <div className="max-h-44 overflow-y-auto space-y-1">
-                        {filteredFoodItems.length === 0 && (
-                          <p className="text-center text-gray-400 text-xs py-3">No items found</p>
-                        )}
-                        {filteredFoodItems.map(fi => {
-                          const alreadyAdded = manualItems.find(m => m.id === fi.id)
-                          return (
-                            <button key={fi.id} onClick={() => addManualItem(fi)}
-                              className="w-full flex justify-between items-center px-3 py-2 rounded-lg hover:bg-orange-50 transition text-left border border-transparent hover:border-orange-200">
-                              <span className="text-sm text-gray-700">{fi.name}</span>
-                              <div className="flex items-center gap-2">
-                                <span className="text-xs text-orange-500 font-bold">₹{fi.price}</span>
-                                {alreadyAdded
-                                  ? <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full font-medium">×{alreadyAdded.qty} added</span>
-                                  : <span className="text-xs bg-orange-100 text-orange-600 px-2 py-0.5 rounded-full">+ Add</span>}
-                              </div>
-                            </button>
-                          )
-                        })}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Charges & Discount — hide in edit mode and if locked */}
-              {!editMode && !billLocked && (
-                <div className="bg-gray-50 rounded-xl p-3 space-y-3">
-                  <p className="text-xs font-bold text-gray-500 uppercase">Charges & Discount</p>
-                  <div className="flex justify-between items-center text-sm text-gray-600">
-                    <span>Service Charge</span>
-                    <div className="flex items-center gap-2">
-                      <select value={serviceChargePct} onChange={e => setServiceChargePct(Number(e.target.value))}
-                        className="border rounded px-2 py-0.5 text-xs">
-                        <option value={0}>0%</option>
-                        <option value={5}>5%</option>
-                        <option value={10}>10%</option>
-                        <option value={12}>12%</option>
-                        <option value={18}>18%</option>
-                      </select>
-                      {previewTotals.serviceChargeAmt > 0 && (
-                        <span className="text-xs font-medium text-gray-700">+₹{previewTotals.serviceChargeAmt}</span>
-                      )}
-                    </div>
+              {/* Charges */}
+              <div className="bg-gray-50 rounded-xl p-3 space-y-3">
+                <p className="text-xs font-bold text-gray-500 uppercase">Charges & Discount</p>
+                <div className="flex justify-between items-center text-sm text-gray-600">
+                  <span>Service Charge</span>
+                  <div className="flex items-center gap-2">
+                    <select value={serviceChargePct} onChange={e => setServiceChargePct(Number(e.target.value))}
+                      className="border rounded px-2 py-0.5 text-xs">
+                      <option value={0}>0%</option>
+                      <option value={5}>5%</option>
+                      <option value={10}>10%</option>
+                      <option value={12}>12%</option>
+                      <option value={18}>18%</option>
+                    </select>
+                    {previewTotals.serviceChargeAmt > 0 && (
+                      <span className="text-xs font-medium text-gray-700">+₹{previewTotals.serviceChargeAmt}</span>
+                    )}
                   </div>
-                  <div className="flex justify-between items-center text-sm text-gray-600">
-                    <span>Discount</span>
-                    <div className="flex items-center gap-2">
-                      <select value={discountType}
-                        onChange={e => { setDiscountType(e.target.value); setDiscountValue(''); setDiscountReason('') }}
-                        className="border rounded px-2 py-0.5 text-xs">
-                        <option value="percent">%</option>
-                        <option value="flat">₹ flat</option>
-                      </select>
-                      <input type="number" min="0" value={discountValue}
-                        onChange={e => { setDiscountValue(e.target.value); setDiscountReasonError(false) }}
-                        placeholder="0" className="border rounded px-2 py-0.5 text-xs w-16 text-right" />
-                      {previewTotals.discountAmt > 0 && (
-                        <span className="text-green-600 text-xs font-medium">-₹{previewTotals.discountAmt}</span>
-                      )}
-                    </div>
-                  </div>
-                  {dv > 0 && (
-                    <div>
-                      <label className="text-xs text-gray-500 mb-1 block">Discount Reason <span className="text-red-500">*</span></label>
-                      <input type="text" value={discountReason}
-                        onChange={e => { setDiscountReason(e.target.value); setDiscountReasonError(false) }}
-                        placeholder="e.g. Regular customer, Birthday..."
-                        className={`w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-orange-400
-                          ${discountReasonError ? 'border-red-500 bg-red-50' : 'border-gray-300'}`} />
-                      {discountReasonError && <p className="text-red-500 text-xs mt-1">⚠️ Reason is required when giving a discount</p>}
-                    </div>
-                  )}
                 </div>
-              )}
+                <div className="flex justify-between items-center text-sm text-gray-600">
+                  <span>Discount</span>
+                  <div className="flex items-center gap-2">
+                    <select value={discountType}
+                      onChange={e => { setDiscountType(e.target.value); setDiscountValue(''); setDiscountReason('') }}
+                      className="border rounded px-2 py-0.5 text-xs">
+                      <option value="percent">%</option>
+                      <option value="flat">₹ flat</option>
+                    </select>
+                    <input type="number" min="0" value={discountValue}
+                      onChange={e => { setDiscountValue(e.target.value); setDiscountReasonError(false) }}
+                      placeholder="0" className="border rounded px-2 py-0.5 text-xs w-16 text-right" />
+                    {previewTotals.discountAmt > 0 && (
+                      <span className="text-green-600 text-xs font-medium">-₹{previewTotals.discountAmt}</span>
+                    )}
+                  </div>
+                </div>
+                {dv > 0 && (
+                  <div>
+                    <label className="text-xs text-gray-500 mb-1 block">
+                      Discount Reason <span className="text-red-500">*</span>
+                    </label>
+                    <input type="text" value={discountReason}
+                      onChange={e => { setDiscountReason(e.target.value); setDiscountReasonError(false) }}
+                      placeholder="e.g. Regular customer..."
+                      className={`w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-orange-400
+                        ${discountReasonError ? 'border-red-500 bg-red-50' : 'border-gray-300'}`} />
+                    {discountReasonError && <p className="text-red-500 text-xs mt-1">⚠️ Reason required</p>}
+                  </div>
+                )}
+              </div>
 
               {/* Totals */}
               <div className="bg-gray-50 rounded-xl p-3">
-                {!editMode && (
-                  <>
-                    <div className="flex justify-between text-xs text-gray-500 mb-1">
-                      <span>Subtotal</span><span>₹{previewTotals.subtotal}</span>
-                    </div>
-                    {previewTotals.serviceChargeAmt > 0 && (
-                      <div className="flex justify-between text-xs text-gray-500 mb-1">
-                        <span>Service ({serviceChargePct}%)</span><span>+₹{previewTotals.serviceChargeAmt}</span>
-                      </div>
-                    )}
-                    {previewTotals.discountAmt > 0 && (
-                      <div className="flex justify-between text-xs text-green-600 mb-1">
-                        <span>Discount {discountReason ? `(${discountReason})` : ''}</span>
-                        <span>-₹{previewTotals.discountAmt}</span>
-                      </div>
-                    )}
-                    <div className="border-t border-dashed border-gray-200 my-1" />
-                  </>
+                <div className="flex justify-between text-xs text-gray-500 mb-1">
+                  <span>Subtotal</span><span>₹{previewTotals.subtotal}</span>
+                </div>
+                {previewTotals.serviceChargeAmt > 0 && (
+                  <div className="flex justify-between text-xs text-gray-500 mb-1">
+                    <span>Service ({serviceChargePct}%)</span><span>+₹{previewTotals.serviceChargeAmt}</span>
+                  </div>
                 )}
+                {previewTotals.discountAmt > 0 && (
+                  <div className="flex justify-between text-xs text-green-600 mb-1">
+                    <span>Discount {discountReason ? `(${discountReason})` : ''}</span>
+                    <span>-₹{previewTotals.discountAmt}</span>
+                  </div>
+                )}
+                <div className="border-t border-dashed border-gray-200 my-1" />
                 <div className="flex justify-between font-bold text-gray-800 text-base">
                   <span>Final Total</span>
                   <span className="text-orange-500 text-xl">₹{previewTotals.finalAmount}</span>
                 </div>
-                {!billLocked && (
-                  <p className="text-xs text-gray-400 mt-1 text-center">Payment method settled in Today's Report</p>
-                )}
+                <p className="text-xs text-gray-400 mt-1 text-center">Payment method settled in Today's Report</p>
               </div>
-
-              {editMode && !billLocked && (
-                <p className="text-xs text-center text-red-400 italic">
-                  Tap − to remove items · Use ➕ Add Item to add unlisted items
-                </p>
-              )}
             </div>
 
-            {/* ── Footer buttons ────────────────────────────── */}
+            {/* Footer — NO Edit button */}
             <div className="p-4 border-t space-y-2">
-              {/* Bill locked state */}
-              {billLocked ? (
-                <button onClick={() => setShowPreview(false)}
-                  className="w-full bg-gray-200 text-gray-600 py-3 rounded-xl font-bold">
-                  🔒 Close (Bill Locked)
-                </button>
-              ) : editMode ? (
-                <div className="flex gap-3">
-                  <button onClick={() => { setEditMode(false); setShowAddItem(false) }}
-                    className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold">
-                    ✅ Done Editing
-                  </button>
-                  <button onClick={() => { setRemovedItems(new Set()); setManualItems([]); setEditMode(false); setShowAddItem(false) }}
-                    className="bg-gray-100 text-gray-600 px-4 py-3 rounded-xl text-sm font-medium">
-                    Reset
-                  </button>
-                </div>
-              ) : (
-                <div className="flex gap-3">
-                  <button onClick={handlePrintAndSave} disabled={clearing}
-                    className="flex-1 bg-green-500 text-white py-3 rounded-xl font-bold hover:bg-green-600 disabled:opacity-50">
-                    🖨️ Print & Save Bill
-                  </button>
-                  <button onClick={() => setEditMode(true)}
-                    className="flex-1 bg-blue-100 text-blue-600 py-3 rounded-xl font-bold hover:bg-blue-200">
-                    ✏️ Edit
-                  </button>
-                </div>
-              )}
-              {!editMode && !billLocked && (
-                <button onClick={() => setShowPreview(false)}
-                  className="w-full bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium">
-                  Cancel
-                </button>
-              )}
+              <button onClick={handlePrintAndSave} disabled={clearing}
+                className="w-full bg-green-500 text-white py-3 rounded-xl font-bold hover:bg-green-600 disabled:opacity-50">
+                🖨️ Print & Save Bill
+              </button>
+              <button onClick={() => setShowPreview(false)}
+                className="w-full bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium">
+                ← Back to Edit
+              </button>
             </div>
           </div>
         </div>
@@ -720,7 +612,7 @@ export default function Dashboard() {
         <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl">
             <h2 className="text-xl font-bold text-red-500 mb-2">⚠️ Clear All Active Tables?</h2>
-            <p className="text-gray-600 text-sm mb-4">This will clear all {activeTables.length} active tables without printing bills.</p>
+            <p className="text-gray-600 text-sm mb-4">This will clear all {activeTables.length} active tables.</p>
             <div className="flex gap-3">
               <button onClick={() => setShowClearAllConfirm(false)}
                 className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium">Cancel</button>
@@ -768,6 +660,8 @@ export default function Dashboard() {
       </div>
 
       <div className="flex flex-1 overflow-hidden relative">
+
+        {/* Sidebar */}
         <div className={`${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
           transition-all duration-300 bg-white shadow-lg flex-shrink-0
           fixed md:relative h-[calc(100vh-56px)] w-64
@@ -821,6 +715,7 @@ export default function Dashboard() {
             onClick={() => setSidebarOpen(false)} />
         )}
 
+        {/* Main Content */}
         <div className="flex-1 overflow-y-auto p-4 md:p-6">
           {!selectedTable && (
             <div className="flex flex-col items-center justify-center h-full min-h-64 text-gray-400">
@@ -836,6 +731,8 @@ export default function Dashboard() {
 
           {selectedTable && (
             <div className="max-w-2xl mx-auto">
+
+              {/* Table header */}
               <div className="bg-white rounded-2xl shadow p-5 mb-4">
                 <div className="flex justify-between items-start flex-wrap gap-3">
                   <div>
@@ -859,6 +756,235 @@ export default function Dashboard() {
                 </div>
               </div>
 
+              {/* ── Item Editor Panel ─────────────────────── */}
+              <div className="bg-white rounded-2xl shadow mb-4 overflow-hidden">
+                <button
+                  onClick={() => setShowItemEditor(!showItemEditor)}
+                  className="w-full flex items-center justify-between px-5 py-4 hover:bg-gray-50 transition">
+                  <div className="flex items-center gap-3">
+                    <span className="text-lg">✏️</span>
+                    <div className="text-left">
+                      <p className="font-bold text-gray-700 text-sm">Add / Remove Items</p>
+                      <p className="text-xs text-gray-400">
+                        {manualItems.length > 0 ? `${manualItems.length} item(s) added` : 'Modify bill before printing'}
+                        {removedItems.size > 0 ? ` · ${removedItems.size} removed` : ''}
+                      </p>
+                    </div>
+                  </div>
+                  <span className={`text-gray-400 transition-transform ${showItemEditor ? 'rotate-180' : ''}`}>▼</span>
+                </button>
+
+                {showItemEditor && (
+                  <div className="border-t">
+
+                    {/* ── Remove existing items ──────────── */}
+                    {allOrderItems.length > 0 && (
+                      <div className="px-5 py-4 border-b">
+                        <p className="text-xs font-bold text-gray-500 uppercase mb-3">
+                          🗑 Remove Items from Order
+                        </p>
+                        <div className="space-y-2">
+                          {tableOrders.flatMap(order =>
+                            (order.order_items || []).map((item, idx) => {
+                              const key = `${order.id}:${idx}`
+                              const isRemoved = removedItems.has(key)
+                              return (
+                                <div key={key}
+                                  className={`flex items-center justify-between px-3 py-2 rounded-xl border transition
+                                    ${isRemoved ? 'bg-red-50 border-red-200 opacity-60' : 'bg-gray-50 border-gray-100'}`}>
+                                  <div className="flex items-center gap-2">
+                                    <span className={`text-sm text-gray-700 ${isRemoved ? 'line-through' : ''}`}>
+                                      {item.food_items?.name}
+                                    </span>
+                                    <span className="text-xs text-gray-400">×{item.quantity}</span>
+                                    <span className="text-xs font-medium text-orange-500">
+                                      ₹{item.price_at_order * item.quantity}
+                                    </span>
+                                  </div>
+                                  <button onClick={() => toggleRemoveItem(key)}
+                                    className={`text-xs px-3 py-1 rounded-full font-medium transition
+                                      ${isRemoved
+                                        ? 'bg-green-100 text-green-600 hover:bg-green-200'
+                                        : 'bg-red-100 text-red-500 hover:bg-red-200'}`}>
+                                    {isRemoved ? '↩ Restore' : '✕ Remove'}
+                                  </button>
+                                </div>
+                              )
+                            })
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ── Add from Menu ──────────────────── */}
+                    <div className="px-5 py-4 border-b">
+                      <p className="text-xs font-bold text-gray-500 uppercase mb-3">
+                        ➕ Add from Menu
+                      </p>
+                      <input
+                        type="text"
+                        value={menuSearch}
+                        onChange={e => setMenuSearch(e.target.value)}
+                        placeholder="🔍 Search menu item..."
+                        className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm mb-3 focus:outline-none focus:ring-2 focus:ring-orange-400"
+                      />
+
+                      {/* Already added from menu */}
+                      {manualItems.filter(m => m.foodItemId).length > 0 && (
+                        <div className="mb-3 space-y-1.5">
+                          <p className="text-xs text-green-600 font-medium">✅ Added:</p>
+                          {manualItems.filter(m => m.foodItemId).map(mi => (
+                            <div key={mi.tempId}
+                              className="flex items-center justify-between bg-green-50 border border-green-100 rounded-lg px-3 py-2">
+                              <div>
+                                <p className="text-sm font-medium text-gray-700">{mi.name}</p>
+                                <p className="text-xs text-gray-400">₹{mi.price} × {mi.qty} = ₹{mi.price * mi.qty}</p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button onClick={() => changeMenuItemQty(mi.foodItemId, -1)}
+                                  className="w-7 h-7 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center hover:bg-red-200">−</button>
+                                <span className="font-bold text-gray-700 w-4 text-center">{mi.qty}</span>
+                                <button onClick={() => changeMenuItemQty(mi.foodItemId, 1)}
+                                  className="w-7 h-7 rounded-full bg-green-100 text-green-600 font-bold flex items-center justify-center hover:bg-green-200">+</button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      <div className="max-h-40 overflow-y-auto space-y-1">
+                        {filteredMenuItems.length === 0 && (
+                          <p className="text-center text-gray-400 text-xs py-2">No items found</p>
+                        )}
+                        {filteredMenuItems.map(fi => {
+                          const added = manualItems.find(m => m.foodItemId === fi.id)
+                          return (
+                            <button key={fi.id} onClick={() => addMenuItemToOrder(fi)}
+                              className="w-full flex justify-between items-center px-3 py-2 rounded-lg hover:bg-orange-50 border border-transparent hover:border-orange-200 transition text-left">
+                              <span className="text-sm text-gray-700">{fi.name}</span>
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs text-orange-500 font-bold">₹{fi.price}</span>
+                                {added
+                                  ? <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full">×{added.qty}</span>
+                                  : <span className="text-xs bg-orange-100 text-orange-600 px-2 py-0.5 rounded-full">+ Add</span>}
+                              </div>
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+
+                    {/* ── Add Open Item ──────────────────── */}
+                    <div className="px-5 py-4">
+                      <div className="flex items-center justify-between mb-3">
+                        <p className="text-xs font-bold text-gray-500 uppercase">
+                          🆕 Add Open Item (Not in Menu)
+                        </p>
+                        <button
+                          onClick={() => setShowOpenForm(!showOpenForm)}
+                          className="text-xs bg-orange-500 text-white px-3 py-1 rounded-full hover:bg-orange-600">
+                          {showOpenForm ? '✕ Cancel' : '+ Open Item'}
+                        </button>
+                      </div>
+
+                      {showOpenForm && (
+                        <div className="bg-orange-50 border border-orange-200 rounded-xl p-4 space-y-3">
+                          {/* Dept selector */}
+                          <div>
+                            <p className="text-xs text-gray-500 mb-1.5 font-medium">Category</p>
+                            <div className="flex gap-2">
+                              {[
+                                { id: 'Food', icon: '🍽', color: 'bg-orange-500 text-white' },
+                                { id: 'Beverage', icon: '🥤', color: 'bg-blue-500 text-white' },
+                                { id: 'Liquor', icon: '🍺', color: 'bg-purple-500 text-white' },
+                              ].map(d => (
+                                <button key={d.id} onClick={() => setOpenDept(d.id)}
+                                  className={`flex-1 py-2 rounded-xl text-xs font-bold border-2 transition
+                                    ${openDept === d.id
+                                      ? d.color + ' border-transparent'
+                                      : 'bg-white border-gray-200 text-gray-500 hover:border-orange-300'}`}>
+                                  {d.icon} {d.id}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* Item name */}
+                          <div>
+                            <label className="text-xs text-gray-500 block mb-1">Item Name *</label>
+                            <input type="text" value={openName}
+                              onChange={e => setOpenName(e.target.value)}
+                              placeholder="e.g. Special Cocktail, Custom Thali..."
+                              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                          </div>
+
+                          {/* Price & Qty */}
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <label className="text-xs text-gray-500 block mb-1">Price (₹) *</label>
+                              <input type="number" min="1" value={openPrice}
+                                onChange={e => setOpenPrice(e.target.value)}
+                                placeholder="0"
+                                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                            </div>
+                            <div>
+                              <label className="text-xs text-gray-500 block mb-1">Quantity</label>
+                              <div className="flex items-center gap-2">
+                                <button onClick={() => setOpenQty(q => Math.max(1, q - 1))}
+                                  className="w-9 h-9 rounded-full bg-gray-200 text-gray-600 font-bold flex items-center justify-center hover:bg-gray-300">−</button>
+                                <span className="font-bold text-gray-700 text-lg w-6 text-center">{openQty}</span>
+                                <button onClick={() => setOpenQty(q => q + 1)}
+                                  className="w-9 h-9 rounded-full bg-orange-100 text-orange-600 font-bold flex items-center justify-center hover:bg-orange-200">+</button>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Preview total */}
+                          {openPrice && parseFloat(openPrice) > 0 && (
+                            <div className="bg-white rounded-lg px-3 py-2 flex justify-between text-sm">
+                              <span className="text-gray-600">{openName || 'Item'} × {openQty}</span>
+                              <span className="font-bold text-orange-500">₹{(parseFloat(openPrice) * openQty).toFixed(0)}</span>
+                            </div>
+                          )}
+
+                          <button onClick={addOpenItem}
+                            className="w-full bg-orange-500 text-white py-2.5 rounded-xl font-bold hover:bg-orange-600">
+                            ✅ Add to Bill
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Open items added */}
+                      {manualItems.filter(m => m.isOpen).length > 0 && (
+                        <div className="mt-3 space-y-1.5">
+                          <p className="text-xs text-purple-600 font-medium">🆕 Open Items Added:</p>
+                          {manualItems.filter(m => m.isOpen).map(mi => (
+                            <div key={mi.tempId}
+                              className="flex items-center justify-between bg-purple-50 border border-purple-100 rounded-lg px-3 py-2">
+                              <div>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs px-1.5 py-0.5 rounded-full font-medium bg-purple-100 text-purple-600">
+                                    {mi.dept === 'Food' ? '🍽' : mi.dept === 'Beverage' ? '🥤' : '🍺'} {mi.dept}
+                                  </span>
+                                  <p className="text-sm font-medium text-gray-700">{mi.name}</p>
+                                </div>
+                                <p className="text-xs text-gray-400 mt-0.5">₹{mi.price} × {mi.qty} = ₹{mi.price * mi.qty}</p>
+                              </div>
+                              <button
+                                onClick={() => setManualItems(prev => prev.filter(m => m.tempId !== mi.tempId))}
+                                className="text-xs bg-red-100 text-red-500 px-2 py-1 rounded-full hover:bg-red-200">
+                                ✕
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Order rounds */}
               <div className="space-y-4 mb-4">
                 {groupedByOrder.map((order, index) => {
                   const isNewOrder = newOrderIds.has(order.id)
@@ -872,7 +998,9 @@ export default function Dashboard() {
                             Round {groupedByOrder.length - index}
                           </span>
                           {isNewOrder && (
-                            <span className="bg-yellow-400 text-yellow-900 text-xs font-bold px-3 py-1 rounded-full animate-pulse">🆕 New!</span>
+                            <span className="bg-yellow-400 text-yellow-900 text-xs font-bold px-3 py-1 rounded-full animate-pulse">
+                              🆕 New!
+                            </span>
                           )}
                           {!isNewOrder && index === 0 && (
                             <span className="bg-green-100 text-green-600 text-xs font-bold px-3 py-1 rounded-full">Latest ✨</span>
@@ -881,28 +1009,42 @@ export default function Dashboard() {
                         <span className="text-xs text-gray-400">🕐 {toIST(order.created_at)}</span>
                       </div>
                       <div className="space-y-2">
-                        {order.items.map((item, i) => (
-                          <div key={i} className="py-2 border-b border-gray-50 last:border-0">
-                            <div className="flex justify-between text-sm text-gray-700">
-                              <span className="font-medium">{item.food_items?.name}</span>
-                              <span className="text-gray-500">× {item.quantity}</span>
+                        {order.items.map((item, i) => {
+                          const key = `${order.id}:${i}`
+                          const isRemoved = removedItems.has(key)
+                          return (
+                            <div key={i}
+                              className={`py-2 border-b border-gray-50 last:border-0 ${isRemoved ? 'opacity-40' : ''}`}>
+                              <div className="flex justify-between text-sm text-gray-700">
+                                <span className={`font-medium ${isRemoved ? 'line-through' : ''}`}>
+                                  {item.food_items?.name}
+                                </span>
+                                <span className="text-gray-500">× {item.quantity}</span>
+                              </div>
+                              {item.note && item.note.trim() !== '' && (
+                                <p className="text-xs text-orange-500 italic mt-1">📝 "{item.note}"</p>
+                              )}
                             </div>
-                            {item.note && item.note.trim() !== '' && (
-                              <p className="text-xs text-orange-500 italic mt-1">📝 "{item.note}"</p>
-                            )}
-                          </div>
-                        ))}
+                          )
+                        })}
                       </div>
                     </div>
                   )
                 })}
               </div>
 
+              {/* Subtotal bar */}
               <div className="bg-orange-500 rounded-2xl shadow p-5 text-white mb-4">
                 <div className="flex justify-between items-center mb-1">
                   <span className="font-bold text-lg">Subtotal</span>
-                  <span className="font-bold text-2xl">₹{tableSubtotal}</span>
+                  <span className="font-bold text-2xl">₹{displaySubtotal}</span>
                 </div>
+                {(removedItems.size > 0 || manualItems.length > 0) && (
+                  <p className="text-orange-100 text-xs mb-2">
+                    {removedItems.size > 0 ? `${removedItems.size} item(s) removed · ` : ''}
+                    {manualItems.length > 0 ? `${manualItems.length} item(s) added` : ''}
+                  </p>
+                )}
                 <p className="text-orange-100 text-xs mb-4">
                   * Charges, discount & payment method set when printing bill
                 </p>
@@ -912,6 +1054,7 @@ export default function Dashboard() {
                   🖨️ Print Bill & Clear Table
                 </button>
               </div>
+
             </div>
           )}
         </div>
