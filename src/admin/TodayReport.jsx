@@ -256,8 +256,8 @@ export default function TodayReport() {
 
     // Effective regular items (with remove toggle)
     const effectiveItems = (bill.order_items || [])
-      .map((item, idx) => ({ ...item, _itemKey: `item:${idx}` }))
-      .filter(item => !removedKeys.has(`item:${idx}`))
+  .map((item, idx) => ({ ...item, _itemKey: `item:${idx}` }))
+  .filter(item => !removedKeys.has(item._itemKey))  // ✅ use the property
 
     // Existing open items from DB (never removed individually in this flow)
     const existingOpenAsItems = (bill.open_items || []).map(oi => ({
