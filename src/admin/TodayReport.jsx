@@ -10,6 +10,8 @@ const formatDate = (d) => new Date(d).toLocaleDateString('en-IN', {
   timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric'
 })
 
+// ── KEY FIX: only take open_items from the FIRST order row ─
+// Never merge open_items across rows — that caused the 3× duplication
 const groupOrdersIntoBills = (orders) => {
   const map = {}
   orders.forEach(order => {
@@ -17,7 +19,8 @@ const groupOrdersIntoBills = (orders) => {
     const key = `${order.table_name_snapshot || ''}__${minuteKey}`
     if (!map[key]) {
       map[key] = {
-        _orderIds: [order.id], _key: key,
+        _orderIds: [order.id],
+        _key: key,
         payment_type: order.payment_type,
         settlement_status: order.settlement_status,
         paid_at: order.paid_at,
@@ -30,14 +33,13 @@ const groupOrdersIntoBills = (orders) => {
         discount_amt: order.discount_amt || 0,
         final_amount: order.final_amount || 0,
         order_items: [...(order.order_items || [])],
-        // ── KEY FIX: collect open items ──────────────
+        // ── Only from FIRST row — never merge across rows ──
         open_items: [...(order.open_items_json || [])],
       }
     } else {
       map[key]._orderIds.push(order.id)
       map[key].order_items = [...map[key].order_items, ...(order.order_items || [])]
-      // merge open items from all order rows
-      map[key].open_items = [...map[key].open_items, ...(order.open_items_json || [])]
+      // ── DO NOT merge open_items here — first row already has them ──
       if (order.settlement_status === 'pending') map[key].settlement_status = 'pending'
     }
   })
@@ -87,15 +89,19 @@ export default function TodayReport() {
   const [showCloseDay, setShowCloseDay] = useState(false)
   const [closingDay, setClosingDay] = useState(false)
   const [summary, setSummary] = useState(null)
-  const [restaurant, setRestaurant] = useState({ name: 'My Restaurant', address: '', phone: '', gst_number: '', footer_note: 'Thank you! Visit again!' })
+  const [restaurant, setRestaurant] = useState({
+    name: 'My Restaurant', address: '', phone: '', gst_number: '', footer_note: 'Thank you! Visit again!'
+  })
   const [allFoodItems, setAllFoodItems] = useState([])
 
   const [showSettleModal, setShowSettleModal] = useState(false)
   const [settleBill, setSettleBill] = useState(null)
   const [settleType, setSettleType] = useState('cash')
 
+  // ── Edit state ─────────────────────────────────────────
   const [editingBillKey, setEditingBillKey] = useState(null)
-  const [editRemovedItems, setEditRemovedItems] = useState(new Set())
+  const [editingBill, setEditingBill] = useState(null)  // ← store full bill object
+  const [editRemovedItemKeys, setEditRemovedItemKeys] = useState(new Set())
   const [editManualItems, setEditManualItems] = useState([])
   const [editMenuSearch, setEditMenuSearch] = useState('')
   const [showEditOpenForm, setShowEditOpenForm] = useState(false)
@@ -103,11 +109,13 @@ export default function TodayReport() {
   const [editOpenName, setEditOpenName] = useState('')
   const [editOpenPrice, setEditOpenPrice] = useState('')
   const [editOpenQty, setEditOpenQty] = useState(1)
+
+  // ── Reprint state ──────────────────────────────────────
   const [showReprintPreview, setShowReprintPreview] = useState(false)
-  const [reprintBill, setReprintBill] = useState(null)
   const [reprintServicePct, setReprintServicePct] = useState(0)
   const [reprintDiscount, setReprintDiscount] = useState({ type: 'percent', value: '', reason: '' })
   const [reprintDiscountError, setReprintDiscountError] = useState(false)
+  const [saving, setSaving] = useState(false)
 
   useEffect(() => { fetchTodayBills() }, [])
 
@@ -131,7 +139,7 @@ export default function TodayReport() {
     setLoading(true)
     const today = todayIST()
     const startISO = new Date(today + 'T00:00:00+05:30').toISOString()
-    const endISO = new Date(today + 'T23:59:59+05:30').toISOString()
+    const endISO   = new Date(today + 'T23:59:59+05:30').toISOString()
     const { data, error } = await supabase
       .from('orders')
       .select(`id, payment_type, is_paid, paid_at, settlement_status,
@@ -139,21 +147,24 @@ export default function TodayReport() {
         discount_type, discount_value, discount_amt,
         final_amount, table_name_snapshot, open_items_json,
         order_items(id, quantity, price_at_order, food_items(name))`)
-      .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
+      .eq('is_paid', true)
+      .gte('paid_at', startISO)
+      .lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
     if (error) console.error('fetchTodayBills:', error.message)
     const grouped = groupOrdersIntoBills(data || [])
     setBills(grouped)
     const settled = grouped.filter(b => b.settlement_status !== 'pending')
-    const pending = grouped.filter(b => b.settlement_status === 'pending')
+    const pending  = grouped.filter(b => b.settlement_status === 'pending')
     const totalRevenue = settled.reduce((s, b) => s + (b.final_amount || 0), 0)
     const cashRev = settled.filter(b => b.payment_type === 'cash').reduce((s, b) => s + (b.final_amount || 0), 0)
-    const upiRev = settled.filter(b => b.payment_type === 'upi').reduce((s, b) => s + (b.final_amount || 0), 0)
+    const upiRev  = settled.filter(b => b.payment_type === 'upi' ).reduce((s, b) => s + (b.final_amount || 0), 0)
     const cardRev = settled.filter(b => b.payment_type === 'card').reduce((s, b) => s + (b.final_amount || 0), 0)
     setSummary({ totalRevenue, cashRev, upiRev, cardRev, settled: settled.length, pending: pending.length, total: grouped.length })
     setLoading(false)
   }
 
+  // ── Settlement ─────────────────────────────────────────
   const openSettle = (bill) => { setSettleBill(bill); setSettleType('cash'); setShowSettleModal(true) }
 
   const confirmSettle = async () => {
@@ -168,9 +179,10 @@ export default function TodayReport() {
     const svc = settleBill.service_charge_amt || 0
     if (existing) {
       await supabase.from('daily_reports').update({
-        total_orders: existing.total_orders + 1, total_revenue: existing.total_revenue + amt,
+        total_orders: existing.total_orders + 1,
+        total_revenue: existing.total_revenue + amt,
         cash_revenue: existing.cash_revenue + (settleType === 'cash' ? amt : 0),
-        upi_revenue: existing.upi_revenue + (settleType === 'upi' ? amt : 0),
+        upi_revenue:  existing.upi_revenue  + (settleType === 'upi'  ? amt : 0),
         card_revenue: existing.card_revenue + (settleType === 'card' ? amt : 0),
         service_charge_total: existing.service_charge_total + svc,
         updated_at: new Date().toISOString()
@@ -179,7 +191,7 @@ export default function TodayReport() {
       await supabase.from('daily_reports').insert({
         report_date: today, total_orders: 1, total_revenue: amt,
         cash_revenue: settleType === 'cash' ? amt : 0,
-        upi_revenue: settleType === 'upi' ? amt : 0,
+        upi_revenue:  settleType === 'upi'  ? amt : 0,
         card_revenue: settleType === 'card' ? amt : 0,
         service_charge_total: svc
       })
@@ -187,20 +199,29 @@ export default function TodayReport() {
     setSettling(null); setShowSettleModal(false); fetchTodayBills()
   }
 
+  // ── Edit helpers ────────────────────────────────────────
   const openEdit = (bill) => {
     setEditingBillKey(bill._key)
-    setEditRemovedItems(new Set()); setEditManualItems([])
-    setEditMenuSearch(''); setShowEditOpenForm(false)
+    setEditingBill(bill)           // ← store the full bill
+    setEditRemovedItemKeys(new Set())
+    setEditManualItems([])
+    setEditMenuSearch('')
+    setShowEditOpenForm(false)
     setEditOpenName(''); setEditOpenPrice(''); setEditOpenQty(1)
   }
 
   const closeEdit = () => {
-    setEditingBillKey(null); setEditRemovedItems(new Set())
-    setEditManualItems([]); setShowEditOpenForm(false)
+    setEditingBillKey(null)
+    setEditingBill(null)
+    setEditRemovedItemKeys(new Set())
+    setEditManualItems([])
+    setShowEditOpenForm(false)
   }
 
   const toggleEditRemove = (key) => {
-    setEditRemovedItems(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n })
+    setEditRemovedItemKeys(prev => {
+      const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n
+    })
   }
 
   const addEditMenuItem = (fi) => {
@@ -228,187 +249,231 @@ export default function TodayReport() {
     setEditOpenName(''); setEditOpenPrice(''); setEditOpenQty(1); setShowEditOpenForm(false)
   }
 
-  // ── Compute edited totals — includes open_items from DB ─
-  const computeEditedTotals = (bill) => {
-    const effectiveItems = bill.order_items
-      .map((item, idx) => ({ ...item, _key: `${bill._orderIds[0]}:${idx}` }))
-      .filter(item => !editRemovedItems.has(item._key))
+  // ── Compute totals from editingBill + edits ─────────────
+  // This is the FIXED version — uses editingBill directly (not reprintBill)
+  const computeCurrentTotals = (bill, removedKeys, manualItems, svcPct, discType, discVal) => {
+    if (!bill) return null
 
-    // Also include existing open items from DB (not removed)
-    const existingOpenAsItems = (bill.open_items || []).map((oi, idx) => ({
-      food_items: { name: oi.name }, price_at_order: oi.price, quantity: oi.qty,
-      _key: `open_existing:${idx}`, _isExistingOpen: true
+    // Effective regular items (with remove toggle)
+    const effectiveItems = (bill.order_items || [])
+      .map((item, idx) => ({ ...item, _itemKey: `item:${idx}` }))
+      .filter(item => !removedKeys.has(`item:${idx}`))
+
+    // Existing open items from DB (never removed individually in this flow)
+    const existingOpenAsItems = (bill.open_items || []).map(oi => ({
+      food_items: { name: oi.name }, price_at_order: oi.price, quantity: oi.qty
     }))
 
-    const manualAsItems = editManualItems.map(mi => ({
+    // Newly added items (from menu or open form)
+    const newManualAsItems = manualItems.map(mi => ({
       food_items: { name: mi.name }, price_at_order: mi.price, quantity: mi.qty
     }))
 
-    const all = [...effectiveItems, ...existingOpenAsItems, ...manualAsItems]
-    const foodItems = all.filter(i => !isLiquorItem(i.food_items?.name))
-    const liquorItems = all.filter(i => isLiquorItem(i.food_items?.name))
-    const foodSubtotal = foodItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
+    const all = [...effectiveItems, ...existingOpenAsItems, ...newManualAsItems]
+    const foodItems   = all.filter(i => !isLiquorItem(i.food_items?.name))
+    const liquorItems = all.filter(i =>  isLiquorItem(i.food_items?.name))
+    const foodSubtotal   = foodItems.reduce((s, i)   => s + i.price_at_order * i.quantity, 0)
     const liquorSubtotal = liquorItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
     const subtotal = foodSubtotal + liquorSubtotal
-    const serviceChargeAmt = Math.round(subtotal * (bill.service_charge_pct || 0) / 100)
+    const serviceChargeAmt = Math.round(subtotal * (svcPct || 0) / 100)
     const afterService = subtotal + serviceChargeAmt
-    const discountAmt = bill.discount_type === 'percent'
-      ? Math.round(afterService * (bill.discount_value || 0) / 100)
-      : Math.min(bill.discount_amt || 0, afterService)
+    const dv = parseFloat(discVal) || 0
+    const discountAmt = discType === 'percent'
+      ? Math.round(afterService * dv / 100)
+      : Math.min(dv, afterService)
     const finalAmount = afterService - discountAmt
+
     return { foodItems, liquorItems, foodSubtotal, liquorSubtotal, subtotal, serviceChargeAmt, discountAmt, finalAmount }
   }
 
+  // ── For live "Updated Total" display in edit panel ──────
+  const editTotals = editingBill
+    ? computeCurrentTotals(
+        editingBill, editRemovedItemKeys, editManualItems,
+        editingBill.service_charge_pct, editingBill.discount_type,
+        editingBill.discount_value?.toString() || ''
+      )
+    : null
+
+  // ── Open reprint preview ────────────────────────────────
   const openReprintPreview = (bill) => {
-    setReprintBill(bill)
     setReprintServicePct(bill.service_charge_pct || 0)
-    setReprintDiscount({ type: bill.discount_type || 'percent', value: bill.discount_value?.toString() || '', reason: '' })
+    setReprintDiscount({
+      type: bill.discount_type || 'percent',
+      value: bill.discount_value?.toString() || '',
+      reason: ''
+    })
     setReprintDiscountError(false)
     setShowReprintPreview(true)
   }
 
-  const computeReprintTotals = () => {
-    if (!reprintBill) return null
-    const effectiveItems = reprintBill.order_items
-      .map((item, idx) => ({ ...item, _key: `edit:${idx}` }))
-      .filter(item => !editRemovedItems.has(`edit:${idx}`))
+  // ── Compute reprint totals (uses editingBill + edits) ───
+  const reprintTotals = showReprintPreview && editingBill
+    ? computeCurrentTotals(
+        editingBill, editRemovedItemKeys, editManualItems,
+        reprintServicePct, reprintDiscount.type, reprintDiscount.value
+      )
+    : null
 
-    // Include existing open items
-    const existingOpenAsItems = (reprintBill.open_items || []).map(oi => ({
-      food_items: { name: oi.name }, price_at_order: oi.price, quantity: oi.qty
-    }))
-
-    const manualAsItems = editManualItems.map(mi => ({
-      food_items: { name: mi.name }, price_at_order: mi.price, quantity: mi.qty
-    }))
-    const all = [...effectiveItems, ...existingOpenAsItems, ...manualAsItems]
-    const foodItems = all.filter(i => !isLiquorItem(i.food_items?.name))
-    const liquorItems = all.filter(i => isLiquorItem(i.food_items?.name))
-    const foodSubtotal = foodItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
-    const liquorSubtotal = liquorItems.reduce((s, i) => s + i.price_at_order * i.quantity, 0)
-    const subtotal = foodSubtotal + liquorSubtotal
-    const serviceChargeAmt = Math.round(subtotal * reprintServicePct / 100)
-    const afterService = subtotal + serviceChargeAmt
-    const dv = parseFloat(reprintDiscount.value) || 0
-    const discountAmt = reprintDiscount.type === 'percent'
-      ? Math.round(afterService * dv / 100) : Math.min(dv, afterService)
-    const finalAmount = afterService - discountAmt
-    return { foodItems, liquorItems, foodSubtotal, liquorSubtotal, subtotal, serviceChargeAmt, discountAmt, finalAmount }
-  }
-
+  // ── Save edits + reprint ────────────────────────────────
   const handleReprintAndSave = async () => {
     const dv = parseFloat(reprintDiscount.value) || 0
     if (dv > 0 && !reprintDiscount.reason.trim()) { setReprintDiscountError(true); return }
     setReprintDiscountError(false)
-    if (!reprintBill) return
-    const totals = computeReprintTotals()
-    if (!totals) return
-    const now = new Date()
 
-    const foodSection = totals.foodItems.length > 0 ? `
+    if (!editingBill || !reprintTotals) {
+      alert('Error: No bill selected. Please close and try again.')
+      return
+    }
+
+    setSaving(true)
+
+    try {
+      const totals = reprintTotals
+
+      // Build receipt HTML sections
+      const foodSection = totals.foodItems.length > 0 ? `
 <div class="section-title">FOOD</div>
-${totals.foodItems.map(i => `<div class="row"><span>${i.food_items?.name || i.name} x${i.quantity}</span><span>Rs.${i.price_at_order * i.quantity}</span></div>`).join('')}
+${totals.foodItems.map(i => `<div class="row"><span>${i.food_items?.name || 'Item'} x${i.quantity}</span><span>Rs.${i.price_at_order * i.quantity}</span></div>`).join('')}
 <div class="row bold"><span>Food Subtotal</span><span>Rs.${totals.foodSubtotal}</span></div>
 <div class="div"></div>` : ''
 
-    const liquorSection = totals.liquorItems.length > 0 ? `
+      const liquorSection = totals.liquorItems.length > 0 ? `
 <div class="section-title">LIQUOR</div>
-${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.name} x${i.quantity}</span><span>Rs.${i.price_at_order * i.quantity}</span></div>`).join('')}
+${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'Item'} x${i.quantity}</span><span>Rs.${i.price_at_order * i.quantity}</span></div>`).join('')}
 <div class="row bold"><span>Liquor Subtotal</span><span>Rs.${totals.liquorSubtotal}</span></div>
 <div class="div"></div>` : ''
 
-    const lines = {
-      restaurantName: restaurant.name, address: restaurant.address,
-      phone: restaurant.phone, gstNumber: restaurant.gst_number,
-      footerNote: restaurant.footer_note,
-      tableName: reprintBill.table_name_snapshot || '',
-      date: formatDate(reprintBill.paid_at), time: toIST(reprintBill.paid_at),
-      foodSection, liquorSection,
-      subtotal: totals.subtotal,
-      serviceChargePct: reprintServicePct, serviceChargeAmt: totals.serviceChargeAmt,
-      discountAmt: totals.discountAmt, finalAmount: totals.finalAmount,
-    }
-
-    const w = window.open('', '_blank', 'width=400,height=600')
-    w.document.write(buildHtmlReceipt(lines))
-    w.document.close(); w.focus(); w.print(); w.close()
-
-    // Build updated open items (original + newly added open items)
-    const newOpenItems = editManualItems.filter(m => m.isOpen).map(mi => ({
-      name: mi.name, price: mi.price, qty: mi.qty, dept: mi.dept, total: mi.price * mi.qty
-    }))
-    const updatedOpenItems = [...(reprintBill.open_items || []), ...newOpenItems]
-
-    for (const orderId of reprintBill._orderIds) {
-      await supabase.from('orders').update({
+      const lines = {
+        restaurantName: restaurant.name,
+        address: restaurant.address,
+        phone: restaurant.phone,
+        gstNumber: restaurant.gst_number,
+        footerNote: restaurant.footer_note,
+        tableName: editingBill.table_name_snapshot || '',
+        date: formatDate(editingBill.paid_at),
+        time: toIST(editingBill.paid_at),
+        foodSection, liquorSection,
         subtotal: totals.subtotal,
-        service_charge_pct: reprintServicePct, service_charge_amt: totals.serviceChargeAmt,
-        discount_type: reprintDiscount.type, discount_value: dv,
-        discount_amt: totals.discountAmt, discount_reason: reprintDiscount.reason.trim(),
-        final_amount: totals.finalAmount,
-        open_items_json: updatedOpenItems  // ── save updated open items
-      }).eq('id', orderId)
-    }
+        serviceChargePct: reprintServicePct,
+        serviceChargeAmt: totals.serviceChargeAmt,
+        discountAmt: totals.discountAmt,
+        finalAmount: totals.finalAmount,
+      }
 
-    if (editManualItems.filter(m => m.foodItemId).length > 0) {
-      const rows = editManualItems.filter(m => m.foodItemId).map(mi => ({
-        order_id: reprintBill._orderIds[0],
-        food_item_id: mi.foodItemId,
-        quantity: mi.qty,
-        price_at_order: mi.price,
-        note: "Added at Today's Report"
-      }))
-      await supabase.from('order_items').insert(rows)
-    }
+      // Print
+      const w = window.open('', '_blank', 'width=400,height=600')
+      if (w) {
+        w.document.write(buildHtmlReceipt(lines))
+        w.document.close()
+        w.focus()
+        setTimeout(() => { w.print(); w.close() }, 300)
+      }
 
-    closeEdit(); setShowReprintPreview(false); setReprintBill(null)
-    fetchTodayBills()
-    alert('✅ Bill updated and reprinted!')
+      // Build new open items = original open items + any newly added open items
+      const newOpenItems = editManualItems
+        .filter(m => m.isOpen)
+        .map(mi => ({ name: mi.name, price: mi.price, qty: mi.qty, dept: mi.dept, total: mi.price * mi.qty }))
+      const updatedOpenItems = [...(editingBill.open_items || []), ...newOpenItems]
+
+      // Update ALL order rows in this bill session
+      for (const orderId of editingBill._orderIds) {
+        const { error } = await supabase.from('orders').update({
+          subtotal: totals.subtotal,
+          service_charge_pct: reprintServicePct,
+          service_charge_amt: totals.serviceChargeAmt,
+          discount_type: reprintDiscount.type,
+          discount_value: dv,
+          discount_amt: totals.discountAmt,
+          discount_reason: reprintDiscount.reason.trim(),
+          final_amount: totals.finalAmount,
+          open_items_json: updatedOpenItems,
+        }).eq('id', orderId)
+        if (error) console.error('update error:', error.message)
+      }
+
+      // Insert new menu items as order_items
+      const newMenuItems = editManualItems.filter(m => m.foodItemId)
+      if (newMenuItems.length > 0) {
+        const rows = newMenuItems.map(mi => ({
+          order_id: editingBill._orderIds[0],
+          food_item_id: mi.foodItemId,
+          quantity: mi.qty,
+          price_at_order: mi.price,
+          note: "Added at Today's Report"
+        }))
+        const { error } = await supabase.from('order_items').insert(rows)
+        if (error) console.error('insert order_items error:', error.message)
+      }
+
+      closeEdit()
+      setShowReprintPreview(false)
+      fetchTodayBills()
+      alert('✅ Bill updated and reprinted!')
+
+    } catch (err) {
+      console.error('handleReprintAndSave error:', err)
+      alert('❌ Error saving bill: ' + err.message)
+    } finally {
+      setSaving(false)
+    }
   }
 
   const closeDay = async () => {
     const pendingBills = bills.filter(b => b.settlement_status === 'pending')
-    if (pendingBills.length > 0) { alert(`⚠️ ${pendingBills.length} bills are still unsettled.`); setShowCloseDay(false); return }
+    if (pendingBills.length > 0) {
+      alert(`⚠️ ${pendingBills.length} bills are still unsettled.`)
+      setShowCloseDay(false); return
+    }
     setClosingDay(true)
     const today = todayIST()
     const startISO = new Date(today + 'T00:00:00+05:30').toISOString()
-    const endISO = new Date(today + 'T23:59:59+05:30').toISOString()
+    const endISO   = new Date(today + 'T23:59:59+05:30').toISOString()
     await supabase.from('orders').update({ settlement_status: 'day_closed' })
       .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
     setClosingDay(false); setShowCloseDay(false)
     alert('✅ Day closed!'); fetchTodayBills()
   }
 
-  const pendingBills = bills.filter(b => b.settlement_status === 'pending')
-  const settledBills = bills.filter(b => b.settlement_status === 'settled' || b.settlement_status === 'day_closed')
+  const pendingBills  = bills.filter(b => b.settlement_status === 'pending')
+  const settledBills  = bills.filter(b => b.settlement_status === 'settled' || b.settlement_status === 'day_closed')
+  const filteredEditMenuItems = allFoodItems.filter(f => f.name.toLowerCase().includes(editMenuSearch.toLowerCase()))
+  const reprintDv = parseFloat(reprintDiscount.value) || 0
 
   const PayBadge = ({ type }) => {
-    if (!type || type === 'pending') return <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-yellow-100 text-yellow-700">⏳ Pending</span>
-    return <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${type === 'cash' ? 'bg-green-100 text-green-600' : type === 'upi' ? 'bg-blue-100 text-blue-600' : 'bg-purple-100 text-purple-600'}`}>
-      {type === 'cash' ? '💵 Cash' : type === 'upi' ? '📱 UPI' : '💳 Card'}
-    </span>
+    if (!type || type === 'pending') return (
+      <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-yellow-100 text-yellow-700">⏳ Pending</span>
+    )
+    return (
+      <span className={`text-xs px-2 py-0.5 rounded-full font-medium
+        ${type === 'cash' ? 'bg-green-100 text-green-600' : type === 'upi' ? 'bg-blue-100 text-blue-600' : 'bg-purple-100 text-purple-600'}`}>
+        {type === 'cash' ? '💵 Cash' : type === 'upi' ? '📱 UPI' : '💳 Card'}
+      </span>
+    )
   }
-
-  const filteredEditMenuItems = allFoodItems.filter(f => f.name.toLowerCase().includes(editMenuSearch.toLowerCase()))
-  const reprintTotals = showReprintPreview ? computeReprintTotals() : null
-  const reprintDv = parseFloat(reprintDiscount.value) || 0
 
   return (
     <div className="min-h-screen bg-gray-50">
 
-      {/* Settlement Modal */}
+      {/* ── Settlement Modal ──────────────────────────── */}
       {showSettleModal && settleBill && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-2xl">
             <h2 className="text-xl font-bold text-gray-800 mb-1">💰 Settle Bill</h2>
             <p className="text-sm text-gray-400 mb-4">{settleBill.table_name_snapshot || 'Table'}</p>
             <div className="bg-gray-50 rounded-xl p-4 mb-4 space-y-2">
-              <div className="flex justify-between text-sm text-gray-500"><span>Subtotal</span><span>₹{settleBill.subtotal}</span></div>
+              <div className="flex justify-between text-sm text-gray-500">
+                <span>Subtotal</span><span>₹{settleBill.subtotal}</span>
+              </div>
               {settleBill.service_charge_amt > 0 && (
-                <div className="flex justify-between text-sm text-gray-500"><span>Service ({settleBill.service_charge_pct}%)</span><span>+₹{settleBill.service_charge_amt}</span></div>
+                <div className="flex justify-between text-sm text-gray-500">
+                  <span>Service ({settleBill.service_charge_pct}%)</span><span>+₹{settleBill.service_charge_amt}</span>
+                </div>
               )}
               {settleBill.discount_amt > 0 && (
-                <div className="flex justify-between text-sm text-green-600"><span>Discount</span><span>-₹{settleBill.discount_amt}</span></div>
+                <div className="flex justify-between text-sm text-green-600">
+                  <span>Discount</span><span>-₹{settleBill.discount_amt}</span>
+                </div>
               )}
               <div className="border-t pt-2 flex justify-between font-bold text-gray-800">
                 <span>Amount to Collect</span>
@@ -419,13 +484,15 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
             <div className="grid grid-cols-3 gap-2 mb-4">
               {[{ id: 'cash', label: '💵 Cash' }, { id: 'upi', label: '📱 UPI' }, { id: 'card', label: '💳 Card' }].map(p => (
                 <button key={p.id} onClick={() => setSettleType(p.id)}
-                  className={`py-3 rounded-xl text-sm font-semibold border-2 transition ${settleType === p.id ? 'border-orange-500 bg-orange-50 text-orange-600' : 'border-gray-200 text-gray-500 hover:border-orange-300'}`}>
+                  className={`py-3 rounded-xl text-sm font-semibold border-2 transition
+                    ${settleType === p.id ? 'border-orange-500 bg-orange-50 text-orange-600' : 'border-gray-200 text-gray-500 hover:border-orange-300'}`}>
                   {p.label}
                 </button>
               ))}
             </div>
             <div className="flex gap-3">
-              <button onClick={() => setShowSettleModal(false)} className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
+              <button onClick={() => setShowSettleModal(false)}
+                className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
               <button onClick={confirmSettle} disabled={!!settling}
                 className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold hover:bg-orange-600 disabled:opacity-50">
                 {settling ? '⏳...' : '✅ Confirm'}
@@ -435,17 +502,19 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
         </div>
       )}
 
-      {/* Reprint Preview Modal */}
-      {showReprintPreview && reprintBill && reprintTotals && (
+      {/* ── Reprint Preview Modal ─────────────────────── */}
+      {showReprintPreview && editingBill && reprintTotals && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl max-h-[92vh] flex flex-col">
             <div className="p-4 border-b flex justify-between items-center">
               <div>
                 <h2 className="font-bold text-gray-800">🖨️ Reprint Preview</h2>
-                <p className="text-xs text-gray-400">{reprintBill.table_name_snapshot} · {toIST(reprintBill.paid_at)}</p>
+                <p className="text-xs text-gray-400">{editingBill.table_name_snapshot} · {toIST(editingBill.paid_at)}</p>
               </div>
-              <button onClick={() => setShowReprintPreview(false)} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-sm">✕</button>
+              <button onClick={() => setShowReprintPreview(false)}
+                className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-sm">✕</button>
             </div>
+
             <div className="flex-1 overflow-y-auto p-4 space-y-3">
               {reprintTotals.foodItems.length > 0 && (
                 <div>
@@ -456,7 +525,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                   {reprintTotals.foodItems.map((item, i) => (
                     <div key={i} className="flex justify-between text-sm py-1">
                       <div className="flex items-center gap-2">
-                        <span className="text-gray-700">{item.food_items?.name || item.name}</span>
+                        <span className="text-gray-700">{item.food_items?.name}</span>
                         <span className="bg-orange-100 text-orange-600 text-xs px-1.5 py-0.5 rounded-full">×{item.quantity}</span>
                       </div>
                       <span className="text-gray-700 font-medium">₹{item.price_at_order * item.quantity}</span>
@@ -467,6 +536,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                   </div>
                 </div>
               )}
+
               {reprintTotals.liquorItems.length > 0 && (
                 <div>
                   <div className="flex items-center gap-2 mb-2">
@@ -476,7 +546,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                   {reprintTotals.liquorItems.map((item, i) => (
                     <div key={i} className="flex justify-between text-sm py-1">
                       <div className="flex items-center gap-2">
-                        <span className="text-gray-700">{item.food_items?.name || item.name}</span>
+                        <span className="text-gray-700">{item.food_items?.name}</span>
                         <span className="bg-blue-100 text-blue-600 text-xs px-1.5 py-0.5 rounded-full">×{item.quantity}</span>
                       </div>
                       <span className="text-gray-700 font-medium">₹{item.price_at_order * item.quantity}</span>
@@ -487,28 +557,37 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                   </div>
                 </div>
               )}
+
+              {/* Charges */}
               <div className="bg-gray-50 rounded-xl p-3 space-y-3">
-                <p className="text-xs font-bold text-gray-500 uppercase">Charges</p>
+                <p className="text-xs font-bold text-gray-500 uppercase">Adjust Charges</p>
                 <div className="flex justify-between items-center text-sm text-gray-600">
                   <span>Service Charge</span>
                   <div className="flex items-center gap-2">
-                    <select value={reprintServicePct} onChange={e => setReprintServicePct(Number(e.target.value))} className="border rounded px-2 py-0.5 text-xs">
+                    <select value={reprintServicePct} onChange={e => setReprintServicePct(Number(e.target.value))}
+                      className="border rounded px-2 py-0.5 text-xs">
                       <option value={0}>0%</option><option value={5}>5%</option>
                       <option value={10}>10%</option><option value={12}>12%</option><option value={18}>18%</option>
                     </select>
-                    {reprintTotals.serviceChargeAmt > 0 && <span className="text-xs font-medium text-gray-700">+₹{reprintTotals.serviceChargeAmt}</span>}
+                    {reprintTotals.serviceChargeAmt > 0 && (
+                      <span className="text-xs font-medium text-gray-700">+₹{reprintTotals.serviceChargeAmt}</span>
+                    )}
                   </div>
                 </div>
                 <div className="flex justify-between items-center text-sm text-gray-600">
                   <span>Discount</span>
                   <div className="flex items-center gap-2">
-                    <select value={reprintDiscount.type} onChange={e => setReprintDiscount(p => ({ ...p, type: e.target.value, value: '' }))} className="border rounded px-2 py-0.5 text-xs">
+                    <select value={reprintDiscount.type}
+                      onChange={e => setReprintDiscount(p => ({ ...p, type: e.target.value, value: '' }))}
+                      className="border rounded px-2 py-0.5 text-xs">
                       <option value="percent">%</option><option value="flat">₹ flat</option>
                     </select>
                     <input type="number" min="0" value={reprintDiscount.value}
                       onChange={e => { setReprintDiscount(p => ({ ...p, value: e.target.value })); setReprintDiscountError(false) }}
                       placeholder="0" className="border rounded px-2 py-0.5 text-xs w-16 text-right" />
-                    {reprintTotals.discountAmt > 0 && <span className="text-green-600 text-xs font-medium">-₹{reprintTotals.discountAmt}</span>}
+                    {reprintTotals.discountAmt > 0 && (
+                      <span className="text-green-600 text-xs font-medium">-₹{reprintTotals.discountAmt}</span>
+                    )}
                   </div>
                 </div>
                 {reprintDv > 0 && (
@@ -517,15 +596,28 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                     <input type="text" value={reprintDiscount.reason}
                       onChange={e => { setReprintDiscount(p => ({ ...p, reason: e.target.value })); setReprintDiscountError(false) }}
                       placeholder="Reason..."
-                      className={`w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-orange-400 ${reprintDiscountError ? 'border-red-500 bg-red-50' : 'border-gray-300'}`} />
+                      className={`w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-orange-400
+                        ${reprintDiscountError ? 'border-red-500 bg-red-50' : 'border-gray-300'}`} />
                     {reprintDiscountError && <p className="text-red-500 text-xs mt-1">⚠️ Reason required</p>}
                   </div>
                 )}
               </div>
+
+              {/* Totals */}
               <div className="bg-gray-50 rounded-xl p-3">
-                <div className="flex justify-between text-xs text-gray-500 mb-1"><span>Subtotal</span><span>₹{reprintTotals.subtotal}</span></div>
-                {reprintTotals.serviceChargeAmt > 0 && <div className="flex justify-between text-xs text-gray-500 mb-1"><span>Service ({reprintServicePct}%)</span><span>+₹{reprintTotals.serviceChargeAmt}</span></div>}
-                {reprintTotals.discountAmt > 0 && <div className="flex justify-between text-xs text-green-600 mb-1"><span>Discount</span><span>-₹{reprintTotals.discountAmt}</span></div>}
+                <div className="flex justify-between text-xs text-gray-500 mb-1">
+                  <span>Subtotal</span><span>₹{reprintTotals.subtotal}</span>
+                </div>
+                {reprintTotals.serviceChargeAmt > 0 && (
+                  <div className="flex justify-between text-xs text-gray-500 mb-1">
+                    <span>Service ({reprintServicePct}%)</span><span>+₹{reprintTotals.serviceChargeAmt}</span>
+                  </div>
+                )}
+                {reprintTotals.discountAmt > 0 && (
+                  <div className="flex justify-between text-xs text-green-600 mb-1">
+                    <span>Discount</span><span>-₹{reprintTotals.discountAmt}</span>
+                  </div>
+                )}
                 <div className="border-t border-dashed my-1" />
                 <div className="flex justify-between font-bold text-gray-800 text-base">
                   <span>Final Total</span>
@@ -533,15 +625,22 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                 </div>
               </div>
             </div>
+
             <div className="p-4 border-t space-y-2">
-              <button onClick={handleReprintAndSave} className="w-full bg-green-500 text-white py-3 rounded-xl font-bold hover:bg-green-600">🖨️ Save Changes & Reprint</button>
-              <button onClick={() => setShowReprintPreview(false)} className="w-full bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium">← Back to Edit</button>
+              <button onClick={handleReprintAndSave} disabled={saving}
+                className="w-full bg-green-500 text-white py-3 rounded-xl font-bold hover:bg-green-600 disabled:opacity-50">
+                {saving ? '⏳ Saving...' : '🖨️ Save Changes & Reprint'}
+              </button>
+              <button onClick={() => setShowReprintPreview(false)}
+                className="w-full bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium">
+                ← Back to Edit
+              </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Close Day Modal */}
+      {/* ── Close Day Modal ───────────────────────────── */}
       {showCloseDay && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl">
@@ -562,7 +661,8 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
               </div>
             )}
             <div className="flex gap-3">
-              <button onClick={() => setShowCloseDay(false)} className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
+              <button onClick={() => setShowCloseDay(false)}
+                className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
               <button onClick={closeDay} disabled={closingDay || pendingBills.length > 0}
                 className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold disabled:opacity-50">
                 {closingDay ? '⏳ Closing...' : '🌙 Close Day'}
@@ -572,7 +672,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
         </div>
       )}
 
-      {/* Navbar */}
+      {/* ── Navbar ────────────────────────────────────── */}
       <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30">
         <div className="flex items-center gap-3">
           <span className="text-xl">📋</span>
@@ -584,13 +684,24 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
           </div>
         </div>
         <div className="flex gap-2 flex-wrap justify-end">
-          <button onClick={() => setShowCloseDay(true)} className="bg-orange-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-600">🌙 Close Day</button>
-          <button onClick={() => navigate('/admin/reports')} className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">📊 Reports</button>
-          <button onClick={() => navigate('/admin/dashboard')} className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">← Dashboard</button>
+          <button onClick={() => setShowCloseDay(true)}
+            className="bg-orange-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-600">
+            🌙 Close Day
+          </button>
+          <button onClick={() => navigate('/admin/reports')}
+            className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">
+            📊 Reports
+          </button>
+          <button onClick={() => navigate('/admin/dashboard')}
+            className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">
+            ← Dashboard
+          </button>
         </div>
       </div>
 
       <div className="p-4 md:p-6 max-w-3xl mx-auto">
+
+        {/* Summary Cards */}
         {summary && summary.total > 0 && (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
             <div className="bg-white border border-gray-200 rounded-2xl p-4">
@@ -614,6 +725,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
         )}
 
         {loading && <div className="text-center py-12 text-gray-400">Loading...</div>}
+
         {!loading && bills.length === 0 && (
           <div className="text-center py-16 text-gray-400">
             <div className="text-5xl mb-3">📭</div>
@@ -621,14 +733,13 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
           </div>
         )}
 
-        {/* Pending Bills */}
+        {/* ── Pending Bills ─────────────────────────── */}
         {!loading && pendingBills.length > 0 && (
           <div className="mb-6">
             <h2 className="text-base font-bold text-red-500 mb-3">⏳ Unsettled Bills ({pendingBills.length})</h2>
             <div className="space-y-4">
               {pendingBills.map(bill => {
                 const isEditing = editingBillKey === bill._key
-                const editTotals = isEditing ? computeEditedTotals(bill) : null
 
                 return (
                   <div key={bill._key} className="bg-white border-2 border-yellow-300 rounded-2xl shadow-sm overflow-hidden">
@@ -640,34 +751,36 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                         </div>
                         <div className="text-right">
                           <p className="text-xl font-bold text-orange-500">
-                            ₹{isEditing && editTotals ? editTotals.finalAmount : bill.final_amount}
+                            {isEditing && editTotals ? `₹${editTotals.finalAmount}` : `₹${bill.final_amount}`}
                           </p>
                           <PayBadge type={bill.payment_type} />
                         </div>
                       </div>
 
-                      {/* Regular order items */}
+                      {/* Items list */}
                       <div className="space-y-1 mb-2">
                         {bill.order_items?.map((item, i) => {
-                          const key = `${bill._orderIds[0]}:${i}`
-                          const isRemoved = isEditing && editRemovedItems.has(key)
+                          const key = `item:${i}`
+                          const isRemoved = isEditing && editRemovedItemKeys.has(key)
                           return (
-                            <div key={i} className={`flex justify-between text-xs ${isRemoved ? 'line-through opacity-40 text-red-400' : 'text-gray-500'}`}>
+                            <div key={i} className={`flex justify-between text-xs
+                              ${isRemoved ? 'line-through opacity-40 text-red-400' : 'text-gray-500'}`}>
                               <span>{item.food_items?.name} × {item.quantity}</span>
                               <span>₹{item.price_at_order * item.quantity}</span>
                             </div>
                           )
                         })}
-                        {/* ── KEY FIX: show open items from DB ─── */}
+                        {/* Open items from DB */}
                         {(bill.open_items || []).map((oi, i) => (
                           <div key={`open-${i}`} className="flex justify-between text-xs text-purple-600">
                             <span>
                               {oi.dept === 'Food' ? '🍽' : oi.dept === 'Beverage' ? '🥤' : '🍺'} {oi.name} × {oi.qty}
-                              <span className="ml-1 text-xs opacity-60">(open)</span>
+                              <span className="ml-1 opacity-60">(open)</span>
                             </span>
                             <span>₹{oi.price * oi.qty}</span>
                           </div>
                         ))}
+                        {/* Newly added in edit mode */}
                         {isEditing && editManualItems.map(mi => (
                           <div key={mi.tempId} className="flex justify-between text-xs text-green-600 font-medium">
                             <span>+ {mi.name} × {mi.qty}</span>
@@ -676,6 +789,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                         ))}
                       </div>
 
+                      {/* Charges summary (when not editing) */}
                       {(bill.service_charge_amt > 0 || bill.discount_amt > 0) && !isEditing && (
                         <div className="border-t pt-2 space-y-0.5 mb-3">
                           {bill.service_charge_amt > 0 && (
@@ -691,6 +805,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                         </div>
                       )}
 
+                      {/* Action buttons */}
                       {!isEditing && (
                         <div className="flex gap-2 mt-2">
                           <button onClick={() => openSettle(bill)}
@@ -705,13 +820,16 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                       )}
                     </div>
 
-                    {/* Edit Panel */}
+                    {/* ── Edit Panel ─────────────────── */}
                     {isEditing && (
                       <div className="border-t bg-blue-50">
+                        {/* Notice */}
                         <div className="px-4 pt-3 pb-2">
                           <div className="bg-blue-100 border border-blue-200 rounded-xl px-3 py-2 flex items-center gap-2">
                             <span>✏️</span>
-                            <p className="text-xs text-blue-700 font-medium">2nd & Last Chance — After reprinting, bill will be locked on settlement.</p>
+                            <p className="text-xs text-blue-700 font-medium">
+                              2nd & Last Chance — After reprinting, bill will be locked on settlement.
+                            </p>
                           </div>
                         </div>
 
@@ -721,17 +839,23 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                             <p className="text-xs font-bold text-gray-500 uppercase mb-2">🗑 Remove Items</p>
                             <div className="space-y-1.5">
                               {bill.order_items.map((item, i) => {
-                                const key = `${bill._orderIds[0]}:${i}`
-                                const isRemoved = editRemovedItems.has(key)
+                                const key = `item:${i}`
+                                const isRemoved = editRemovedItemKeys.has(key)
                                 return (
-                                  <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-xl border ${isRemoved ? 'bg-red-50 border-red-100 opacity-60' : 'bg-white border-gray-100'}`}>
+                                  <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-xl border
+                                    ${isRemoved ? 'bg-red-50 border-red-100 opacity-60' : 'bg-white border-gray-100'}`}>
                                     <div className="flex items-center gap-2">
-                                      <span className={`text-sm text-gray-700 ${isRemoved ? 'line-through' : ''}`}>{item.food_items?.name}</span>
+                                      <span className={`text-sm text-gray-700 ${isRemoved ? 'line-through' : ''}`}>
+                                        {item.food_items?.name}
+                                      </span>
                                       <span className="text-xs text-gray-400">×{item.quantity}</span>
-                                      <span className="text-xs font-medium text-orange-500">₹{item.price_at_order * item.quantity}</span>
+                                      <span className="text-xs font-medium text-orange-500">
+                                        ₹{item.price_at_order * item.quantity}
+                                      </span>
                                     </div>
                                     <button onClick={() => toggleEditRemove(key)}
-                                      className={`text-xs px-3 py-1 rounded-full font-medium ${isRemoved ? 'bg-green-100 text-green-600 hover:bg-green-200' : 'bg-red-100 text-red-500 hover:bg-red-200'}`}>
+                                      className={`text-xs px-3 py-1 rounded-full font-medium
+                                        ${isRemoved ? 'bg-green-100 text-green-600 hover:bg-green-200' : 'bg-red-100 text-red-500 hover:bg-red-200'}`}>
                                       {isRemoved ? '↩ Restore' : '✕ Remove'}
                                     </button>
                                   </div>
@@ -741,25 +865,29 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                           </div>
                         )}
 
-                        {/* Add from menu */}
+                        {/* Add from Menu */}
                         <div className="px-4 py-3 border-b border-blue-100">
                           <p className="text-xs font-bold text-gray-500 uppercase mb-2">➕ Add from Menu</p>
-                          <input type="text" value={editMenuSearch} onChange={e => setEditMenuSearch(e.target.value)}
+                          <input type="text" value={editMenuSearch}
+                            onChange={e => setEditMenuSearch(e.target.value)}
                             placeholder="🔍 Search menu..."
                             className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm mb-2 focus:outline-none focus:ring-2 focus:ring-orange-400" />
                           {editManualItems.filter(m => m.foodItemId).length > 0 && (
                             <div className="mb-2 space-y-1">
                               <p className="text-xs text-green-600 font-medium">✅ Added:</p>
                               {editManualItems.filter(m => m.foodItemId).map(mi => (
-                                <div key={mi.tempId} className="flex items-center justify-between bg-green-50 border border-green-100 rounded-lg px-3 py-2">
+                                <div key={mi.tempId}
+                                  className="flex items-center justify-between bg-green-50 border border-green-100 rounded-lg px-3 py-2">
                                   <div>
                                     <p className="text-sm font-medium text-gray-700">{mi.name}</p>
                                     <p className="text-xs text-gray-400">₹{mi.price} × {mi.qty} = ₹{mi.price * mi.qty}</p>
                                   </div>
                                   <div className="flex items-center gap-2">
-                                    <button onClick={() => changeEditMenuQty(mi.foodItemId, -1)} className="w-7 h-7 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center">−</button>
+                                    <button onClick={() => changeEditMenuQty(mi.foodItemId, -1)}
+                                      className="w-7 h-7 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center">−</button>
                                     <span className="font-bold text-gray-700 w-4 text-center">{mi.qty}</span>
-                                    <button onClick={() => changeEditMenuQty(mi.foodItemId, 1)} className="w-7 h-7 rounded-full bg-green-100 text-green-600 font-bold flex items-center justify-center">+</button>
+                                    <button onClick={() => changeEditMenuQty(mi.foodItemId, 1)}
+                                      className="w-7 h-7 rounded-full bg-green-100 text-green-600 font-bold flex items-center justify-center">+</button>
                                   </div>
                                 </div>
                               ))}
@@ -774,7 +902,8 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                                   <span className="text-sm text-gray-700">{fi.name}</span>
                                   <div className="flex items-center gap-2">
                                     <span className="text-xs text-orange-500 font-bold">₹{fi.price}</span>
-                                    {added ? <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full">×{added.qty}</span>
+                                    {added
+                                      ? <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full">×{added.qty}</span>
                                       : <span className="text-xs bg-orange-100 text-orange-600 px-2 py-0.5 rounded-full">+ Add</span>}
                                   </div>
                                 </button>
@@ -797,7 +926,8 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                               <div className="flex gap-2">
                                 {[{ id: 'Food', icon: '🍽' }, { id: 'Beverage', icon: '🥤' }, { id: 'Liquor', icon: '🍺' }].map(d => (
                                   <button key={d.id} onClick={() => setEditOpenDept(d.id)}
-                                    className={`flex-1 py-2 rounded-xl text-xs font-bold border-2 transition ${editOpenDept === d.id ? 'bg-orange-500 text-white border-transparent' : 'bg-white border-gray-200 text-gray-500'}`}>
+                                    className={`flex-1 py-2 rounded-xl text-xs font-bold border-2 transition
+                                      ${editOpenDept === d.id ? 'bg-orange-500 text-white border-transparent' : 'bg-white border-gray-200 text-gray-500'}`}>
                                     {d.icon} {d.id}
                                   </button>
                                 ))}
@@ -810,18 +940,24 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                                   placeholder="Price ₹ *"
                                   className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
                                 <div className="flex items-center gap-2">
-                                  <button onClick={() => setEditOpenQty(q => Math.max(1, q - 1))} className="w-8 h-8 rounded-full bg-gray-200 font-bold flex items-center justify-center">−</button>
+                                  <button onClick={() => setEditOpenQty(q => Math.max(1, q - 1))}
+                                    className="w-8 h-8 rounded-full bg-gray-200 font-bold flex items-center justify-center">−</button>
                                   <span className="font-bold text-gray-700 w-4 text-center">{editOpenQty}</span>
-                                  <button onClick={() => setEditOpenQty(q => q + 1)} className="w-8 h-8 rounded-full bg-orange-100 text-orange-600 font-bold flex items-center justify-center">+</button>
+                                  <button onClick={() => setEditOpenQty(q => q + 1)}
+                                    className="w-8 h-8 rounded-full bg-orange-100 text-orange-600 font-bold flex items-center justify-center">+</button>
                                 </div>
                               </div>
-                              <button onClick={addEditOpenItem} className="w-full bg-orange-500 text-white py-2 rounded-xl font-bold hover:bg-orange-600">✅ Add to Bill</button>
+                              <button onClick={addEditOpenItem}
+                                className="w-full bg-orange-500 text-white py-2 rounded-xl font-bold hover:bg-orange-600">
+                                ✅ Add to Bill
+                              </button>
                             </div>
                           )}
                           {editManualItems.filter(m => m.isOpen).length > 0 && (
                             <div className="mt-2 space-y-1">
                               {editManualItems.filter(m => m.isOpen).map(mi => (
-                                <div key={mi.tempId} className="flex items-center justify-between bg-purple-50 border border-purple-100 rounded-lg px-3 py-2">
+                                <div key={mi.tempId}
+                                  className="flex items-center justify-between bg-purple-50 border border-purple-100 rounded-lg px-3 py-2">
                                   <div>
                                     <p className="text-sm font-medium text-gray-700">{mi.name}</p>
                                     <p className="text-xs text-gray-400">₹{mi.price} × {mi.qty} = ₹{mi.price * mi.qty}</p>
@@ -834,6 +970,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                           )}
                         </div>
 
+                        {/* Edit footer */}
                         <div className="px-4 py-3 space-y-2">
                           {editTotals && (
                             <div className="bg-white rounded-xl px-4 py-3 flex justify-between items-center border border-gray-100 mb-2">
@@ -845,7 +982,10 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                             className="w-full bg-green-500 text-white py-2.5 rounded-xl font-bold hover:bg-green-600">
                             🖨️ Preview & Reprint
                           </button>
-                          <button onClick={closeEdit} className="w-full bg-gray-100 text-gray-600 py-2 rounded-xl text-sm font-medium">Cancel Edits</button>
+                          <button onClick={closeEdit}
+                            className="w-full bg-gray-100 text-gray-600 py-2 rounded-xl text-sm font-medium">
+                            Cancel Edits
+                          </button>
                         </div>
                       </div>
                     )}
@@ -856,7 +996,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
           </div>
         )}
 
-        {/* Settled Bills */}
+        {/* ── Settled Bills ─────────────────────────── */}
         {!loading && settledBills.length > 0 && (
           <div>
             <h2 className="text-base font-bold text-green-600 mb-3">
@@ -883,10 +1023,12 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                         <span>₹{item.price_at_order * item.quantity}</span>
                       </div>
                     ))}
-                    {/* ── Show open items in settled bills too ── */}
                     {(bill.open_items || []).map((oi, i) => (
                       <div key={`open-${i}`} className="flex justify-between text-xs text-purple-400">
-                        <span>{oi.dept === 'Food' ? '🍽' : oi.dept === 'Beverage' ? '🥤' : '🍺'} {oi.name} × {oi.qty} <span className="opacity-60">(open)</span></span>
+                        <span>
+                          {oi.dept === 'Food' ? '🍽' : oi.dept === 'Beverage' ? '🥤' : '🍺'} {oi.name} × {oi.qty}
+                          <span className="opacity-60 ml-1">(open)</span>
+                        </span>
                         <span>₹{oi.price * oi.qty}</span>
                       </div>
                     ))}
@@ -894,14 +1036,20 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || i.
                   {(bill.service_charge_amt > 0 || bill.discount_amt > 0) && (
                     <div className="border-t mt-2 pt-2 space-y-0.5">
                       {bill.service_charge_amt > 0 && (
-                        <div className="flex justify-between text-xs text-gray-400"><span>Service ({bill.service_charge_pct}%)</span><span>+₹{bill.service_charge_amt}</span></div>
+                        <div className="flex justify-between text-xs text-gray-400">
+                          <span>Service ({bill.service_charge_pct}%)</span><span>+₹{bill.service_charge_amt}</span>
+                        </div>
                       )}
                       {bill.discount_amt > 0 && (
-                        <div className="flex justify-between text-xs text-green-600"><span>Discount</span><span>-₹{bill.discount_amt}</span></div>
+                        <div className="flex justify-between text-xs text-green-600">
+                          <span>Discount</span><span>-₹{bill.discount_amt}</span>
+                        </div>
                       )}
                     </div>
                   )}
-                  <div className="mt-2 flex items-center gap-1 text-xs text-gray-300"><span>🔒</span><span>Locked after settlement</span></div>
+                  <div className="mt-2 flex items-center gap-1 text-xs text-gray-300">
+                    <span>🔒</span><span>Locked after settlement</span>
+                  </div>
                 </div>
               ))}
             </div>
