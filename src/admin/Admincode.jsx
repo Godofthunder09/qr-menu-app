@@ -413,7 +413,7 @@ export default function AdminCode() {
 
             {/* ── SECTION 1: Bill Meta ── */}
             <div className="bg-gray-800 rounded-2xl p-4 mb-4">
-              <p className="text-xs font-bold text-gray-400 uppercase mb-3">📋 Bill Details</p>
+              <p className="text-xs font-bold text-gray-400 uppercase mb-3">📋 Bill Details of khalasi</p>
               <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                 <div>
                   <label className="text-xs text-gray-500 block mb-1">Date</label>
@@ -741,3 +741,5 @@ export default function AdminCode() {
     </div>
   )
 }
+
+//Yash
