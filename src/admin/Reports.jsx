@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 
-// ── Helpers ───────────────────────────────────────────────
 const toIST = (d) => new Date(d).toLocaleTimeString('en-IN', {
   timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true
 })
@@ -36,7 +35,6 @@ const downloadCSV = (rows, filename) => {
   a.download = filename; document.body.appendChild(a); a.click(); document.body.removeChild(a)
 }
 
-// ── Department classification ─────────────────────────────
 const LIQUOR_KEYWORDS = [
   'beer','wine','whisky','whiskey','vodka','rum','gin','tequila','brandy',
   'champagne','scotch','bourbon','ale','lager','cider','sake','mead','port',
@@ -82,7 +80,6 @@ const PAY_COLOR = {
   card: 'bg-purple-100 text-purple-700',
 }
 
-// ── Tab definitions ───────────────────────────────────────
 const TABS = [
   { id: 'today',      label: '📅 Today' },
   { id: 'range',      label: '📆 Date Range' },
@@ -92,7 +89,6 @@ const TABS = [
   { id: 'settlement', label: '💰 Settlement' },
 ]
 
-// ── Table-wise helper ─────────────────────────────────────
 const buildTableGroups = (orders) => {
   const map = {}
   orders.forEach(o => {
@@ -133,19 +129,16 @@ const buildTableGroups = (orders) => {
   }).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
 }
 
-// ═══════════════════════════════════════════════════════════
 export default function Reports() {
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState('today')
 
-  // ── Today state ───────────────────────────────────────
   const [todayLoading, setTodayLoading] = useState(true)
   const [todayBills, setTodayBills] = useState([])
   const [todayStats, setTodayStats] = useState(null)
   const [showTodayOrders, setShowTodayOrders] = useState(false)
   const [showTodayPrint, setShowTodayPrint] = useState(false)
 
-  // ── Date Range state ──────────────────────────────────
   const [rangeFrom, setRangeFrom] = useState(todayIST())
   const [rangeTo, setRangeTo] = useState(todayIST())
   const [rangeLoading, setRangeLoading] = useState(false)
@@ -155,14 +148,12 @@ export default function Reports() {
   const [rangeLabelB, setRangeLabelB] = useState('')
   const [showRangePrint, setShowRangePrint] = useState(false)
 
-  // ── Category state ────────────────────────────────────
   const [catFrom, setCatFrom] = useState(todayIST())
   const [catTo, setCatTo] = useState(todayIST())
   const [catLoading, setCatLoading] = useState(false)
   const [catData, setCatData] = useState(null)
   const [showCatPrint, setShowCatPrint] = useState(false)
 
-  // ── Table-wise state ──────────────────────────────────
   const [tblFrom, setTblFrom] = useState(todayIST())
   const [tblTo, setTblTo] = useState(todayIST())
   const [tblLoading, setTblLoading] = useState(false)
@@ -171,14 +162,12 @@ export default function Reports() {
   const [tblExpanded, setTblExpanded] = useState({})
   const [showTblPrint, setShowTblPrint] = useState(false)
 
-  // ── Discounts state ───────────────────────────────────
   const [discFrom, setDiscFrom] = useState(todayIST())
   const [discTo, setDiscTo] = useState(todayIST())
   const [discLoading, setDiscLoading] = useState(false)
   const [discData, setDiscData] = useState(null)
   const [showDiscPrint, setShowDiscPrint] = useState(false)
 
-  // ── Settlement state ──────────────────────────────────
   const [settlFrom, setSettlFrom] = useState(todayIST())
   const [settlTo, setSettlTo] = useState(todayIST())
   const [settlLoading, setSettlLoading] = useState(true)
@@ -186,22 +175,32 @@ export default function Reports() {
   const [settlSort, setSettlSort] = useState('time')
   const [showSettlPrint, setShowSettlPrint] = useState(false)
 
-  // ── Fetch: Today ──────────────────────────────────────
+  // ── FIXED fetchToday: now fetches open_items_json ─────
   const fetchToday = async () => {
     setTodayLoading(true)
     const { startISO, endISO } = toRange(todayIST(), todayIST())
     const { data: orders } = await supabase
       .from('orders')
       .select(`id, payment_type, paid_at, final_amount, subtotal,
-        service_charge_amt, discount_amt, table_name_snapshot,
+        service_charge_amt, discount_amt, table_name_snapshot, open_items_json,
         order_items(quantity, price_at_order, food_items(name))`)
       .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
+
+    // Group into bills (dedup by table+minute), take open_items from first row only
     const map = {}
     orders?.forEach(o => {
       const key = `${o.table_name_snapshot}__${o.paid_at?.substring(0, 16)}`
-      if (!map[key]) map[key] = { ...o, order_items: [...(o.order_items || [])] }
-      else map[key].order_items = [...map[key].order_items, ...(o.order_items || [])]
+      if (!map[key]) {
+        map[key] = {
+          ...o,
+          order_items: [...(o.order_items || [])],
+          open_items: [...(o.open_items_json || [])],  // ← FIXED: from first row only
+        }
+      } else {
+        map[key].order_items = [...map[key].order_items, ...(o.order_items || [])]
+        // DO NOT merge open_items — first row already has them
+      }
     })
     const grouped = Object.values(map)
     setTodayBills(grouped)
@@ -209,6 +208,7 @@ export default function Reports() {
     setTodayLoading(false)
   }
 
+  // ── FIXED computeTodayStats: counts open item revenue ─
   const computeTodayStats = (bills) => {
     if (!bills.length) { setTodayStats(null); return }
     const totalRevenue = bills.reduce((s, b) => s + (b.final_amount || 0), 0)
@@ -226,17 +226,35 @@ export default function Reports() {
       hourMap[hr] = (hourMap[hr] || 0) + 1
     })
     const hours = Object.entries(hourMap).sort((a, b) => b[1] - a[1])
+
+    // Item map — include open items too
     const itemMap = {}
-    bills.forEach(b => b.order_items?.forEach(i => {
-      const name = i.food_items?.name || 'Unknown'
-      itemMap[name] = (itemMap[name] || 0) + i.quantity
-    }))
+    bills.forEach(b => {
+      b.order_items?.forEach(i => {
+        const name = i.food_items?.name || 'Unknown'
+        itemMap[name] = (itemMap[name] || 0) + i.quantity
+      })
+      // ── FIXED: also count open items ──
+      ;(b.open_items || []).forEach(oi => {
+        itemMap[oi.name] = (itemMap[oi.name] || 0) + oi.qty
+      })
+    })
     const topItem = Object.entries(itemMap).sort((a, b) => b[1] - a[1])[0]
+
+    // Food/liquor revenue — include open items
     let foodRev = 0, liquorRev = 0
-    bills.forEach(b => b.order_items?.forEach(i => {
-      const rev = i.price_at_order * i.quantity
-      if (isLiquor(i.food_items?.name)) liquorRev += rev; else foodRev += rev
-    }))
+    bills.forEach(b => {
+      b.order_items?.forEach(i => {
+        const rev = i.price_at_order * i.quantity
+        if (isLiquor(i.food_items?.name)) liquorRev += rev; else foodRev += rev
+      })
+      // ── FIXED: open items revenue split ──
+      ;(b.open_items || []).forEach(oi => {
+        const rev = oi.price * oi.qty
+        if (isLiquor(oi.name)) liquorRev += rev; else foodRev += rev
+      })
+    })
+
     setTodayStats({
       totalRevenue, totalOrders, aov, cash, upi, card,
       scTotal, discTotal, discPct,
@@ -249,7 +267,6 @@ export default function Reports() {
 
   useEffect(() => { fetchToday() }, [])
 
-  // ── Fetch: Date Range ─────────────────────────────────
   const fetchRangePeriod = async (from, to) => {
     const { startISO, endISO } = toRange(from, to)
     const { data: orders } = await supabase
@@ -316,7 +333,6 @@ export default function Reports() {
 
   const rangePct = (a, b) => b === 0 ? null : (((a - b) / b) * 100).toFixed(1)
 
-  // ── Fetch: Category ───────────────────────────────────
   const fetchCategory = async () => {
     setCatLoading(true)
     const { startISO, endISO } = toRange(catFrom, catTo)
@@ -347,7 +363,6 @@ export default function Reports() {
     setCatLoading(false)
   }
 
-  // ── Fetch: Table-wise ─────────────────────────────────
   const fetchTablewise = useCallback(async () => {
     setTblLoading(true)
     const { startISO, endISO } = toRange(tblFrom, tblTo)
@@ -372,7 +387,6 @@ export default function Reports() {
     tables: s.tables + 1,
   }), { revenue: 0, sc: 0, discount: 0, bills: 0, tables: 0 })
 
-  // ── Fetch: Discounts ──────────────────────────────────
   const fetchDiscounts = async () => {
     setDiscLoading(true)
     const { startISO, endISO } = toRange(discFrom, discTo)
@@ -418,7 +432,6 @@ export default function Reports() {
     setDiscLoading(false)
   }
 
-  // ── Fetch: Settlement ─────────────────────────────────
   const fetchSettlement = async () => {
     setSettlLoading(true)
     const { startISO, endISO } = toRange(settlFrom, settlTo)
@@ -462,105 +475,185 @@ export default function Reports() {
     return b
   }
 
-  // ── CSV Exports ───────────────────────────────────────
+  // ── FIXED CSV exports — each exports its own correct data ─
+
   const exportTodayCSV = () => {
     if (!todayBills.length) return
     const s = todayStats
     const rows = [
-      ['TODAY REPORT', formatDate(new Date())], [],
-      ['Total Revenue', s.totalRevenue], ['Total Orders', s.totalOrders], ['Avg Order Value', s.aov],
-      ['Cash', s.cash], ['UPI', s.upi], ['Card', s.card],
-      ['Service Charge', s.scTotal], ['Discounts', s.discTotal],
-      ['Food Revenue', s.foodRev], ['Liquor Revenue', s.liquorRev], [],
-      ['Table', 'Time', 'Payment', 'Subtotal', 'SC', 'Discount', 'Final', 'Items']
+      ['TODAY SALES REPORT', formatDate(new Date())], [],
+      ['SUMMARY'],
+      ['Total Revenue', `Rs.${s.totalRevenue}`],
+      ['Total Bills', s.totalOrders],
+      ['Avg Order Value', `Rs.${s.aov}`],
+      ['Cash', `Rs.${s.cash}`],
+      ['UPI', `Rs.${s.upi}`],
+      ['Card', `Rs.${s.card}`],
+      ['Food Revenue', `Rs.${s.foodRev}`],
+      ['Liquor Revenue', `Rs.${s.liquorRev}`],
+      ['Service Charge', `Rs.${s.scTotal}`],
+      ['Discounts', `-Rs.${s.discTotal} (${s.discPct}%)`],
+      ['Top Item', s.topItem],
+      ['Busiest Hour', s.busiestHour], [],
+      ['BILL DETAILS'],
+      ['Table', 'Time', 'Payment', 'Subtotal', 'SC', 'Discount', 'Final', 'Menu Items', 'Open Items']
     ]
     todayBills.forEach(b => rows.push([
-      b.table_name_snapshot, toIST(b.paid_at), b.payment_type,
-      b.subtotal, b.service_charge_amt, b.discount_amt, b.final_amount,
-      b.order_items?.map(i => `${i.food_items?.name} x${i.quantity}`).join(' | ')
+      b.table_name_snapshot,
+      toIST(b.paid_at),
+      b.payment_type,
+      b.subtotal,
+      b.service_charge_amt,
+      b.discount_amt,
+      b.final_amount,
+      b.order_items?.map(i => `${i.food_items?.name} x${i.quantity}`).join(' | ') || '',
+      (b.open_items || []).map(oi => `${oi.name} x${oi.qty} @Rs.${oi.price}`).join(' | ') || ''
     ]))
-    downloadCSV(rows, `Today_${todayIST()}.csv`)
+    downloadCSV(rows, `Today_Sales_${todayIST()}.csv`)
   }
 
   const exportRangeCSV = () => {
     if (!rangeDataA) return
     const rows = [
-      ['DATE RANGE COMPARISON'], ['Metric', rangeLabelA, rangeLabelB, '% Change'],
-      ['Total Revenue', rangeDataA.totalRevenue, rangeDataB?.totalRevenue || 0, (rangePct(rangeDataA.totalRevenue, rangeDataB?.totalRevenue || 0) || '—') + '%'],
+      ['DATE RANGE COMPARISON REPORT'],
+      ['Period A (This)', rangeLabelA],
+      ['Period B (Previous)', rangeLabelB], [],
+      ['Metric', 'This Period', 'Previous Period', '% Change'],
+      ['Total Revenue', `Rs.${rangeDataA.totalRevenue}`, `Rs.${rangeDataB?.totalRevenue || 0}`, (rangePct(rangeDataA.totalRevenue, rangeDataB?.totalRevenue || 0) || '—') + '%'],
       ['Total Orders', rangeDataA.totalOrders, rangeDataB?.totalOrders || 0, ''],
-      ['Avg Order Value', rangeDataA.aov, rangeDataB?.aov || 0, ''],
-      ['Cash', rangeDataA.cash, rangeDataB?.cash || 0, ''],
-      ['UPI', rangeDataA.upi, rangeDataB?.upi || 0, ''],
-      ['Card', rangeDataA.card, rangeDataB?.card || 0, ''],
+      ['Avg Order Value', `Rs.${rangeDataA.aov}`, `Rs.${rangeDataB?.aov || 0}`, ''],
+      ['Cash Revenue', `Rs.${rangeDataA.cash}`, `Rs.${rangeDataB?.cash || 0}`, ''],
+      ['UPI Revenue', `Rs.${rangeDataA.upi}`, `Rs.${rangeDataB?.upi || 0}`, ''],
+      ['Card Revenue', `Rs.${rangeDataA.card}`, `Rs.${rangeDataB?.card || 0}`, ''], [],
+      ['TOP ITEMS (THIS PERIOD)'],
+      ['Rank', 'Item', 'Qty Sold'],
+      ...rangeDataA.top3.map(([name, qty], i) => [i + 1, name, qty]),
+      [], ['TOP ITEMS (PREVIOUS PERIOD)'],
+      ['Rank', 'Item', 'Qty Sold'],
+      ...(rangeDataB?.top3 || []).map(([name, qty], i) => [i + 1, name, qty]),
     ]
-    downloadCSV(rows, `Range_${rangeFrom}_${rangeTo}.csv`)
+    downloadCSV(rows, `DateRange_${rangeFrom}_to_${rangeTo}.csv`)
   }
 
   const exportCatCSV = () => {
     if (!catData) return
     const total = catData.totalRevenue
     const rows = [
-      ['CATEGORY REPORT', `${formatDate(catFrom)} to ${formatDate(catTo)}`], [],
-      ['Food Revenue', catData.foodTotal], ['Liquor Revenue', catData.liquorTotal], [],
+      ['CATEGORY SALES REPORT'],
+      ['Period', `${formatDate(catFrom)} to ${formatDate(catTo)}`], [],
+      ['OVERVIEW'],
+      ['Food Revenue', `Rs.${catData.foodTotal}`, `${catData.totalRevenue > 0 ? ((catData.foodTotal / catData.totalRevenue) * 100).toFixed(1) : 0}%`],
+      ['Liquor Revenue', `Rs.${catData.liquorTotal}`, `${catData.totalRevenue > 0 ? ((catData.liquorTotal / catData.totalRevenue) * 100).toFixed(1) : 0}%`],
+      ['Total Revenue', `Rs.${catData.totalRevenue}`], [],
+      ['CATEGORY BREAKDOWN'],
       ['Category', 'Items Sold', 'Revenue', '% of Total', 'Top Item'],
     ]
     catData.catStats.forEach(c => {
       const share = total > 0 ? ((c.revenue / total) * 100).toFixed(1) : 0
-      rows.push([c.name, c.qty, c.revenue, share + '%', c.topItem ? `${c.topItem[0]} (${c.topItem[1]})` : '—'])
+      rows.push([c.name, c.qty, `Rs.${c.revenue}`, share + '%', c.topItem ? `${c.topItem[0]} (${c.topItem[1]} sold)` : '—'])
     })
-    rows.push([], ['Zero Sales Items'])
-    catData.zeroItems.forEach(i => rows.push([i.name]))
-    downloadCSV(rows, `Category_${catFrom}_${catTo}.csv`)
+    if (catData.zeroItems.length > 0) {
+      rows.push([], ['ZERO SALES ITEMS (available but no orders in this period)'], ['Item Name'])
+      catData.zeroItems.forEach(i => rows.push([i.name]))
+    }
+    downloadCSV(rows, `Category_${catFrom}_to_${catTo}.csv`)
   }
 
   const exportTblCSV = () => {
-    const rows = [['TABLE-WISE REPORT'], [`${formatDate(tblFrom)} → ${formatDate(tblTo)}`], []]
+    const rows = [
+      ['TABLE-WISE SALES REPORT'],
+      ['Period', `${formatDate(tblFrom)} to ${formatDate(tblTo)}`], [],
+      ['SUMMARY'],
+      ['Total Tables', tblSummary.tables],
+      ['Total Bills', tblSummary.bills],
+      ['Net Revenue', `Rs.${tblSummary.revenue}`],
+      ['Service Charge', `Rs.${tblSummary.sc}`],
+      ['Discounts', `-Rs.${tblSummary.discount}`], [],
+      ['DETAILED BILL DATA'],
+    ]
     tblData.forEach(tbl => {
-      rows.push([`Table: ${tbl.name}`, `Net: ₹${tbl.tableRevenue}`, `Bills: ${tbl.bills.length}`])
+      rows.push([])
+      rows.push([`TABLE: ${tbl.name}`, `Total: Rs.${tbl.tableRevenue}`, `${tbl.bills.length} bill(s)`, `Duration: ${formatDuration(tbl.duration)}`])
       tbl.bills.forEach(bill => {
-        rows.push([`Bill #${bill.billSerial}`, PAY_LABEL[bill.payment_type] || bill.payment_type, toIST(bill.paid_at)])
-        bill.items.forEach((item, i) => rows.push([i+1, item.name, item.qty, item.rate, item.amount]))
-        rows.push(['', 'TOTAL', '', '', bill.final_amount]); rows.push([])
+        rows.push([`Bill #${bill.billSerial}`, PAY_LABEL[bill.payment_type] || bill.payment_type, toIST(bill.paid_at), `Rs.${bill.final_amount}`])
+        rows.push(['Sr', 'Item', 'Dept', 'Qty', 'Rate', 'Amount'])
+        bill.items.forEach((item, i) => rows.push([i + 1, item.name, item.dept, item.qty, `Rs.${item.rate}`, `Rs.${item.amount}`]))
+        rows.push(['', 'Subtotal', '', '', '', `Rs.${bill.subtotal}`])
+        if (bill.service_charge_amt > 0) rows.push(['', `Service Charge (${bill.service_charge_pct}%)`, '', '', '', `Rs.${bill.service_charge_amt}`])
+        if (bill.discount_amt > 0) rows.push(['', 'Discount', '', '', '', `-Rs.${bill.discount_amt}`])
+        rows.push(['', 'BILL TOTAL', '', '', '', `Rs.${bill.final_amount}`])
       })
     })
-    downloadCSV(rows, `TableWise_${tblFrom}_${tblTo}.csv`)
+    downloadCSV(rows, `TableWise_${tblFrom}_to_${tblTo}.csv`)
   }
 
   const exportDiscCSV = () => {
     if (!discData) return
     const rows = [
-      ['DISCOUNT REPORT', `${formatDate(discFrom)} to ${formatDate(discTo)}`], [],
-      ['Total Discounts', discData.totalDiscount],
-      ['Disc % of Revenue', discData.discPct + '%'],
-      ['Red Flags', discData.redFlags], ['Yellow Flags', discData.yellowFlags], [],
-      ['Table', 'Date', 'Time', 'Subtotal', 'Discount', 'Disc%', 'Final', 'Payment', 'Reason', 'Flag']
+      ['DISCOUNT AUDIT REPORT'],
+      ['Period', `${formatDate(discFrom)} to ${formatDate(discTo)}`], [],
+      ['SUMMARY'],
+      ['Total Discounts Given', `-Rs.${discData.totalDiscount}`],
+      ['Discount % of Revenue', discData.discPct + '%'],
+      ['Bills with Discounts', discData.bills.length],
+      ['Avg Discount per Bill', `Rs.${discData.avgDiscount}`],
+      ['Red Flags (>40%)', discData.redFlags],
+      ['Yellow Flags (20-40%)', discData.yellowFlags],
+      ['Most Discounts Day', discData.topDay?.[0] || '—', `Rs.${discData.topDay?.[1] || 0}`],
+      ['Largest Single Discount', `Rs.${discData.largest?.discount_amt || 0}`, discData.largest?.table_name_snapshot || ''], [],
+      ['DISCOUNT BY REASON'],
+      ['Reason', 'No. of Bills', 'Total Discounted'],
+      ...discData.reasonBreakdown.map(r => [r.reason, r.count, `Rs.${r.total}`]), [],
+      ['ALL DISCOUNTED BILLS'],
+      ['Table', 'Date', 'Time', 'Subtotal', 'Discount', 'Disc%', 'Final Amount', 'Payment', 'Reason', 'Flag']
     ]
     discData.bills.forEach(b => rows.push([
-      b.table_name_snapshot, formatDate(b.paid_at), toIST(b.paid_at),
-      b.subtotal, b.discount_amt, b.truePct.toFixed(1) + '%',
-      b.final_amount, b.payment_type, b.discount_reason || '', b.flag || 'ok'
+      b.table_name_snapshot,
+      formatDate(b.paid_at),
+      toIST(b.paid_at),
+      `Rs.${b.subtotal}`,
+      `-Rs.${b.discount_amt}`,
+      b.truePct.toFixed(1) + '%',
+      `Rs.${b.final_amount}`,
+      b.payment_type,
+      b.discount_reason || 'No reason',
+      b.flag === 'red' ? '🚨 Red Flag' : b.flag === 'yellow' ? '⚠️ Yellow Flag' : 'OK'
     ]))
-    downloadCSV(rows, `Discounts_${discFrom}_${discTo}.csv`)
+    downloadCSV(rows, `Discounts_${discFrom}_to_${discTo}.csv`)
   }
 
   const exportSettlCSV = () => {
     if (!settlData) return
     const rows = [
-      ['SETTLEMENT REPORT', `${formatDate(settlFrom)} to ${formatDate(settlTo)}`], [],
-      ['Cash', settlData.cash.total, settlData.cash.count + ' bills'],
-      ['UPI', settlData.upi.total, settlData.upi.count + ' bills'],
-      ['Card', settlData.card.total, settlData.card.count + ' bills'],
-      ['Grand Total', settlData.grandTotal], [],
-      ['Table', 'Date', 'Time', 'Payment', 'Subtotal', 'SC', 'Discount', 'Final']
+      ['SETTLEMENT REPORT'],
+      ['Period', `${formatDate(settlFrom)} to ${formatDate(settlTo)}`],
+      ['Printed', `${formatDate(new Date())} ${toIST(new Date().toISOString())}`], [],
+      ['PAYMENT SUMMARY'],
+      ['Payment Mode', 'No. of Bills', 'Total Amount'],
+      ['Cash', settlData.cash.count, `Rs.${settlData.cash.total}`],
+      ['UPI', settlData.upi.count, `Rs.${settlData.upi.total}`],
+      ['Card', settlData.card.count, `Rs.${settlData.card.total}`],
+      ['GRAND TOTAL', settlData.bills.length, `Rs.${settlData.grandTotal}`], [],
+      ['REVENUE BREAKDOWN'],
+      ['Gross Revenue', `Rs.${settlData.gross}`],
+      ['+ Service Charge', `Rs.${settlData.scTotal}`],
+      ['- Discounts', `-Rs.${settlData.discTotal}`],
+      ['Net Collected', `Rs.${settlData.grandTotal}`], [],
+      ['ALL TRANSACTIONS'],
+      ['Time', 'Table', 'Payment Mode', 'Subtotal', 'Service Charge', 'Discount', 'Final Amount']
     ]
     sortedSettlBills().forEach(b => rows.push([
-      b.table_name_snapshot, formatDate(b.paid_at), toIST(b.paid_at),
-      b.payment_type, b.subtotal, b.service_charge_amt, b.discount_amt, b.final_amount
+      toIST(b.paid_at),
+      b.table_name_snapshot,
+      b.payment_type.toUpperCase(),
+      `Rs.${b.subtotal}`,
+      b.service_charge_amt > 0 ? `Rs.${b.service_charge_amt}` : '—',
+      b.discount_amt > 0 ? `-Rs.${b.discount_amt}` : '—',
+      `Rs.${b.final_amount}`
     ]))
-    downloadCSV(rows, `Settlement_${settlFrom}_${settlTo}.csv`)
+    downloadCSV(rows, `Settlement_${settlFrom}_to_${settlTo}.csv`)
   }
 
-  // ── Reusable mini-components ──────────────────────────
   const DateFilter = ({ from, to, onFrom, onTo, onFetch, btnText = 'View' }) => (
     <div className="bg-white rounded-2xl shadow p-5 mb-4">
       <div className="flex gap-3 flex-wrap items-end">
@@ -586,7 +679,6 @@ export default function Reports() {
     </div>
   )
 
-  // ── Print modals ──────────────────────────────────────
   const PrintModal = ({ show, onClose, title, onPrint, onCSV, children }) => {
     if (!show) return null
     return (
@@ -606,11 +698,8 @@ export default function Reports() {
     )
   }
 
-  // ══════════════════════════════════════════════════════
   return (
     <div className="min-h-screen bg-gray-50">
-
-      {/* ── Navbar ─────────────────────────────────────── */}
       <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30 print:hidden">
         <div className="flex items-center gap-3">
           <span className="text-xl">📊</span>
@@ -623,8 +712,6 @@ export default function Reports() {
       </div>
 
       <div className="p-4 md:p-6 max-w-5xl mx-auto">
-
-        {/* ── Tab Bar ────────────────────────────────────── */}
         <div className="flex gap-2 mb-6 overflow-x-auto pb-2 print:hidden">
           {TABS.map(tab => (
             <button key={tab.id} onClick={() => setActiveTab(tab.id)}
@@ -635,12 +722,10 @@ export default function Reports() {
           ))}
         </div>
 
-        {/* ══════════════════════════════════════════════ */}
-        {/* TAB: TODAY                                     */}
-        {/* ══════════════════════════════════════════════ */}
+        {/* TODAY TAB */}
         {activeTab === 'today' && (
           <div>
-            <PrintModal show={showTodayPrint} title="Today's Report"
+            <PrintModal show={showTodayPrint} title="Today's Sales Report"
               onClose={() => setShowTodayPrint(false)}
               onPrint={() => window.print()} onCSV={exportTodayCSV}>
               <div className="text-center mb-4 border-b pb-3">
@@ -649,7 +734,7 @@ export default function Reports() {
               </div>
               {todayStats && <>
                 <div className="flex justify-between font-bold text-lg border-b pb-2 mb-2"><span>TOTAL REVENUE</span><span>Rs.{todayStats.totalRevenue}</span></div>
-                <div className="flex justify-between mb-1"><span>Total Orders</span><span>{todayStats.totalOrders}</span></div>
+                <div className="flex justify-between mb-1"><span>Total Bills</span><span>{todayStats.totalOrders}</span></div>
                 <div className="flex justify-between mb-3"><span>Avg Order Value</span><span>Rs.{todayStats.aov}</span></div>
                 <p className="font-bold mb-1 border-t pt-2">Payment Split</p>
                 <div className="flex justify-between"><span>💵 Cash</span><span>Rs.{todayStats.cash}</span></div>
@@ -663,12 +748,19 @@ export default function Reports() {
                 <div className="flex justify-between mb-3"><span>Discounts</span><span>-Rs.{todayStats.discTotal} ({todayStats.discPct}%)</span></div>
                 <p className="font-bold mb-2 border-t pt-2">Bills ({todayBills.length})</p>
                 {todayBills.map((b, i) => (
-                  <div key={i} className="border-b pb-1 mb-1 text-xs">
-                    <div className="flex justify-between"><span>{b.table_name_snapshot} · {toIST(b.paid_at)}</span><span>Rs.{b.final_amount} ({b.payment_type})</span></div>
+                  <div key={i} className="border-b pb-2 mb-2 text-xs">
+                    <div className="flex justify-between font-medium"><span>{b.table_name_snapshot} · {toIST(b.paid_at)}</span><span>Rs.{b.final_amount} ({b.payment_type})</span></div>
                     {b.order_items?.map((item, j) => (
                       <div key={j} className="flex justify-between text-gray-500 ml-2">
                         <span>{item.food_items?.name} × {item.quantity}</span>
                         <span>Rs.{item.price_at_order * item.quantity}</span>
+                      </div>
+                    ))}
+                    {/* Open items in print modal too */}
+                    {(b.open_items || []).map((oi, j) => (
+                      <div key={`oi-${j}`} className="flex justify-between text-gray-500 ml-2 italic">
+                        <span>{oi.name} × {oi.qty} (open)</span>
+                        <span>Rs.{oi.price * oi.qty}</span>
                       </div>
                     ))}
                   </div>
@@ -754,6 +846,8 @@ export default function Reports() {
                     <p className="text-xs text-gray-400 mt-1">Quiet: {todayStats.quietestHour}</p>
                   </div>
                 </div>
+
+                {/* All Bills — now shows open items too */}
                 <div className="bg-white rounded-2xl shadow">
                   <button onClick={() => setShowTodayOrders(!showTodayOrders)}
                     className="w-full p-5 flex justify-between items-center">
@@ -771,7 +865,10 @@ export default function Reports() {
                             </div>
                             <div className="text-right">
                               <p className="font-bold text-orange-500">₹{bill.final_amount}</p>
-                              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${bill.payment_type === 'cash' ? 'bg-green-100 text-green-600' : bill.payment_type === 'upi' ? 'bg-blue-100 text-blue-600' : 'bg-purple-100 text-purple-600'}`}>
+                              <span className={`text-xs px-2 py-0.5 rounded-full font-medium
+                                ${bill.payment_type === 'cash' ? 'bg-green-100 text-green-600'
+                                : bill.payment_type === 'upi' ? 'bg-blue-100 text-blue-600'
+                                : 'bg-purple-100 text-purple-600'}`}>
                                 {bill.payment_type}
                               </span>
                             </div>
@@ -783,7 +880,31 @@ export default function Reports() {
                                 <span>₹{item.price_at_order * item.quantity}</span>
                               </div>
                             ))}
+                            {/* ── FIXED: show open items in Reports All Bills ── */}
+                            {(bill.open_items || []).map((oi, j) => (
+                              <div key={`oi-${j}`} className="flex justify-between text-xs text-purple-500">
+                                <span>
+                                  {oi.dept === 'Food' ? '🍽' : oi.dept === 'Beverage' ? '🥤' : '🍺'} {oi.name} × {oi.qty}
+                                  <span className="ml-1 opacity-60">(open)</span>
+                                </span>
+                                <span>₹{oi.price * oi.qty}</span>
+                              </div>
+                            ))}
                           </div>
+                          {(bill.service_charge_amt > 0 || bill.discount_amt > 0) && (
+                            <div className="border-t mt-2 pt-1 space-y-0.5">
+                              {bill.service_charge_amt > 0 && (
+                                <div className="flex justify-between text-xs text-gray-400">
+                                  <span>Service Charge</span><span>+₹{bill.service_charge_amt}</span>
+                                </div>
+                              )}
+                              {bill.discount_amt > 0 && (
+                                <div className="flex justify-between text-xs text-green-600">
+                                  <span>Discount</span><span>-₹{bill.discount_amt}</span>
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -794,17 +915,15 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ══════════════════════════════════════════════ */}
-        {/* TAB: DATE RANGE                               */}
-        {/* ══════════════════════════════════════════════ */}
+        {/* DATE RANGE TAB */}
         {activeTab === 'range' && (
           <div>
-            <PrintModal show={showRangePrint} title="Date Range Report"
+            <PrintModal show={showRangePrint} title="Date Range Comparison Report"
               onClose={() => setShowRangePrint(false)}
               onPrint={() => window.print()} onCSV={exportRangeCSV}>
               <div className="text-center mb-4 border-b pb-2">
-                <p className="font-bold">HOTEL KHALASI — DATE RANGE</p>
-                <p className="text-xs text-gray-500">{rangeLabelA}</p>
+                <p className="font-bold">HOTEL KHALASI — DATE RANGE COMPARISON</p>
+                <p className="text-xs text-gray-500">{rangeLabelA} vs {rangeLabelB}</p>
               </div>
               {rangeDataA && [
                 ['Total Revenue', rangeDataA.totalRevenue, rangeDataB?.totalRevenue],
@@ -898,16 +1017,12 @@ export default function Reports() {
                 <div className="grid grid-cols-2 gap-3">
                   <div className="bg-white rounded-2xl shadow p-4">
                     <p className="font-bold text-gray-700 mb-2 text-sm">🏆 Top Items (This)</p>
-                    {rangeDataA.top3.map(([name, qty], i) => (
-                      <p key={i} className="text-xs text-gray-600">{i+1}. {name} — {qty} sold</p>
-                    ))}
+                    {rangeDataA.top3.map(([name, qty], i) => <p key={i} className="text-xs text-gray-600">{i+1}. {name} — {qty} sold</p>)}
                     {rangeDataA.bestDay && <p className="text-xs text-orange-500 mt-2">📈 Best: {formatDate(rangeDataA.bestDay[0])}</p>}
                   </div>
                   <div className="bg-white rounded-2xl shadow p-4">
                     <p className="font-bold text-gray-700 mb-2 text-sm">🏆 Top Items (Prev)</p>
-                    {rangeDataB?.top3.map(([name, qty], i) => (
-                      <p key={i} className="text-xs text-gray-600">{i+1}. {name} — {qty} sold</p>
-                    ))}
+                    {rangeDataB?.top3.map(([name, qty], i) => <p key={i} className="text-xs text-gray-600">{i+1}. {name} — {qty} sold</p>)}
                     {rangeDataB?.bestDay && <p className="text-xs text-gray-500 mt-2">📈 Best: {formatDate(rangeDataB.bestDay[0])}</p>}
                   </div>
                 </div>
@@ -916,12 +1031,10 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ══════════════════════════════════════════════ */}
-        {/* TAB: CATEGORY                                  */}
-        {/* ══════════════════════════════════════════════ */}
+        {/* CATEGORY TAB */}
         {activeTab === 'category' && (
           <div>
-            <PrintModal show={showCatPrint} title="Category Report"
+            <PrintModal show={showCatPrint} title="Category Sales Report"
               onClose={() => setShowCatPrint(false)}
               onPrint={() => window.print()} onCSV={exportCatCSV}>
               <div className="text-center mb-4 border-b pb-2">
@@ -942,7 +1055,6 @@ export default function Reports() {
                 </>}
               </>}
             </PrintModal>
-
             <DateFilter from={catFrom} to={catTo} onFrom={setCatFrom} onTo={setCatTo} onFetch={fetchCategory} />
             {catLoading && <div className="text-center py-8 text-gray-400">Loading...</div>}
             {!catLoading && !catData && <Empty icon="📊" text="Select date range and click View" />}
@@ -1003,12 +1115,10 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ══════════════════════════════════════════════ */}
-        {/* TAB: TABLE-WISE                               */}
-        {/* ══════════════════════════════════════════════ */}
+        {/* TABLE-WISE TAB */}
         {activeTab === 'tables' && (
           <div>
-            <PrintModal show={showTblPrint} title="Table-wise Report"
+            <PrintModal show={showTblPrint} title="Table-wise Sales Report"
               onClose={() => setShowTblPrint(false)}
               onPrint={() => window.print()} onCSV={exportTblCSV}>
               <div className="text-center mb-4 border-b pb-2">
@@ -1030,7 +1140,6 @@ export default function Reports() {
                 </div>
               ))}
             </PrintModal>
-
             <div className="bg-white rounded-2xl shadow p-5 mb-5">
               <div className="flex gap-3 flex-wrap items-end">
                 <div><label className="text-xs text-gray-500 block mb-1">From</label>
@@ -1043,11 +1152,9 @@ export default function Reports() {
                   className="bg-orange-500 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-orange-600">View Report</button>
               </div>
             </div>
-
             {tblLoading && <div className="text-center py-12 text-gray-400"><div className="text-4xl mb-2 animate-pulse">🪑</div><p>Loading…</p></div>}
             {!tblLoading && tblFetched && tblData.length === 0 && <Empty icon="📭" text="No paid orders in this period." />}
             {!tblLoading && !tblFetched && <Empty icon="🪑" text="Select a date range and click View Report" />}
-
             {!tblLoading && tblData.length > 0 && (
               <>
                 <div className="flex gap-2 justify-end mb-4 print:hidden">
@@ -1184,12 +1291,10 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ══════════════════════════════════════════════ */}
-        {/* TAB: DISCOUNTS                                */}
-        {/* ══════════════════════════════════════════════ */}
+        {/* DISCOUNTS TAB */}
         {activeTab === 'discounts' && (
           <div>
-            <PrintModal show={showDiscPrint} title="Discount Audit"
+            <PrintModal show={showDiscPrint} title="Discount Audit Report"
               onClose={() => setShowDiscPrint(false)}
               onPrint={() => window.print()} onCSV={exportDiscCSV}>
               <div className="text-center mb-4 border-b pb-2">
@@ -1220,7 +1325,6 @@ export default function Reports() {
                 ))}
               </>}
             </PrintModal>
-
             <DateFilter from={discFrom} to={discTo} onFrom={setDiscFrom} onTo={setDiscTo} onFetch={fetchDiscounts} />
             {discLoading && <div className="text-center py-8 text-gray-400">Loading...</div>}
             {!discLoading && !discData && <Empty icon="🎁" text="No discounts in this period" />}
@@ -1301,9 +1405,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* ══════════════════════════════════════════════ */}
-        {/* TAB: SETTLEMENT                               */}
-        {/* ══════════════════════════════════════════════ */}
+        {/* SETTLEMENT TAB */}
         {activeTab === 'settlement' && (
           <div>
             <PrintModal show={showSettlPrint} title="Settlement Slip"
@@ -1334,7 +1436,6 @@ export default function Reports() {
                 </div>
               </>}
             </PrintModal>
-
             <DateFilter from={settlFrom} to={settlTo} onFrom={setSettlFrom} onTo={setSettlTo} onFetch={fetchSettlement} />
             {settlLoading && <div className="text-center py-8 text-gray-400">Loading...</div>}
             {!settlLoading && !settlData && <Empty icon="💰" text="No transactions found" />}
@@ -1425,5 +1526,3 @@ export default function Reports() {
     </div>
   )
 }
-
-//yash

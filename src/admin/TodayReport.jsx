@@ -10,8 +10,7 @@ const formatDate = (d) => new Date(d).toLocaleDateString('en-IN', {
   timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric'
 })
 
-// ── KEY FIX: only take open_items from the FIRST order row ─
-// Never merge open_items across rows — that caused the 3× duplication
+// Only take open_items from FIRST order row — never merge across rows
 const groupOrdersIntoBills = (orders) => {
   const map = {}
   orders.forEach(order => {
@@ -19,8 +18,7 @@ const groupOrdersIntoBills = (orders) => {
     const key = `${order.table_name_snapshot || ''}__${minuteKey}`
     if (!map[key]) {
       map[key] = {
-        _orderIds: [order.id],
-        _key: key,
+        _orderIds: [order.id], _key: key,
         payment_type: order.payment_type,
         settlement_status: order.settlement_status,
         paid_at: order.paid_at,
@@ -33,13 +31,12 @@ const groupOrdersIntoBills = (orders) => {
         discount_amt: order.discount_amt || 0,
         final_amount: order.final_amount || 0,
         order_items: [...(order.order_items || [])],
-        // ── Only from FIRST row — never merge across rows ──
-        open_items: [...(order.open_items_json || [])],
+        open_items: [...(order.open_items_json || [])], // FIRST row only
       }
     } else {
       map[key]._orderIds.push(order.id)
       map[key].order_items = [...map[key].order_items, ...(order.order_items || [])]
-      // ── DO NOT merge open_items here — first row already has them ──
+      // DO NOT merge open_items — first row already has them all
       if (order.settlement_status === 'pending') map[key].settlement_status = 'pending'
     }
   })
@@ -98,9 +95,8 @@ export default function TodayReport() {
   const [settleBill, setSettleBill] = useState(null)
   const [settleType, setSettleType] = useState('cash')
 
-  // ── Edit state ─────────────────────────────────────────
   const [editingBillKey, setEditingBillKey] = useState(null)
-  const [editingBill, setEditingBill] = useState(null)  // ← store full bill object
+  const [editingBill, setEditingBill] = useState(null)
   const [editRemovedItemKeys, setEditRemovedItemKeys] = useState(new Set())
   const [editManualItems, setEditManualItems] = useState([])
   const [editMenuSearch, setEditMenuSearch] = useState('')
@@ -110,7 +106,6 @@ export default function TodayReport() {
   const [editOpenPrice, setEditOpenPrice] = useState('')
   const [editOpenQty, setEditOpenQty] = useState(1)
 
-  // ── Reprint state ──────────────────────────────────────
   const [showReprintPreview, setShowReprintPreview] = useState(false)
   const [reprintServicePct, setReprintServicePct] = useState(0)
   const [reprintDiscount, setReprintDiscount] = useState({ type: 'percent', value: '', reason: '' })
@@ -164,7 +159,6 @@ export default function TodayReport() {
     setLoading(false)
   }
 
-  // ── Settlement ─────────────────────────────────────────
   const openSettle = (bill) => { setSettleBill(bill); setSettleType('cash'); setShowSettleModal(true) }
 
   const confirmSettle = async () => {
@@ -199,10 +193,9 @@ export default function TodayReport() {
     setSettling(null); setShowSettleModal(false); fetchTodayBills()
   }
 
-  // ── Edit helpers ────────────────────────────────────────
   const openEdit = (bill) => {
     setEditingBillKey(bill._key)
-    setEditingBill(bill)           // ← store the full bill
+    setEditingBill(bill)
     setEditRemovedItemKeys(new Set())
     setEditManualItems([])
     setEditMenuSearch('')
@@ -211,10 +204,8 @@ export default function TodayReport() {
   }
 
   const closeEdit = () => {
-    setEditingBillKey(null)
-    setEditingBill(null)
-    setEditRemovedItemKeys(new Set())
-    setEditManualItems([])
+    setEditingBillKey(null); setEditingBill(null)
+    setEditRemovedItemKeys(new Set()); setEditManualItems([])
     setShowEditOpenForm(false)
   }
 
@@ -249,22 +240,22 @@ export default function TodayReport() {
     setEditOpenName(''); setEditOpenPrice(''); setEditOpenQty(1); setShowEditOpenForm(false)
   }
 
-  // ── Compute totals from editingBill + edits ─────────────
-  // This is the FIXED version — uses editingBill directly (not reprintBill)
+  // ── FIXED: computeCurrentTotals ────────────────────────
+  // Uses stable item keys that match what toggleEditRemove sets
   const computeCurrentTotals = (bill, removedKeys, manualItems, svcPct, discType, discVal) => {
     if (!bill) return null
 
-    // Effective regular items (with remove toggle)
+    // Map order_items with stable keys matching the UI toggle keys
     const effectiveItems = (bill.order_items || [])
-  .map((item, idx) => ({ ...item, _itemKey: `item:${idx}` }))
-  .filter(item => !removedKeys.has(item._itemKey))  // ✅ use the property
+      .map((item, idx) => ({ ...item, _stableKey: `item:${idx}` }))
+      .filter(item => !removedKeys.has(item._stableKey))
 
-    // Existing open items from DB (never removed individually in this flow)
+    // Existing open items from DB
     const existingOpenAsItems = (bill.open_items || []).map(oi => ({
       food_items: { name: oi.name }, price_at_order: oi.price, quantity: oi.qty
     }))
 
-    // Newly added items (from menu or open form)
+    // Newly added items
     const newManualAsItems = manualItems.map(mi => ({
       food_items: { name: mi.name }, price_at_order: mi.price, quantity: mi.qty
     }))
@@ -286,7 +277,6 @@ export default function TodayReport() {
     return { foodItems, liquorItems, foodSubtotal, liquorSubtotal, subtotal, serviceChargeAmt, discountAmt, finalAmount }
   }
 
-  // ── For live "Updated Total" display in edit panel ──────
   const editTotals = editingBill
     ? computeCurrentTotals(
         editingBill, editRemovedItemKeys, editManualItems,
@@ -295,7 +285,6 @@ export default function TodayReport() {
       )
     : null
 
-  // ── Open reprint preview ────────────────────────────────
   const openReprintPreview = (bill) => {
     setReprintServicePct(bill.service_charge_pct || 0)
     setReprintDiscount({
@@ -307,7 +296,6 @@ export default function TodayReport() {
     setShowReprintPreview(true)
   }
 
-  // ── Compute reprint totals (uses editingBill + edits) ───
   const reprintTotals = showReprintPreview && editingBill
     ? computeCurrentTotals(
         editingBill, editRemovedItemKeys, editManualItems,
@@ -315,23 +303,18 @@ export default function TodayReport() {
       )
     : null
 
-  // ── Save edits + reprint ────────────────────────────────
   const handleReprintAndSave = async () => {
     const dv = parseFloat(reprintDiscount.value) || 0
     if (dv > 0 && !reprintDiscount.reason.trim()) { setReprintDiscountError(true); return }
     setReprintDiscountError(false)
-
     if (!editingBill || !reprintTotals) {
-      alert('Error: No bill selected. Please close and try again.')
+      alert('Error: No bill loaded. Please close and try again.')
       return
     }
-
     setSaving(true)
-
     try {
       const totals = reprintTotals
 
-      // Build receipt HTML sections
       const foodSection = totals.foodItems.length > 0 ? `
 <div class="section-title">FOOD</div>
 ${totals.foodItems.map(i => `<div class="row"><span>${i.food_items?.name || 'Item'} x${i.quantity}</span><span>Rs.${i.price_at_order * i.quantity}</span></div>`).join('')}
@@ -345,10 +328,8 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
 <div class="div"></div>` : ''
 
       const lines = {
-        restaurantName: restaurant.name,
-        address: restaurant.address,
-        phone: restaurant.phone,
-        gstNumber: restaurant.gst_number,
+        restaurantName: restaurant.name, address: restaurant.address,
+        phone: restaurant.phone, gstNumber: restaurant.gst_number,
         footerNote: restaurant.footer_note,
         tableName: editingBill.table_name_snapshot || '',
         date: formatDate(editingBill.paid_at),
@@ -361,22 +342,18 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         finalAmount: totals.finalAmount,
       }
 
-      // Print
       const w = window.open('', '_blank', 'width=400,height=600')
       if (w) {
         w.document.write(buildHtmlReceipt(lines))
-        w.document.close()
-        w.focus()
+        w.document.close(); w.focus()
         setTimeout(() => { w.print(); w.close() }, 300)
       }
 
-      // Build new open items = original open items + any newly added open items
       const newOpenItems = editManualItems
         .filter(m => m.isOpen)
         .map(mi => ({ name: mi.name, price: mi.price, qty: mi.qty, dept: mi.dept, total: mi.price * mi.qty }))
       const updatedOpenItems = [...(editingBill.open_items || []), ...newOpenItems]
 
-      // Update ALL order rows in this bill session
       for (const orderId of editingBill._orderIds) {
         const { error } = await supabase.from('orders').update({
           subtotal: totals.subtotal,
@@ -392,7 +369,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         if (error) console.error('update error:', error.message)
       }
 
-      // Insert new menu items as order_items
       const newMenuItems = editManualItems.filter(m => m.foodItemId)
       if (newMenuItems.length > 0) {
         const rows = newMenuItems.map(mi => ({
@@ -403,17 +379,16 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
           note: "Added at Today's Report"
         }))
         const { error } = await supabase.from('order_items').insert(rows)
-        if (error) console.error('insert order_items error:', error.message)
+        if (error) console.error('insert error:', error.message)
       }
 
       closeEdit()
       setShowReprintPreview(false)
       fetchTodayBills()
       alert('✅ Bill updated and reprinted!')
-
     } catch (err) {
       console.error('handleReprintAndSave error:', err)
-      alert('❌ Error saving bill: ' + err.message)
+      alert('❌ Error: ' + err.message)
     } finally {
       setSaving(false)
     }
@@ -455,16 +430,14 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
   return (
     <div className="min-h-screen bg-gray-50">
 
-      {/* ── Settlement Modal ──────────────────────────── */}
+      {/* Settlement Modal */}
       {showSettleModal && settleBill && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-2xl">
             <h2 className="text-xl font-bold text-gray-800 mb-1">💰 Settle Bill</h2>
             <p className="text-sm text-gray-400 mb-4">{settleBill.table_name_snapshot || 'Table'}</p>
             <div className="bg-gray-50 rounded-xl p-4 mb-4 space-y-2">
-              <div className="flex justify-between text-sm text-gray-500">
-                <span>Subtotal</span><span>₹{settleBill.subtotal}</span>
-              </div>
+              <div className="flex justify-between text-sm text-gray-500"><span>Subtotal</span><span>₹{settleBill.subtotal}</span></div>
               {settleBill.service_charge_amt > 0 && (
                 <div className="flex justify-between text-sm text-gray-500">
                   <span>Service ({settleBill.service_charge_pct}%)</span><span>+₹{settleBill.service_charge_amt}</span>
@@ -491,8 +464,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
               ))}
             </div>
             <div className="flex gap-3">
-              <button onClick={() => setShowSettleModal(false)}
-                className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
+              <button onClick={() => setShowSettleModal(false)} className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
               <button onClick={confirmSettle} disabled={!!settling}
                 className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold hover:bg-orange-600 disabled:opacity-50">
                 {settling ? '⏳...' : '✅ Confirm'}
@@ -502,7 +474,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         </div>
       )}
 
-      {/* ── Reprint Preview Modal ─────────────────────── */}
+      {/* Reprint Preview Modal */}
       {showReprintPreview && editingBill && reprintTotals && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl max-h-[92vh] flex flex-col">
@@ -511,10 +483,8 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                 <h2 className="font-bold text-gray-800">🖨️ Reprint Preview</h2>
                 <p className="text-xs text-gray-400">{editingBill.table_name_snapshot} · {toIST(editingBill.paid_at)}</p>
               </div>
-              <button onClick={() => setShowReprintPreview(false)}
-                className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-sm">✕</button>
+              <button onClick={() => setShowReprintPreview(false)} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-sm">✕</button>
             </div>
-
             <div className="flex-1 overflow-y-auto p-4 space-y-3">
               {reprintTotals.foodItems.length > 0 && (
                 <div>
@@ -536,7 +506,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                   </div>
                 </div>
               )}
-
               {reprintTotals.liquorItems.length > 0 && (
                 <div>
                   <div className="flex items-center gap-2 mb-2">
@@ -557,37 +526,28 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                   </div>
                 </div>
               )}
-
-              {/* Charges */}
               <div className="bg-gray-50 rounded-xl p-3 space-y-3">
                 <p className="text-xs font-bold text-gray-500 uppercase">Adjust Charges</p>
                 <div className="flex justify-between items-center text-sm text-gray-600">
                   <span>Service Charge</span>
                   <div className="flex items-center gap-2">
-                    <select value={reprintServicePct} onChange={e => setReprintServicePct(Number(e.target.value))}
-                      className="border rounded px-2 py-0.5 text-xs">
+                    <select value={reprintServicePct} onChange={e => setReprintServicePct(Number(e.target.value))} className="border rounded px-2 py-0.5 text-xs">
                       <option value={0}>0%</option><option value={5}>5%</option>
                       <option value={10}>10%</option><option value={12}>12%</option><option value={18}>18%</option>
                     </select>
-                    {reprintTotals.serviceChargeAmt > 0 && (
-                      <span className="text-xs font-medium text-gray-700">+₹{reprintTotals.serviceChargeAmt}</span>
-                    )}
+                    {reprintTotals.serviceChargeAmt > 0 && <span className="text-xs font-medium text-gray-700">+₹{reprintTotals.serviceChargeAmt}</span>}
                   </div>
                 </div>
                 <div className="flex justify-between items-center text-sm text-gray-600">
                   <span>Discount</span>
                   <div className="flex items-center gap-2">
-                    <select value={reprintDiscount.type}
-                      onChange={e => setReprintDiscount(p => ({ ...p, type: e.target.value, value: '' }))}
-                      className="border rounded px-2 py-0.5 text-xs">
+                    <select value={reprintDiscount.type} onChange={e => setReprintDiscount(p => ({ ...p, type: e.target.value, value: '' }))} className="border rounded px-2 py-0.5 text-xs">
                       <option value="percent">%</option><option value="flat">₹ flat</option>
                     </select>
                     <input type="number" min="0" value={reprintDiscount.value}
                       onChange={e => { setReprintDiscount(p => ({ ...p, value: e.target.value })); setReprintDiscountError(false) }}
                       placeholder="0" className="border rounded px-2 py-0.5 text-xs w-16 text-right" />
-                    {reprintTotals.discountAmt > 0 && (
-                      <span className="text-green-600 text-xs font-medium">-₹{reprintTotals.discountAmt}</span>
-                    )}
+                    {reprintTotals.discountAmt > 0 && <span className="text-green-600 text-xs font-medium">-₹{reprintTotals.discountAmt}</span>}
                   </div>
                 </div>
                 {reprintDv > 0 && (
@@ -596,28 +556,15 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                     <input type="text" value={reprintDiscount.reason}
                       onChange={e => { setReprintDiscount(p => ({ ...p, reason: e.target.value })); setReprintDiscountError(false) }}
                       placeholder="Reason..."
-                      className={`w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-orange-400
-                        ${reprintDiscountError ? 'border-red-500 bg-red-50' : 'border-gray-300'}`} />
+                      className={`w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-orange-400 ${reprintDiscountError ? 'border-red-500 bg-red-50' : 'border-gray-300'}`} />
                     {reprintDiscountError && <p className="text-red-500 text-xs mt-1">⚠️ Reason required</p>}
                   </div>
                 )}
               </div>
-
-              {/* Totals */}
               <div className="bg-gray-50 rounded-xl p-3">
-                <div className="flex justify-between text-xs text-gray-500 mb-1">
-                  <span>Subtotal</span><span>₹{reprintTotals.subtotal}</span>
-                </div>
-                {reprintTotals.serviceChargeAmt > 0 && (
-                  <div className="flex justify-between text-xs text-gray-500 mb-1">
-                    <span>Service ({reprintServicePct}%)</span><span>+₹{reprintTotals.serviceChargeAmt}</span>
-                  </div>
-                )}
-                {reprintTotals.discountAmt > 0 && (
-                  <div className="flex justify-between text-xs text-green-600 mb-1">
-                    <span>Discount</span><span>-₹{reprintTotals.discountAmt}</span>
-                  </div>
-                )}
+                <div className="flex justify-between text-xs text-gray-500 mb-1"><span>Subtotal</span><span>₹{reprintTotals.subtotal}</span></div>
+                {reprintTotals.serviceChargeAmt > 0 && <div className="flex justify-between text-xs text-gray-500 mb-1"><span>Service ({reprintServicePct}%)</span><span>+₹{reprintTotals.serviceChargeAmt}</span></div>}
+                {reprintTotals.discountAmt > 0 && <div className="flex justify-between text-xs text-green-600 mb-1"><span>Discount</span><span>-₹{reprintTotals.discountAmt}</span></div>}
                 <div className="border-t border-dashed my-1" />
                 <div className="flex justify-between font-bold text-gray-800 text-base">
                   <span>Final Total</span>
@@ -625,7 +572,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                 </div>
               </div>
             </div>
-
             <div className="p-4 border-t space-y-2">
               <button onClick={handleReprintAndSave} disabled={saving}
                 className="w-full bg-green-500 text-white py-3 rounded-xl font-bold hover:bg-green-600 disabled:opacity-50">
@@ -640,7 +586,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         </div>
       )}
 
-      {/* ── Close Day Modal ───────────────────────────── */}
+      {/* Close Day Modal */}
       {showCloseDay && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl">
@@ -661,8 +607,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
               </div>
             )}
             <div className="flex gap-3">
-              <button onClick={() => setShowCloseDay(false)}
-                className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
+              <button onClick={() => setShowCloseDay(false)} className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
               <button onClick={closeDay} disabled={closingDay || pendingBills.length > 0}
                 className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold disabled:opacity-50">
                 {closingDay ? '⏳ Closing...' : '🌙 Close Day'}
@@ -672,7 +617,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         </div>
       )}
 
-      {/* ── Navbar ────────────────────────────────────── */}
+      {/* Navbar */}
       <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30">
         <div className="flex items-center gap-3">
           <span className="text-xl">📋</span>
@@ -684,24 +629,13 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
           </div>
         </div>
         <div className="flex gap-2 flex-wrap justify-end">
-          <button onClick={() => setShowCloseDay(true)}
-            className="bg-orange-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-600">
-            🌙 Close Day
-          </button>
-          <button onClick={() => navigate('/admin/reports')}
-            className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">
-            📊 Reports
-          </button>
-          <button onClick={() => navigate('/admin/dashboard')}
-            className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">
-            ← Dashboard
-          </button>
+          <button onClick={() => setShowCloseDay(true)} className="bg-orange-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-600">🌙 Close Day</button>
+          <button onClick={() => navigate('/admin/reports')} className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">📊 Reports</button>
+          <button onClick={() => navigate('/admin/dashboard')} className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">← Dashboard</button>
         </div>
       </div>
 
       <div className="p-4 md:p-6 max-w-3xl mx-auto">
-
-        {/* Summary Cards */}
         {summary && summary.total > 0 && (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
             <div className="bg-white border border-gray-200 rounded-2xl p-4">
@@ -725,7 +659,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         )}
 
         {loading && <div className="text-center py-12 text-gray-400">Loading...</div>}
-
         {!loading && bills.length === 0 && (
           <div className="text-center py-16 text-gray-400">
             <div className="text-5xl mb-3">📭</div>
@@ -733,14 +666,13 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
           </div>
         )}
 
-        {/* ── Pending Bills ─────────────────────────── */}
+        {/* Pending Bills */}
         {!loading && pendingBills.length > 0 && (
           <div className="mb-6">
             <h2 className="text-base font-bold text-red-500 mb-3">⏳ Unsettled Bills ({pendingBills.length})</h2>
             <div className="space-y-4">
               {pendingBills.map(bill => {
                 const isEditing = editingBillKey === bill._key
-
                 return (
                   <div key={bill._key} className="bg-white border-2 border-yellow-300 rounded-2xl shadow-sm overflow-hidden">
                     <div className="p-4">
@@ -757,30 +689,23 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                         </div>
                       </div>
 
-                      {/* Items list */}
                       <div className="space-y-1 mb-2">
                         {bill.order_items?.map((item, i) => {
                           const key = `item:${i}`
                           const isRemoved = isEditing && editRemovedItemKeys.has(key)
                           return (
-                            <div key={i} className={`flex justify-between text-xs
-                              ${isRemoved ? 'line-through opacity-40 text-red-400' : 'text-gray-500'}`}>
+                            <div key={i} className={`flex justify-between text-xs ${isRemoved ? 'line-through opacity-40 text-red-400' : 'text-gray-500'}`}>
                               <span>{item.food_items?.name} × {item.quantity}</span>
                               <span>₹{item.price_at_order * item.quantity}</span>
                             </div>
                           )
                         })}
-                        {/* Open items from DB */}
                         {(bill.open_items || []).map((oi, i) => (
                           <div key={`open-${i}`} className="flex justify-between text-xs text-purple-600">
-                            <span>
-                              {oi.dept === 'Food' ? '🍽' : oi.dept === 'Beverage' ? '🥤' : '🍺'} {oi.name} × {oi.qty}
-                              <span className="ml-1 opacity-60">(open)</span>
-                            </span>
+                            <span>{oi.dept === 'Food' ? '🍽' : oi.dept === 'Beverage' ? '🥤' : '🍺'} {oi.name} × {oi.qty} <span className="opacity-60">(open)</span></span>
                             <span>₹{oi.price * oi.qty}</span>
                           </div>
                         ))}
-                        {/* Newly added in edit mode */}
                         {isEditing && editManualItems.map(mi => (
                           <div key={mi.tempId} className="flex justify-between text-xs text-green-600 font-medium">
                             <span>+ {mi.name} × {mi.qty}</span>
@@ -789,7 +714,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                         ))}
                       </div>
 
-                      {/* Charges summary (when not editing) */}
                       {(bill.service_charge_amt > 0 || bill.discount_amt > 0) && !isEditing && (
                         <div className="border-t pt-2 space-y-0.5 mb-3">
                           {bill.service_charge_amt > 0 && (
@@ -805,7 +729,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                         </div>
                       )}
 
-                      {/* Action buttons */}
                       {!isEditing && (
                         <div className="flex gap-2 mt-2">
                           <button onClick={() => openSettle(bill)}
@@ -820,20 +743,16 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                       )}
                     </div>
 
-                    {/* ── Edit Panel ─────────────────── */}
+                    {/* Edit Panel */}
                     {isEditing && (
                       <div className="border-t bg-blue-50">
-                        {/* Notice */}
                         <div className="px-4 pt-3 pb-2">
                           <div className="bg-blue-100 border border-blue-200 rounded-xl px-3 py-2 flex items-center gap-2">
                             <span>✏️</span>
-                            <p className="text-xs text-blue-700 font-medium">
-                              2nd & Last Chance — After reprinting, bill will be locked on settlement.
-                            </p>
+                            <p className="text-xs text-blue-700 font-medium">2nd & Last Chance — After reprinting, bill will be locked on settlement.</p>
                           </div>
                         </div>
 
-                        {/* Remove items */}
                         {bill.order_items?.length > 0 && (
                           <div className="px-4 py-3 border-b border-blue-100">
                             <p className="text-xs font-bold text-gray-500 uppercase mb-2">🗑 Remove Items</p>
@@ -842,20 +761,14 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                                 const key = `item:${i}`
                                 const isRemoved = editRemovedItemKeys.has(key)
                                 return (
-                                  <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-xl border
-                                    ${isRemoved ? 'bg-red-50 border-red-100 opacity-60' : 'bg-white border-gray-100'}`}>
+                                  <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-xl border ${isRemoved ? 'bg-red-50 border-red-100 opacity-60' : 'bg-white border-gray-100'}`}>
                                     <div className="flex items-center gap-2">
-                                      <span className={`text-sm text-gray-700 ${isRemoved ? 'line-through' : ''}`}>
-                                        {item.food_items?.name}
-                                      </span>
+                                      <span className={`text-sm text-gray-700 ${isRemoved ? 'line-through' : ''}`}>{item.food_items?.name}</span>
                                       <span className="text-xs text-gray-400">×{item.quantity}</span>
-                                      <span className="text-xs font-medium text-orange-500">
-                                        ₹{item.price_at_order * item.quantity}
-                                      </span>
+                                      <span className="text-xs font-medium text-orange-500">₹{item.price_at_order * item.quantity}</span>
                                     </div>
                                     <button onClick={() => toggleEditRemove(key)}
-                                      className={`text-xs px-3 py-1 rounded-full font-medium
-                                        ${isRemoved ? 'bg-green-100 text-green-600 hover:bg-green-200' : 'bg-red-100 text-red-500 hover:bg-red-200'}`}>
+                                      className={`text-xs px-3 py-1 rounded-full font-medium ${isRemoved ? 'bg-green-100 text-green-600 hover:bg-green-200' : 'bg-red-100 text-red-500 hover:bg-red-200'}`}>
                                       {isRemoved ? '↩ Restore' : '✕ Remove'}
                                     </button>
                                   </div>
@@ -865,29 +778,24 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                           </div>
                         )}
 
-                        {/* Add from Menu */}
                         <div className="px-4 py-3 border-b border-blue-100">
                           <p className="text-xs font-bold text-gray-500 uppercase mb-2">➕ Add from Menu</p>
-                          <input type="text" value={editMenuSearch}
-                            onChange={e => setEditMenuSearch(e.target.value)}
+                          <input type="text" value={editMenuSearch} onChange={e => setEditMenuSearch(e.target.value)}
                             placeholder="🔍 Search menu..."
                             className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm mb-2 focus:outline-none focus:ring-2 focus:ring-orange-400" />
                           {editManualItems.filter(m => m.foodItemId).length > 0 && (
                             <div className="mb-2 space-y-1">
                               <p className="text-xs text-green-600 font-medium">✅ Added:</p>
                               {editManualItems.filter(m => m.foodItemId).map(mi => (
-                                <div key={mi.tempId}
-                                  className="flex items-center justify-between bg-green-50 border border-green-100 rounded-lg px-3 py-2">
+                                <div key={mi.tempId} className="flex items-center justify-between bg-green-50 border border-green-100 rounded-lg px-3 py-2">
                                   <div>
                                     <p className="text-sm font-medium text-gray-700">{mi.name}</p>
                                     <p className="text-xs text-gray-400">₹{mi.price} × {mi.qty} = ₹{mi.price * mi.qty}</p>
                                   </div>
                                   <div className="flex items-center gap-2">
-                                    <button onClick={() => changeEditMenuQty(mi.foodItemId, -1)}
-                                      className="w-7 h-7 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center">−</button>
+                                    <button onClick={() => changeEditMenuQty(mi.foodItemId, -1)} className="w-7 h-7 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center">−</button>
                                     <span className="font-bold text-gray-700 w-4 text-center">{mi.qty}</span>
-                                    <button onClick={() => changeEditMenuQty(mi.foodItemId, 1)}
-                                      className="w-7 h-7 rounded-full bg-green-100 text-green-600 font-bold flex items-center justify-center">+</button>
+                                    <button onClick={() => changeEditMenuQty(mi.foodItemId, 1)} className="w-7 h-7 rounded-full bg-green-100 text-green-600 font-bold flex items-center justify-center">+</button>
                                   </div>
                                 </div>
                               ))}
@@ -902,8 +810,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                                   <span className="text-sm text-gray-700">{fi.name}</span>
                                   <div className="flex items-center gap-2">
                                     <span className="text-xs text-orange-500 font-bold">₹{fi.price}</span>
-                                    {added
-                                      ? <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full">×{added.qty}</span>
+                                    {added ? <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full">×{added.qty}</span>
                                       : <span className="text-xs bg-orange-100 text-orange-600 px-2 py-0.5 rounded-full">+ Add</span>}
                                   </div>
                                 </button>
@@ -912,7 +819,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                           </div>
                         </div>
 
-                        {/* Open item */}
                         <div className="px-4 py-3 border-b border-blue-100">
                           <div className="flex items-center justify-between mb-2">
                             <p className="text-xs font-bold text-gray-500 uppercase">🆕 Open Item</p>
@@ -926,8 +832,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                               <div className="flex gap-2">
                                 {[{ id: 'Food', icon: '🍽' }, { id: 'Beverage', icon: '🥤' }, { id: 'Liquor', icon: '🍺' }].map(d => (
                                   <button key={d.id} onClick={() => setEditOpenDept(d.id)}
-                                    className={`flex-1 py-2 rounded-xl text-xs font-bold border-2 transition
-                                      ${editOpenDept === d.id ? 'bg-orange-500 text-white border-transparent' : 'bg-white border-gray-200 text-gray-500'}`}>
+                                    className={`flex-1 py-2 rounded-xl text-xs font-bold border-2 transition ${editOpenDept === d.id ? 'bg-orange-500 text-white border-transparent' : 'bg-white border-gray-200 text-gray-500'}`}>
                                     {d.icon} {d.id}
                                   </button>
                                 ))}
@@ -940,24 +845,18 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                                   placeholder="Price ₹ *"
                                   className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
                                 <div className="flex items-center gap-2">
-                                  <button onClick={() => setEditOpenQty(q => Math.max(1, q - 1))}
-                                    className="w-8 h-8 rounded-full bg-gray-200 font-bold flex items-center justify-center">−</button>
+                                  <button onClick={() => setEditOpenQty(q => Math.max(1, q - 1))} className="w-8 h-8 rounded-full bg-gray-200 font-bold flex items-center justify-center">−</button>
                                   <span className="font-bold text-gray-700 w-4 text-center">{editOpenQty}</span>
-                                  <button onClick={() => setEditOpenQty(q => q + 1)}
-                                    className="w-8 h-8 rounded-full bg-orange-100 text-orange-600 font-bold flex items-center justify-center">+</button>
+                                  <button onClick={() => setEditOpenQty(q => q + 1)} className="w-8 h-8 rounded-full bg-orange-100 text-orange-600 font-bold flex items-center justify-center">+</button>
                                 </div>
                               </div>
-                              <button onClick={addEditOpenItem}
-                                className="w-full bg-orange-500 text-white py-2 rounded-xl font-bold hover:bg-orange-600">
-                                ✅ Add to Bill
-                              </button>
+                              <button onClick={addEditOpenItem} className="w-full bg-orange-500 text-white py-2 rounded-xl font-bold hover:bg-orange-600">✅ Add to Bill</button>
                             </div>
                           )}
                           {editManualItems.filter(m => m.isOpen).length > 0 && (
                             <div className="mt-2 space-y-1">
                               {editManualItems.filter(m => m.isOpen).map(mi => (
-                                <div key={mi.tempId}
-                                  className="flex items-center justify-between bg-purple-50 border border-purple-100 rounded-lg px-3 py-2">
+                                <div key={mi.tempId} className="flex items-center justify-between bg-purple-50 border border-purple-100 rounded-lg px-3 py-2">
                                   <div>
                                     <p className="text-sm font-medium text-gray-700">{mi.name}</p>
                                     <p className="text-xs text-gray-400">₹{mi.price} × {mi.qty} = ₹{mi.price * mi.qty}</p>
@@ -970,7 +869,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                           )}
                         </div>
 
-                        {/* Edit footer */}
                         <div className="px-4 py-3 space-y-2">
                           {editTotals && (
                             <div className="bg-white rounded-xl px-4 py-3 flex justify-between items-center border border-gray-100 mb-2">
@@ -982,10 +880,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                             className="w-full bg-green-500 text-white py-2.5 rounded-xl font-bold hover:bg-green-600">
                             🖨️ Preview & Reprint
                           </button>
-                          <button onClick={closeEdit}
-                            className="w-full bg-gray-100 text-gray-600 py-2 rounded-xl text-sm font-medium">
-                            Cancel Edits
-                          </button>
+                          <button onClick={closeEdit} className="w-full bg-gray-100 text-gray-600 py-2 rounded-xl text-sm font-medium">Cancel Edits</button>
                         </div>
                       </div>
                     )}
@@ -996,7 +891,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
           </div>
         )}
 
-        {/* ── Settled Bills ─────────────────────────── */}
+        {/* Settled Bills */}
         {!loading && settledBills.length > 0 && (
           <div>
             <h2 className="text-base font-bold text-green-600 mb-3">
@@ -1025,31 +920,18 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                     ))}
                     {(bill.open_items || []).map((oi, i) => (
                       <div key={`open-${i}`} className="flex justify-between text-xs text-purple-400">
-                        <span>
-                          {oi.dept === 'Food' ? '🍽' : oi.dept === 'Beverage' ? '🥤' : '🍺'} {oi.name} × {oi.qty}
-                          <span className="opacity-60 ml-1">(open)</span>
-                        </span>
+                        <span>{oi.dept === 'Food' ? '🍽' : oi.dept === 'Beverage' ? '🥤' : '🍺'} {oi.name} × {oi.qty} <span className="opacity-60">(open)</span></span>
                         <span>₹{oi.price * oi.qty}</span>
                       </div>
                     ))}
                   </div>
                   {(bill.service_charge_amt > 0 || bill.discount_amt > 0) && (
                     <div className="border-t mt-2 pt-2 space-y-0.5">
-                      {bill.service_charge_amt > 0 && (
-                        <div className="flex justify-between text-xs text-gray-400">
-                          <span>Service ({bill.service_charge_pct}%)</span><span>+₹{bill.service_charge_amt}</span>
-                        </div>
-                      )}
-                      {bill.discount_amt > 0 && (
-                        <div className="flex justify-between text-xs text-green-600">
-                          <span>Discount</span><span>-₹{bill.discount_amt}</span>
-                        </div>
-                      )}
+                      {bill.service_charge_amt > 0 && <div className="flex justify-between text-xs text-gray-400"><span>Service ({bill.service_charge_pct}%)</span><span>+₹{bill.service_charge_amt}</span></div>}
+                      {bill.discount_amt > 0 && <div className="flex justify-between text-xs text-green-600"><span>Discount</span><span>-₹{bill.discount_amt}</span></div>}
                     </div>
                   )}
-                  <div className="mt-2 flex items-center gap-1 text-xs text-gray-300">
-                    <span>🔒</span><span>Locked after settlement</span>
-                  </div>
+                  <div className="mt-2 flex items-center gap-1 text-xs text-gray-300"><span>🔒</span><span>Locked after settlement</span></div>
                 </div>
               ))}
             </div>
