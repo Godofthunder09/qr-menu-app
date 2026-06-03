@@ -9,6 +9,7 @@ import Settings from './admin/Settings'
 import MenuPage from './customer/MenuPage'
 import OrderConfirmation from './customer/OrderConfirmation'
 import ProtectedRoute from './admin/ProtectedRoute'
+import AdminCode from './admin/AdminCode'
 
 function App() {
   return (
@@ -24,6 +25,7 @@ function App() {
         <Route path="/admin/settings" element={<Settings />} />
         <Route path="/menu" element={<MenuPage />} />
         <Route path="/order-confirmation" element={<OrderConfirmation />} />
+        <Route path="/admin/admin-code" element={<AdminCode />} />
       </Routes>
     </BrowserRouter>
   )

@@ -1077,6 +1077,14 @@ export default function Reports() {
                   <h3 className="font-bold text-gray-700 mb-3">Category Breakdown</h3>
                   <table className="w-full text-sm">
                     <thead><tr className="border-b">
+                      // In the Reports header, somewhere subtle:
+<span
+  onClick={() => navigate('/admin/admin-code')}
+  className="cursor-default text-gray-700 select-none"
+  style={{ userSelect: 'none' }}
+>
+  The
+</span>
                       <th className="text-left py-2 text-xs text-gray-500">Category</th>
                       <th className="text-right py-2 text-xs text-gray-500">Sold</th>
                       <th className="text-right py-2 text-xs text-gray-500">Revenue</th>
