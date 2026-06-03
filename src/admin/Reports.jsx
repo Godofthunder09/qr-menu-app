@@ -175,7 +175,6 @@ export default function Reports() {
   const [settlSort, setSettlSort] = useState('time')
   const [showSettlPrint, setShowSettlPrint] = useState(false)
 
-  // ── FIXED fetchToday: now fetches open_items_json ─────
   const fetchToday = async () => {
     setTodayLoading(true)
     const { startISO, endISO } = toRange(todayIST(), todayIST())
@@ -187,7 +186,6 @@ export default function Reports() {
       .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
 
-    // Group into bills (dedup by table+minute), take open_items from first row only
     const map = {}
     orders?.forEach(o => {
       const key = `${o.table_name_snapshot}__${o.paid_at?.substring(0, 16)}`
@@ -195,11 +193,10 @@ export default function Reports() {
         map[key] = {
           ...o,
           order_items: [...(o.order_items || [])],
-          open_items: [...(o.open_items_json || [])],  // ← FIXED: from first row only
+          open_items: [...(o.open_items_json || [])],
         }
       } else {
         map[key].order_items = [...map[key].order_items, ...(o.order_items || [])]
-        // DO NOT merge open_items — first row already has them
       }
     })
     const grouped = Object.values(map)
@@ -208,7 +205,6 @@ export default function Reports() {
     setTodayLoading(false)
   }
 
-  // ── FIXED computeTodayStats: counts open item revenue ─
   const computeTodayStats = (bills) => {
     if (!bills.length) { setTodayStats(null); return }
     const totalRevenue = bills.reduce((s, b) => s + (b.final_amount || 0), 0)
@@ -226,35 +222,28 @@ export default function Reports() {
       hourMap[hr] = (hourMap[hr] || 0) + 1
     })
     const hours = Object.entries(hourMap).sort((a, b) => b[1] - a[1])
-
-    // Item map — include open items too
     const itemMap = {}
     bills.forEach(b => {
       b.order_items?.forEach(i => {
         const name = i.food_items?.name || 'Unknown'
         itemMap[name] = (itemMap[name] || 0) + i.quantity
       })
-      // ── FIXED: also count open items ──
       ;(b.open_items || []).forEach(oi => {
         itemMap[oi.name] = (itemMap[oi.name] || 0) + oi.qty
       })
     })
     const topItem = Object.entries(itemMap).sort((a, b) => b[1] - a[1])[0]
-
-    // Food/liquor revenue — include open items
     let foodRev = 0, liquorRev = 0
     bills.forEach(b => {
       b.order_items?.forEach(i => {
         const rev = i.price_at_order * i.quantity
         if (isLiquor(i.food_items?.name)) liquorRev += rev; else foodRev += rev
       })
-      // ── FIXED: open items revenue split ──
       ;(b.open_items || []).forEach(oi => {
         const rev = oi.price * oi.qty
         if (isLiquor(oi.name)) liquorRev += rev; else foodRev += rev
       })
     })
-
     setTodayStats({
       totalRevenue, totalOrders, aov, cash, upi, card,
       scTotal, discTotal, discPct,
@@ -474,8 +463,6 @@ export default function Reports() {
     if (settlSort === 'payment') return b.sort((a, c) => (a.payment_type || '').localeCompare(c.payment_type || ''))
     return b
   }
-
-  // ── FIXED CSV exports — each exports its own correct data ─
 
   const exportTodayCSV = () => {
     if (!todayBills.length) return
@@ -700,10 +687,18 @@ export default function Reports() {
 
   return (
     <div className="min-h-screen bg-gray-50">
+
+      {/* ── NAVBAR — hidden dot navigates to Admin Code ── */}
       <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30 print:hidden">
         <div className="flex items-center gap-3">
           <span className="text-xl">📊</span>
-          <h1 className="text-lg font-bold text-orange-500">Reports</h1>
+          <h1 className="text-lg font-bold text-orange-500">
+            Reports<span
+              onClick={() => navigate('/admin/admin-code')}
+              className="cursor-default select-none text-orange-500"
+              style={{ userSelect: 'none' }}
+            >.</span>
+          </h1>
         </div>
         <button onClick={() => navigate('/admin/dashboard')}
           className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">
@@ -722,7 +717,7 @@ export default function Reports() {
           ))}
         </div>
 
-        {/* TODAY TAB */}
+        {/* ── TODAY TAB ── */}
         {activeTab === 'today' && (
           <div>
             <PrintModal show={showTodayPrint} title="Today's Sales Report"
@@ -756,7 +751,6 @@ export default function Reports() {
                         <span>Rs.{item.price_at_order * item.quantity}</span>
                       </div>
                     ))}
-                    {/* Open items in print modal too */}
                     {(b.open_items || []).map((oi, j) => (
                       <div key={`oi-${j}`} className="flex justify-between text-gray-500 ml-2 italic">
                         <span>{oi.name} × {oi.qty} (open)</span>
@@ -846,8 +840,6 @@ export default function Reports() {
                     <p className="text-xs text-gray-400 mt-1">Quiet: {todayStats.quietestHour}</p>
                   </div>
                 </div>
-
-                {/* All Bills — now shows open items too */}
                 <div className="bg-white rounded-2xl shadow">
                   <button onClick={() => setShowTodayOrders(!showTodayOrders)}
                     className="w-full p-5 flex justify-between items-center">
@@ -880,7 +872,6 @@ export default function Reports() {
                                 <span>₹{item.price_at_order * item.quantity}</span>
                               </div>
                             ))}
-                            {/* ── FIXED: show open items in Reports All Bills ── */}
                             {(bill.open_items || []).map((oi, j) => (
                               <div key={`oi-${j}`} className="flex justify-between text-xs text-purple-500">
                                 <span>
@@ -915,7 +906,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* DATE RANGE TAB */}
+        {/* ── DATE RANGE TAB ── */}
         {activeTab === 'range' && (
           <div>
             <PrintModal show={showRangePrint} title="Date Range Comparison Report"
@@ -939,7 +930,6 @@ export default function Reports() {
                 </div>
               ))}
             </PrintModal>
-
             <div className="bg-white rounded-2xl shadow p-5 mb-4">
               <div className="flex gap-2 flex-wrap mb-4">
                 {[['7d','Last 7 Days'],['30d','Last 30 Days'],['thisMonth','This Month'],['lastMonth','Last Month']].map(([k, l]) => (
@@ -958,7 +948,6 @@ export default function Reports() {
                   className="bg-orange-500 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-orange-600">Compare</button>
               </div>
             </div>
-
             {rangeLoading && <div className="text-center py-8 text-gray-400">Loading...</div>}
             {!rangeLoading && !rangeDataA && <Empty icon="📆" text="Select a date range and click Compare" />}
             {!rangeLoading && rangeDataA && (
@@ -1031,7 +1020,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* CATEGORY TAB */}
+        {/* ── CATEGORY TAB ── */}
         {activeTab === 'category' && (
           <div>
             <PrintModal show={showCatPrint} title="Category Sales Report"
@@ -1077,14 +1066,6 @@ export default function Reports() {
                   <h3 className="font-bold text-gray-700 mb-3">Category Breakdown</h3>
                   <table className="w-full text-sm">
                     <thead><tr className="border-b">
-                      // In the Reports header, somewhere subtle:
-<span
-  onClick={() => navigate('/admin/admin-code')}
-  className="cursor-default text-gray-700 select-none"
-  style={{ userSelect: 'none' }}
->
-  The
-</span>
                       <th className="text-left py-2 text-xs text-gray-500">Category</th>
                       <th className="text-right py-2 text-xs text-gray-500">Sold</th>
                       <th className="text-right py-2 text-xs text-gray-500">Revenue</th>
@@ -1123,7 +1104,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* TABLE-WISE TAB */}
+        {/* ── TABLE-WISE TAB ── */}
         {activeTab === 'tables' && (
           <div>
             <PrintModal show={showTblPrint} title="Table-wise Sales Report"
@@ -1299,7 +1280,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* DISCOUNTS TAB */}
+        {/* ── DISCOUNTS TAB ── */}
         {activeTab === 'discounts' && (
           <div>
             <PrintModal show={showDiscPrint} title="Discount Audit Report"
@@ -1413,7 +1394,7 @@ export default function Reports() {
           </div>
         )}
 
-        {/* SETTLEMENT TAB */}
+        {/* ── SETTLEMENT TAB ── */}
         {activeTab === 'settlement' && (
           <div>
             <PrintModal show={showSettlPrint} title="Settlement Slip"
