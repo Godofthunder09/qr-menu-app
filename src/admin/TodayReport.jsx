@@ -10,7 +10,7 @@ const formatDate = (d) => new Date(d).toLocaleDateString('en-IN', {
   timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric'
 })
 
-// Only take open_items from FIRST order row — never merge across rows
+// Only take open_items from FIRST order row — never merge
 const groupOrdersIntoBills = (orders) => {
   const map = {}
   orders.forEach(order => {
@@ -20,6 +20,7 @@ const groupOrdersIntoBills = (orders) => {
       map[key] = {
         _orderIds: [order.id], _key: key,
         payment_type: order.payment_type,
+        split_payment: order.split_payment || null,
         settlement_status: order.settlement_status,
         paid_at: order.paid_at,
         table_name_snapshot: order.table_name_snapshot,
@@ -31,12 +32,11 @@ const groupOrdersIntoBills = (orders) => {
         discount_amt: order.discount_amt || 0,
         final_amount: order.final_amount || 0,
         order_items: [...(order.order_items || [])],
-        open_items: [...(order.open_items_json || [])], // FIRST row only
+        open_items: [...(order.open_items_json || [])],
       }
     } else {
       map[key]._orderIds.push(order.id)
       map[key].order_items = [...map[key].order_items, ...(order.order_items || [])]
-      // DO NOT merge open_items — first row already has them all
       if (order.settlement_status === 'pending') map[key].settlement_status = 'pending'
     }
   })
@@ -74,9 +74,24 @@ ${lines.serviceChargeAmt > 0 ? `<div class="row"><span>Service (${lines.serviceC
 ${lines.discountAmt > 0 ? `<div class="row"><span>Discount</span><span>-Rs.${lines.discountAmt}</span></div>` : ''}
 <div class="div"></div>
 <div class="row big"><span>TOTAL</span><span>Rs.${lines.finalAmount}</span></div>
+${lines.splitInfo ? `<div class="div"></div><div class="center" style="font-size:11px">Payment: ${lines.splitInfo}</div>` : ''}
 <div class="div"></div>
 <div class="center">${lines.footerNote}</div>
 </body></html>`
+
+// Helper to display payment method nicely
+const payLabel = (type, split) => {
+  if (split) {
+    return Object.entries(split)
+      .filter(([, v]) => v > 0)
+      .map(([k, v]) => `${k === 'cash' ? '💵' : k === 'upi' ? '📱' : '💳'} ₹${v}`)
+      .join(' + ')
+  }
+  if (type === 'cash') return '💵 Cash'
+  if (type === 'upi')  return '📱 UPI'
+  if (type === 'card') return '💳 Card'
+  return type || '—'
+}
 
 export default function TodayReport() {
   const navigate = useNavigate()
@@ -91,10 +106,16 @@ export default function TodayReport() {
   })
   const [allFoodItems, setAllFoodItems] = useState([])
 
+  // Settlement
   const [showSettleModal, setShowSettleModal] = useState(false)
   const [settleBill, setSettleBill] = useState(null)
-  const [settleType, setSettleType] = useState('cash')
+  const [settleType, setSettleType] = useState('cash') // 'cash','upi','card','split'
+  // Split payment
+  const [splitMode, setSplitMode] = useState('cash+upi') // 'cash+upi','cash+card','upi+card'
+  const [splitAmounts, setSplitAmounts] = useState({ first: '', second: '' })
+  const [splitError, setSplitError] = useState('')
 
+  // Edit state
   const [editingBillKey, setEditingBillKey] = useState(null)
   const [editingBill, setEditingBill] = useState(null)
   const [editRemovedItemKeys, setEditRemovedItemKeys] = useState(new Set())
@@ -106,6 +127,7 @@ export default function TodayReport() {
   const [editOpenPrice, setEditOpenPrice] = useState('')
   const [editOpenQty, setEditOpenQty] = useState(1)
 
+  // Reprint
   const [showReprintPreview, setShowReprintPreview] = useState(false)
   const [reprintServicePct, setReprintServicePct] = useState(0)
   const [reprintDiscount, setReprintDiscount] = useState({ type: 'percent', value: '', reason: '' })
@@ -137,14 +159,13 @@ export default function TodayReport() {
     const endISO   = new Date(today + 'T23:59:59+05:30').toISOString()
     const { data, error } = await supabase
       .from('orders')
-      .select(`id, payment_type, is_paid, paid_at, settlement_status,
+      .select(`id, payment_type, split_payment, is_paid, paid_at, settlement_status,
         subtotal, service_charge_pct, service_charge_amt,
         discount_type, discount_value, discount_amt,
         final_amount, table_name_snapshot, open_items_json,
         order_items(id, quantity, price_at_order, food_items(name))`)
       .eq('is_paid', true)
-      .gte('paid_at', startISO)
-      .lte('paid_at', endISO)
+      .gte('paid_at', startISO).lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
     if (error) console.error('fetchTodayBills:', error.message)
     const grouped = groupOrdersIntoBills(data || [])
@@ -152,54 +173,110 @@ export default function TodayReport() {
     const settled = grouped.filter(b => b.settlement_status !== 'pending')
     const pending  = grouped.filter(b => b.settlement_status === 'pending')
     const totalRevenue = settled.reduce((s, b) => s + (b.final_amount || 0), 0)
-    const cashRev = settled.filter(b => b.payment_type === 'cash').reduce((s, b) => s + (b.final_amount || 0), 0)
-    const upiRev  = settled.filter(b => b.payment_type === 'upi' ).reduce((s, b) => s + (b.final_amount || 0), 0)
-    const cardRev = settled.filter(b => b.payment_type === 'card').reduce((s, b) => s + (b.final_amount || 0), 0)
+    const cashRev = settled.reduce((s, b) => {
+      if (b.split_payment) return s + (b.split_payment.cash || 0)
+      return s + (b.payment_type === 'cash' ? b.final_amount || 0 : 0)
+    }, 0)
+    const upiRev = settled.reduce((s, b) => {
+      if (b.split_payment) return s + (b.split_payment.upi || 0)
+      return s + (b.payment_type === 'upi' ? b.final_amount || 0 : 0)
+    }, 0)
+    const cardRev = settled.reduce((s, b) => {
+      if (b.split_payment) return s + (b.split_payment.card || 0)
+      return s + (b.payment_type === 'card' ? b.final_amount || 0 : 0)
+    }, 0)
     setSummary({ totalRevenue, cashRev, upiRev, cardRev, settled: settled.length, pending: pending.length, total: grouped.length })
     setLoading(false)
   }
 
-  const openSettle = (bill) => { setSettleBill(bill); setSettleType('cash'); setShowSettleModal(true) }
+  // ── Settlement ─────────────────────────────────────────
+  const openSettle = (bill) => {
+    setSettleBill(bill)
+    setSettleType('cash')
+    setSplitMode('cash+upi')
+    setSplitAmounts({ first: '', second: '' })
+    setSplitError('')
+    setShowSettleModal(true)
+  }
 
+  // Parse split mode into two method names
+  const parseSplitMode = (mode) => {
+    const parts = mode.split('+')
+    return { firstMethod: parts[0], secondMethod: parts[1] }
+  }
+
+  // Validate and confirm settlement
   const confirmSettle = async () => {
     if (!settleBill) return
+
+    let paymentType = settleType
+    let splitPayload = null
+
+    if (settleType === 'split') {
+      const { firstMethod, secondMethod } = parseSplitMode(splitMode)
+      const firstAmt = parseFloat(splitAmounts.first) || 0
+      const secondAmt = parseFloat(splitAmounts.second) || 0
+      const total = settleBill.final_amount || 0
+
+      if (firstAmt <= 0 && secondAmt <= 0) {
+        setSplitError('Enter amounts for both payment methods'); return
+      }
+      if (Math.abs((firstAmt + secondAmt) - total) > 1) {
+        setSplitError(`Amounts must add up to ₹${total} (currently ₹${firstAmt + secondAmt})`); return
+      }
+      setSplitError('')
+
+      // Primary type = whichever is higher
+      paymentType = firstAmt >= secondAmt ? firstMethod : secondMethod
+      splitPayload = { [firstMethod]: firstAmt, [secondMethod]: secondAmt }
+    }
+
     setSettling(settleBill._key)
     for (const orderId of settleBill._orderIds) {
-      await supabase.from('orders').update({ payment_type: settleType, settlement_status: 'settled' }).eq('id', orderId)
+      await supabase.from('orders').update({
+        payment_type: paymentType,
+        settlement_status: 'settled',
+        ...(splitPayload ? { split_payment: splitPayload } : {})
+      }).eq('id', orderId)
     }
+
+    // Update daily_reports
     const today = todayIST()
     const { data: existing } = await supabase.from('daily_reports').select('*').eq('report_date', today).single()
     const amt = settleBill.final_amount || 0
     const svc = settleBill.service_charge_amt || 0
+
+    // Calculate per-mode amounts for daily_reports
+    const cashAmt = splitPayload ? (splitPayload.cash || 0) : (paymentType === 'cash' ? amt : 0)
+    const upiAmt  = splitPayload ? (splitPayload.upi  || 0) : (paymentType === 'upi'  ? amt : 0)
+    const cardAmt = splitPayload ? (splitPayload.card || 0) : (paymentType === 'card' ? amt : 0)
+
     if (existing) {
       await supabase.from('daily_reports').update({
         total_orders: existing.total_orders + 1,
         total_revenue: existing.total_revenue + amt,
-        cash_revenue: existing.cash_revenue + (settleType === 'cash' ? amt : 0),
-        upi_revenue:  existing.upi_revenue  + (settleType === 'upi'  ? amt : 0),
-        card_revenue: existing.card_revenue + (settleType === 'card' ? amt : 0),
+        cash_revenue: existing.cash_revenue + cashAmt,
+        upi_revenue:  existing.upi_revenue  + upiAmt,
+        card_revenue: existing.card_revenue + cardAmt,
         service_charge_total: existing.service_charge_total + svc,
         updated_at: new Date().toISOString()
       }).eq('report_date', today)
     } else {
       await supabase.from('daily_reports').insert({
         report_date: today, total_orders: 1, total_revenue: amt,
-        cash_revenue: settleType === 'cash' ? amt : 0,
-        upi_revenue:  settleType === 'upi'  ? amt : 0,
-        card_revenue: settleType === 'card' ? amt : 0,
+        cash_revenue: cashAmt, upi_revenue: upiAmt, card_revenue: cardAmt,
         service_charge_total: svc
       })
     }
+
     setSettling(null); setShowSettleModal(false); fetchTodayBills()
   }
 
+  // ── Edit helpers ────────────────────────────────────────
   const openEdit = (bill) => {
-    setEditingBillKey(bill._key)
-    setEditingBill(bill)
-    setEditRemovedItemKeys(new Set())
-    setEditManualItems([])
-    setEditMenuSearch('')
-    setShowEditOpenForm(false)
+    setEditingBillKey(bill._key); setEditingBill(bill)
+    setEditRemovedItemKeys(new Set()); setEditManualItems([])
+    setEditMenuSearch(''); setShowEditOpenForm(false)
     setEditOpenName(''); setEditOpenPrice(''); setEditOpenQty(1)
   }
 
@@ -240,26 +317,17 @@ export default function TodayReport() {
     setEditOpenName(''); setEditOpenPrice(''); setEditOpenQty(1); setShowEditOpenForm(false)
   }
 
-  // ── FIXED: computeCurrentTotals ────────────────────────
-  // Uses stable item keys that match what toggleEditRemove sets
   const computeCurrentTotals = (bill, removedKeys, manualItems, svcPct, discType, discVal) => {
     if (!bill) return null
-
-    // Map order_items with stable keys matching the UI toggle keys
     const effectiveItems = (bill.order_items || [])
       .map((item, idx) => ({ ...item, _stableKey: `item:${idx}` }))
       .filter(item => !removedKeys.has(item._stableKey))
-
-    // Existing open items from DB
     const existingOpenAsItems = (bill.open_items || []).map(oi => ({
       food_items: { name: oi.name }, price_at_order: oi.price, quantity: oi.qty
     }))
-
-    // Newly added items
     const newManualAsItems = manualItems.map(mi => ({
       food_items: { name: mi.name }, price_at_order: mi.price, quantity: mi.qty
     }))
-
     const all = [...effectiveItems, ...existingOpenAsItems, ...newManualAsItems]
     const foodItems   = all.filter(i => !isLiquorItem(i.food_items?.name))
     const liquorItems = all.filter(i =>  isLiquorItem(i.food_items?.name))
@@ -270,136 +338,90 @@ export default function TodayReport() {
     const afterService = subtotal + serviceChargeAmt
     const dv = parseFloat(discVal) || 0
     const discountAmt = discType === 'percent'
-      ? Math.round(afterService * dv / 100)
-      : Math.min(dv, afterService)
+      ? Math.round(afterService * dv / 100) : Math.min(dv, afterService)
     const finalAmount = afterService - discountAmt
-
     return { foodItems, liquorItems, foodSubtotal, liquorSubtotal, subtotal, serviceChargeAmt, discountAmt, finalAmount }
   }
 
   const editTotals = editingBill
-    ? computeCurrentTotals(
-        editingBill, editRemovedItemKeys, editManualItems,
+    ? computeCurrentTotals(editingBill, editRemovedItemKeys, editManualItems,
         editingBill.service_charge_pct, editingBill.discount_type,
-        editingBill.discount_value?.toString() || ''
-      )
+        editingBill.discount_value?.toString() || '')
     : null
 
   const openReprintPreview = (bill) => {
     setReprintServicePct(bill.service_charge_pct || 0)
-    setReprintDiscount({
-      type: bill.discount_type || 'percent',
-      value: bill.discount_value?.toString() || '',
-      reason: ''
-    })
+    setReprintDiscount({ type: bill.discount_type || 'percent', value: bill.discount_value?.toString() || '', reason: '' })
     setReprintDiscountError(false)
     setShowReprintPreview(true)
   }
 
   const reprintTotals = showReprintPreview && editingBill
-    ? computeCurrentTotals(
-        editingBill, editRemovedItemKeys, editManualItems,
-        reprintServicePct, reprintDiscount.type, reprintDiscount.value
-      )
+    ? computeCurrentTotals(editingBill, editRemovedItemKeys, editManualItems,
+        reprintServicePct, reprintDiscount.type, reprintDiscount.value)
     : null
 
   const handleReprintAndSave = async () => {
     const dv = parseFloat(reprintDiscount.value) || 0
     if (dv > 0 && !reprintDiscount.reason.trim()) { setReprintDiscountError(true); return }
     setReprintDiscountError(false)
-    if (!editingBill || !reprintTotals) {
-      alert('Error: No bill loaded. Please close and try again.')
-      return
-    }
+    if (!editingBill || !reprintTotals) { alert('Error: No bill loaded.'); return }
     setSaving(true)
     try {
       const totals = reprintTotals
-
       const foodSection = totals.foodItems.length > 0 ? `
 <div class="section-title">FOOD</div>
 ${totals.foodItems.map(i => `<div class="row"><span>${i.food_items?.name || 'Item'} x${i.quantity}</span><span>Rs.${i.price_at_order * i.quantity}</span></div>`).join('')}
 <div class="row bold"><span>Food Subtotal</span><span>Rs.${totals.foodSubtotal}</span></div>
 <div class="div"></div>` : ''
-
       const liquorSection = totals.liquorItems.length > 0 ? `
 <div class="section-title">LIQUOR</div>
 ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'Item'} x${i.quantity}</span><span>Rs.${i.price_at_order * i.quantity}</span></div>`).join('')}
 <div class="row bold"><span>Liquor Subtotal</span><span>Rs.${totals.liquorSubtotal}</span></div>
 <div class="div"></div>` : ''
-
       const lines = {
         restaurantName: restaurant.name, address: restaurant.address,
         phone: restaurant.phone, gstNumber: restaurant.gst_number,
         footerNote: restaurant.footer_note,
         tableName: editingBill.table_name_snapshot || '',
-        date: formatDate(editingBill.paid_at),
-        time: toIST(editingBill.paid_at),
+        date: formatDate(editingBill.paid_at), time: toIST(editingBill.paid_at),
         foodSection, liquorSection,
-        subtotal: totals.subtotal,
-        serviceChargePct: reprintServicePct,
-        serviceChargeAmt: totals.serviceChargeAmt,
-        discountAmt: totals.discountAmt,
+        subtotal: totals.subtotal, serviceChargePct: reprintServicePct,
+        serviceChargeAmt: totals.serviceChargeAmt, discountAmt: totals.discountAmt,
         finalAmount: totals.finalAmount,
       }
-
       const w = window.open('', '_blank', 'width=400,height=600')
-      if (w) {
-        w.document.write(buildHtmlReceipt(lines))
-        w.document.close(); w.focus()
-        setTimeout(() => { w.print(); w.close() }, 300)
-      }
+      if (w) { w.document.write(buildHtmlReceipt(lines)); w.document.close(); w.focus(); setTimeout(() => { w.print(); w.close() }, 300) }
 
-      const newOpenItems = editManualItems
-        .filter(m => m.isOpen)
+      const newOpenItems = editManualItems.filter(m => m.isOpen)
         .map(mi => ({ name: mi.name, price: mi.price, qty: mi.qty, dept: mi.dept, total: mi.price * mi.qty }))
       const updatedOpenItems = [...(editingBill.open_items || []), ...newOpenItems]
 
       for (const orderId of editingBill._orderIds) {
-        const { error } = await supabase.from('orders').update({
-          subtotal: totals.subtotal,
-          service_charge_pct: reprintServicePct,
+        await supabase.from('orders').update({
+          subtotal: totals.subtotal, service_charge_pct: reprintServicePct,
           service_charge_amt: totals.serviceChargeAmt,
-          discount_type: reprintDiscount.type,
-          discount_value: dv,
-          discount_amt: totals.discountAmt,
-          discount_reason: reprintDiscount.reason.trim(),
-          final_amount: totals.finalAmount,
-          open_items_json: updatedOpenItems,
+          discount_type: reprintDiscount.type, discount_value: dv,
+          discount_amt: totals.discountAmt, discount_reason: reprintDiscount.reason.trim(),
+          final_amount: totals.finalAmount, open_items_json: updatedOpenItems,
         }).eq('id', orderId)
-        if (error) console.error('update error:', error.message)
       }
-
       const newMenuItems = editManualItems.filter(m => m.foodItemId)
       if (newMenuItems.length > 0) {
-        const rows = newMenuItems.map(mi => ({
-          order_id: editingBill._orderIds[0],
-          food_item_id: mi.foodItemId,
-          quantity: mi.qty,
-          price_at_order: mi.price,
-          note: "Added at Today's Report"
-        }))
-        const { error } = await supabase.from('order_items').insert(rows)
-        if (error) console.error('insert error:', error.message)
+        await supabase.from('order_items').insert(newMenuItems.map(mi => ({
+          order_id: editingBill._orderIds[0], food_item_id: mi.foodItemId,
+          quantity: mi.qty, price_at_order: mi.price, note: "Added at Today's Report"
+        })))
       }
-
-      closeEdit()
-      setShowReprintPreview(false)
-      fetchTodayBills()
+      closeEdit(); setShowReprintPreview(false); fetchTodayBills()
       alert('✅ Bill updated and reprinted!')
-    } catch (err) {
-      console.error('handleReprintAndSave error:', err)
-      alert('❌ Error: ' + err.message)
-    } finally {
-      setSaving(false)
-    }
+    } catch (err) { alert('❌ Error: ' + err.message) }
+    finally { setSaving(false) }
   }
 
   const closeDay = async () => {
     const pendingBills = bills.filter(b => b.settlement_status === 'pending')
-    if (pendingBills.length > 0) {
-      alert(`⚠️ ${pendingBills.length} bills are still unsettled.`)
-      setShowCloseDay(false); return
-    }
+    if (pendingBills.length > 0) { alert(`⚠️ ${pendingBills.length} bills are still unsettled.`); setShowCloseDay(false); return }
     setClosingDay(true)
     const today = todayIST()
     const startISO = new Date(today + 'T00:00:00+05:30').toISOString()
@@ -415,54 +437,137 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
   const filteredEditMenuItems = allFoodItems.filter(f => f.name.toLowerCase().includes(editMenuSearch.toLowerCase()))
   const reprintDv = parseFloat(reprintDiscount.value) || 0
 
-  const PayBadge = ({ type }) => {
-    if (!type || type === 'pending') return (
-      <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-yellow-100 text-yellow-700">⏳ Pending</span>
-    )
-    return (
-      <span className={`text-xs px-2 py-0.5 rounded-full font-medium
-        ${type === 'cash' ? 'bg-green-100 text-green-600' : type === 'upi' ? 'bg-blue-100 text-blue-600' : 'bg-purple-100 text-purple-600'}`}>
-        {type === 'cash' ? '💵 Cash' : type === 'upi' ? '📱 UPI' : '💳 Card'}
-      </span>
-    )
+  // Split auto-fill second amount when first is entered
+  const handleSplitFirstChange = (val) => {
+    setSplitError('')
+    const v = parseFloat(val) || 0
+    const total = settleBill?.final_amount || 0
+    const remaining = Math.max(0, total - v)
+    setSplitAmounts({ first: val, second: remaining > 0 ? String(remaining) : '' })
   }
+
+  const PayBadge = ({ type, split }) => {
+    if (split) {
+      const parts = Object.entries(split).filter(([, v]) => v > 0)
+      return (
+        <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-indigo-100 text-indigo-700">
+          🔀 Split
+        </span>
+      )
+    }
+    if (!type || type === 'pending') return <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-yellow-100 text-yellow-700">⏳ Pending</span>
+    return <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${type === 'cash' ? 'bg-green-100 text-green-600' : type === 'upi' ? 'bg-blue-100 text-blue-600' : 'bg-purple-100 text-purple-600'}`}>
+      {type === 'cash' ? '💵 Cash' : type === 'upi' ? '📱 UPI' : '💳 Card'}
+    </span>
+  }
+
+  const { firstMethod, secondMethod } = parseSplitMode(splitMode)
 
   return (
     <div className="min-h-screen bg-gray-50">
 
-      {/* Settlement Modal */}
+      {/* ── Settlement Modal ─────────────────────────── */}
       {showSettleModal && settleBill && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-2xl">
             <h2 className="text-xl font-bold text-gray-800 mb-1">💰 Settle Bill</h2>
-            <p className="text-sm text-gray-400 mb-4">{settleBill.table_name_snapshot || 'Table'}</p>
-            <div className="bg-gray-50 rounded-xl p-4 mb-4 space-y-2">
+            <p className="text-sm text-gray-400 mb-3">{settleBill.table_name_snapshot || 'Table'}</p>
+
+            {/* Amount summary */}
+            <div className="bg-gray-50 rounded-xl p-3 mb-4 space-y-1.5">
               <div className="flex justify-between text-sm text-gray-500"><span>Subtotal</span><span>₹{settleBill.subtotal}</span></div>
               {settleBill.service_charge_amt > 0 && (
-                <div className="flex justify-between text-sm text-gray-500">
-                  <span>Service ({settleBill.service_charge_pct}%)</span><span>+₹{settleBill.service_charge_amt}</span>
-                </div>
+                <div className="flex justify-between text-sm text-gray-500"><span>Service ({settleBill.service_charge_pct}%)</span><span>+₹{settleBill.service_charge_amt}</span></div>
               )}
               {settleBill.discount_amt > 0 && (
-                <div className="flex justify-between text-sm text-green-600">
-                  <span>Discount</span><span>-₹{settleBill.discount_amt}</span>
-                </div>
+                <div className="flex justify-between text-sm text-green-600"><span>Discount</span><span>-₹{settleBill.discount_amt}</span></div>
               )}
               <div className="border-t pt-2 flex justify-between font-bold text-gray-800">
                 <span>Amount to Collect</span>
                 <span className="text-orange-500 text-lg">₹{settleBill.final_amount}</span>
               </div>
             </div>
+
             <p className="text-sm font-medium text-gray-700 mb-2">How did they pay?</p>
-            <div className="grid grid-cols-3 gap-2 mb-4">
-              {[{ id: 'cash', label: '💵 Cash' }, { id: 'upi', label: '📱 UPI' }, { id: 'card', label: '💳 Card' }].map(p => (
-                <button key={p.id} onClick={() => setSettleType(p.id)}
-                  className={`py-3 rounded-xl text-sm font-semibold border-2 transition
+
+            {/* 4 payment type tabs */}
+            <div className="grid grid-cols-4 gap-1.5 mb-4">
+              {[
+                { id: 'cash', label: '💵 Cash' },
+                { id: 'upi',  label: '📱 UPI' },
+                { id: 'card', label: '💳 Card' },
+                { id: 'split', label: '🔀 Split' },
+              ].map(p => (
+                <button key={p.id} onClick={() => { setSettleType(p.id); setSplitError('') }}
+                  className={`py-2.5 rounded-xl text-xs font-semibold border-2 transition
                     ${settleType === p.id ? 'border-orange-500 bg-orange-50 text-orange-600' : 'border-gray-200 text-gray-500 hover:border-orange-300'}`}>
                   {p.label}
                 </button>
               ))}
             </div>
+
+            {/* Split payment UI */}
+            {settleType === 'split' && (
+              <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-3 mb-4 space-y-3">
+                {/* Split mode selector */}
+                <div>
+                  <p className="text-xs text-gray-500 mb-1.5 font-medium">Choose payment combination</p>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {[
+                      { id: 'cash+upi',  label: '💵+📱' },
+                      { id: 'cash+card', label: '💵+💳' },
+                      { id: 'upi+card',  label: '📱+💳' },
+                    ].map(m => (
+                      <button key={m.id} onClick={() => { setSplitMode(m.id); setSplitAmounts({ first: '', second: '' }); setSplitError('') }}
+                        className={`py-2 rounded-lg text-xs font-bold border-2 transition
+                          ${splitMode === m.id ? 'border-indigo-500 bg-indigo-100 text-indigo-700' : 'border-gray-200 bg-white text-gray-500 hover:border-indigo-300'}`}>
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Amount inputs */}
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">
+                      {firstMethod === 'cash' ? '💵 Cash' : firstMethod === 'upi' ? '📱 UPI' : '💳 Card'} ₹
+                    </label>
+                    <input
+                      type="number" min="0" max={settleBill.final_amount}
+                      value={splitAmounts.first}
+                      onChange={e => handleSplitFirstChange(e.target.value)}
+                      placeholder="0"
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">
+                      {secondMethod === 'cash' ? '💵 Cash' : secondMethod === 'upi' ? '📱 UPI' : '💳 Card'} ₹
+                    </label>
+                    <input
+                      type="number" min="0" max={settleBill.final_amount}
+                      value={splitAmounts.second}
+                      onChange={e => { setSplitError(''); setSplitAmounts(p => ({ ...p, second: e.target.value })) }}
+                      placeholder="0"
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                    />
+                  </div>
+                </div>
+
+                {/* Running total check */}
+                <div className="flex justify-between text-xs">
+                  <span className="text-gray-500">Entered total:</span>
+                  <span className={`font-bold ${Math.abs(((parseFloat(splitAmounts.first)||0) + (parseFloat(splitAmounts.second)||0)) - (settleBill.final_amount||0)) <= 1 ? 'text-green-600' : 'text-red-500'}`}>
+                    ₹{(parseFloat(splitAmounts.first)||0) + (parseFloat(splitAmounts.second)||0)}
+                    {' '}/ ₹{settleBill.final_amount}
+                  </span>
+                </div>
+
+                {splitError && <p className="text-red-500 text-xs">⚠️ {splitError}</p>}
+              </div>
+            )}
+
             <div className="flex gap-3">
               <button onClick={() => setShowSettleModal(false)} className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
               <button onClick={confirmSettle} disabled={!!settling}
@@ -474,7 +579,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         </div>
       )}
 
-      {/* Reprint Preview Modal */}
+      {/* ── Reprint Preview Modal ─────────────────────── */}
       {showReprintPreview && editingBill && reprintTotals && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl max-h-[92vh] flex flex-col">
@@ -586,7 +691,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         </div>
       )}
 
-      {/* Close Day Modal */}
+      {/* ── Close Day Modal ───────────────────────────── */}
       {showCloseDay && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl">
@@ -685,7 +790,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                           <p className="text-xl font-bold text-orange-500">
                             {isEditing && editTotals ? `₹${editTotals.finalAmount}` : `₹${bill.final_amount}`}
                           </p>
-                          <PayBadge type={bill.payment_type} />
+                          <PayBadge type={bill.payment_type} split={bill.split_payment} />
                         </div>
                       </div>
 
@@ -908,7 +1013,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                     </div>
                     <div className="text-right">
                       <p className="text-lg font-bold text-gray-700">₹{bill.final_amount}</p>
-                      <PayBadge type={bill.payment_type} />
+                      <PayBadge type={bill.payment_type} split={bill.split_payment} />
                     </div>
                   </div>
                   <div className="space-y-1">
@@ -925,6 +1030,18 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                       </div>
                     ))}
                   </div>
+                  {/* Show split payment breakdown */}
+                  {bill.split_payment && (
+                    <div className="mt-2 bg-indigo-50 rounded-lg px-3 py-2">
+                      <p className="text-xs text-indigo-600 font-medium mb-1">🔀 Split Payment</p>
+                      {Object.entries(bill.split_payment).filter(([, v]) => v > 0).map(([method, amt]) => (
+                        <div key={method} className="flex justify-between text-xs text-indigo-500">
+                          <span>{method === 'cash' ? '💵 Cash' : method === 'upi' ? '📱 UPI' : '💳 Card'}</span>
+                          <span>₹{amt}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {(bill.service_charge_amt > 0 || bill.discount_amt > 0) && (
                     <div className="border-t mt-2 pt-2 space-y-0.5">
                       {bill.service_charge_amt > 0 && <div className="flex justify-between text-xs text-gray-400"><span>Service ({bill.service_charge_pct}%)</span><span>+₹{bill.service_charge_amt}</span></div>}
