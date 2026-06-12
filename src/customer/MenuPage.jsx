@@ -6,6 +6,7 @@ export default function MenuPage() {
   const [searchParams] = useSearchParams()
   const tableId = searchParams.get('table')
   const [tableName, setTableName] = useState('')
+  const [sessionVersion, setSessionVersion] = useState(null)
   const [categories, setCategories] = useState([])
   const [foodItems, setFoodItems] = useState([])
   const [activeCategory, setActiveCategory] = useState('all')
@@ -27,9 +28,7 @@ export default function MenuPage() {
   const [activeTab, setActiveTab] = useState('menu')
   const navigate = useNavigate()
 
-  // ── Storage keys — all scoped to tableId ─────────────────
   const SESSION_KEY = `pin_session_${tableId}`
-  const SUMMARY_KEY = `order_summary_${tableId}`
   const VERSION_KEY = `ver_${tableId}`
 
   // ── Welcome animation ─────────────────────────────────────
@@ -50,7 +49,7 @@ export default function MenuPage() {
     return () => clearInterval(t)
   }, [tableId, pinVerified])
 
-  // ── Init: check PIN session, load saved orders ────────────
+  // ── Init ──────────────────────────────────────────────────
   const init = async () => {
     setLoading(true)
     const { data: tbl } = await supabase
@@ -62,83 +61,94 @@ export default function MenuPage() {
     const dbVer = tbl.session_version || 1
     const myVer = parseInt(localStorage.getItem(VERSION_KEY) || '0')
 
-    // ── Version mismatch = table was cleared = wipe all data ─
     if (dbVer !== myVer) {
-      clearTableData()
+      clearLocalData()
       setLoading(false)
       setPinPhase(true)
       return
     }
 
-    // ── Version matches — check PIN session ──────────────────
     const session = localStorage.getItem(SESSION_KEY)
     if (session) {
       const parsed = JSON.parse(session)
       if (parsed.version === tbl.session_version) {
-        // Valid session — load saved order summary
-        loadSavedSummary()
+        setSessionVersion(tbl.session_version)
         setPinVerified(true)
         setPinPhase(false)
         await loadMenuData()
+        await loadOrderSummary(tableId, tbl.session_version)
         setLoading(false)
       } else {
-        // Session version mismatch
-        clearTableData()
+        clearLocalData()
         setLoading(false)
         setPinPhase(true)
       }
     } else {
-      // No session — show PIN screen
       setLoading(false)
       setPinPhase(true)
     }
   }
 
-  // ── Helper: load saved summary from localStorage ──────────
-  const loadSavedSummary = () => {
-    try {
-      const saved = localStorage.getItem(SUMMARY_KEY)
-      if (saved) {
-        const parsed = JSON.parse(saved)
-        // Only keep id, name, quantity, note — no prices
-        const clean = parsed.map(i => ({
-          id: i.id,
-          name: i.name,
-          quantity: i.quantity,
-          note: i.note || ''
-        }))
-        setOrderSummary(clean)
-      }
-    } catch (e) {
-      console.error('loadSavedSummary error:', e)
-      localStorage.removeItem(SUMMARY_KEY)
+  // ── Load order summary from Supabase ──────────────────────
+  const loadOrderSummary = async (tid, ver) => {
+    const { data, error } = await supabase
+      .from('table_order_summary')
+      .select('food_item_id, item_name, quantity, note')
+      .eq('table_id', tid)
+      .eq('session_version', ver)
+
+    if (error) { console.error('loadOrderSummary error:', error.message); return }
+    setOrderSummary(
+      (data || []).map(r => ({
+        id: r.food_item_id,
+        name: r.item_name,
+        quantity: r.quantity,
+        note: r.note || ''
+      }))
+    )
+  }
+
+  // ── Upsert one item into table_order_summary ──────────────
+  const upsertSummaryItem = async (tid, ver, item) => {
+    // Try to find existing row
+    const { data: existing } = await supabase
+      .from('table_order_summary')
+      .select('id, quantity')
+      .eq('table_id', tid)
+      .eq('session_version', ver)
+      .eq('food_item_id', item.id)
+      .single()
+
+    if (existing) {
+      // Row exists → increment quantity
+      await supabase
+        .from('table_order_summary')
+        .update({
+          quantity: existing.quantity + item.quantity,
+          note: item.note || existing.note || '',
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', existing.id)
+    } else {
+      // New row
+      await supabase
+        .from('table_order_summary')
+        .insert({
+          table_id: tid,
+          session_version: ver,
+          food_item_id: item.id,
+          item_name: item.name,
+          quantity: item.quantity,
+          note: item.note || ''
+        })
     }
   }
 
-  // ── Helper: wipe all table-specific data ──────────────────
-  const clearTableData = () => {
+  const clearLocalData = () => {
     localStorage.removeItem(SESSION_KEY)
-    localStorage.removeItem(SUMMARY_KEY)
     localStorage.removeItem(VERSION_KEY)
     setOrderSummary([])
     setCart([])
-  }
-
-  // ── Helper: save summary to localStorage ─────────────────
-  // Called synchronously after every order placed
-  const saveSummaryToStorage = (summary) => {
-    try {
-      // Only store id, name, quantity, note — no prices
-      const toStore = summary.map(i => ({
-        id: i.id,
-        name: i.name,
-        quantity: i.quantity,
-        note: i.note || ''
-      }))
-      localStorage.setItem(SUMMARY_KEY, JSON.stringify(toStore))
-    } catch (e) {
-      console.error('saveSummaryToStorage error:', e)
-    }
   }
 
   const loadMenuData = async () => {
@@ -165,7 +175,7 @@ export default function MenuPage() {
 
     const session = localStorage.getItem(SESSION_KEY)
     if (!session) {
-      clearTableData()
+      clearLocalData()
       setPinVerified(false)
       setPinPhase(true)
       return
@@ -173,8 +183,7 @@ export default function MenuPage() {
 
     const parsed = JSON.parse(session)
     if (parsed.version !== tbl.session_version) {
-      // Table was cleared — wipe everything and show PIN
-      clearTableData()
+      clearLocalData()
       setPinVerified(false)
       setPinInput('')
       setPinError('')
@@ -189,22 +198,19 @@ export default function MenuPage() {
     if (!tbl) { setPinError('Table not found.'); return }
 
     if (pinInput === tbl.pin) {
-      // Save session
       localStorage.setItem(SESSION_KEY, JSON.stringify({
         version: tbl.session_version,
         tableId,
         enteredAt: new Date().toISOString()
       }))
       localStorage.setItem(VERSION_KEY, tbl.session_version.toString())
-
-      // Load any saved orders for this session
-      loadSavedSummary()
-
+      setSessionVersion(tbl.session_version)
       setPinVerified(true)
       setPinPhase(false)
       setPinError('')
       setLoading(true)
       await loadMenuData()
+      await loadOrderSummary(tableId, tbl.session_version)
       setLoading(false)
     } else {
       setPinError('Wrong PIN. Ask your waiter.')
@@ -212,33 +218,40 @@ export default function MenuPage() {
     }
   }
 
-  // ── Merge newly placed cart into order summary ────────────
-  // FIXED: build new summary first, THEN save to storage synchronously
-  const mergeIntoSummary = (cartItems) => {
-    setOrderSummary(prev => {
-      // Build the new merged summary
-      const updated = prev.map(i => ({ ...i })) // deep copy
+  // ── Place order → upsert each cart item into summary ──────
+  const placeOrder = async () => {
+    if (!cart.length) { alert('Add items first!'); return }
+    setPlacing(true)
 
-      cartItems.forEach(cartItem => {
-        const existing = updated.find(s => s.id === cartItem.id)
-        if (existing) {
-          existing.quantity += cartItem.quantity
-          if (cartItem.note) existing.note = cartItem.note
-        } else {
-          updated.push({
-            id: cartItem.id,
-            name: cartItem.name,
-            quantity: cartItem.quantity,
-            note: cartItem.note || ''
-            // ← no price stored here intentionally
-          })
-        }
-      })
+    const { data: order, error } = await supabase
+      .from('orders')
+      .insert({ table_id: tableId, status: 'pending' })
+      .select().single()
 
-      // Save synchronously right here, not in a callback
-      saveSummaryToStorage(updated)
-      return updated
-    })
+    if (error) { alert('Error: ' + error.message); setPlacing(false); return }
+
+    const { error: e2 } = await supabase.from('order_items').insert(
+      cart.map(i => ({
+        order_id: order.id,
+        food_item_id: i.id,
+        quantity: i.quantity,
+        price_at_order: i.price,
+        note: i.note || ''
+      }))
+    )
+
+    if (e2) { alert('Error: ' + e2.message); setPlacing(false); return }
+
+    // ── Save each cart item to table_order_summary ────────
+    await Promise.all(cart.map(item => upsertSummaryItem(tableId, sessionVersion, item)))
+
+    // ── Reload summary from DB (source of truth) ──────────
+    await loadOrderSummary(tableId, sessionVersion)
+
+    setCart([])
+    setShowCart(false)
+    setPlacing(false)
+    navigate(`/order-confirmation?table=${tableId}&name=${tableName}`)
   }
 
   // ── Cart helpers ──────────────────────────────────────────
@@ -277,38 +290,6 @@ export default function MenuPage() {
     : activeCategory === 'all'
       ? foodItems
       : foodItems.filter(i => i.category_id === activeCategory)
-
-  // ── Place order ───────────────────────────────────────────
-  const placeOrder = async () => {
-    if (!cart.length) { alert('Add items first!'); return }
-    setPlacing(true)
-
-    const { data: order, error } = await supabase
-      .from('orders')
-      .insert({ table_id: tableId, status: 'pending' })
-      .select().single()
-
-    if (error) { alert('Error: ' + error.message); setPlacing(false); return }
-
-    const { error: e2 } = await supabase.from('order_items').insert(
-      cart.map(i => ({
-        order_id: order.id,
-        food_item_id: i.id,
-        quantity: i.quantity,
-        price_at_order: i.price,
-        note: i.note || ''
-      }))
-    )
-
-    if (e2) { alert('Error: ' + e2.message); setPlacing(false); return }
-
-    // Merge and save — synchronous save happens inside mergeIntoSummary
-    mergeIntoSummary(cart)
-    setCart([])
-    setShowCart(false)
-    setPlacing(false)
-    navigate(`/order-confirmation?table=${tableId}&name=${tableName}`)
-  }
 
   // ── Screens ───────────────────────────────────────────────
   if (phase === 'welcome') return (
@@ -395,7 +376,6 @@ export default function MenuPage() {
   return (
     <div className="min-h-screen bg-orange-50 pb-24">
 
-      {/* Zoom Modal */}
       {zoomedImage && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-80 flex items-center justify-center p-4"
           onClick={() => setZoomedImage(null)}>
@@ -408,7 +388,6 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* Customization Modal */}
       {noteItem && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-5 w-full max-w-sm shadow-xl">
@@ -435,7 +414,7 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ── Header ─────────────────────────────────────────── */}
+      {/* Header */}
       <div className="bg-white shadow px-4 py-3 sticky top-0 z-10">
         <div className="flex justify-between items-center mb-3">
           <div>
@@ -453,7 +432,6 @@ export default function MenuPage() {
           )}
         </div>
 
-        {/* ── Main Tabs ──────────────────────────────────────── */}
         <div className="flex gap-0 rounded-xl overflow-hidden border border-gray-200 mb-3">
           <button
             onClick={() => setActiveTab('menu')}
@@ -475,7 +453,6 @@ export default function MenuPage() {
           </button>
         </div>
 
-        {/* Search + Categories — only on menu tab */}
         {activeTab === 'menu' && (
           <>
             <div className="relative mb-3">
@@ -515,9 +492,7 @@ export default function MenuPage() {
         )}
       </div>
 
-      {/* ═══════════════════════════════════════════════════ */}
-      {/* TAB: MENU                                           */}
-      {/* ═══════════════════════════════════════════════════ */}
+      {/* TAB: MENU */}
       {activeTab === 'menu' && (
         <div className="p-4 space-y-3">
           {filtered.length === 0 && (
@@ -526,7 +501,6 @@ export default function MenuPage() {
               <p>No items found</p>
             </div>
           )}
-
           {filtered.map(item => {
             const qty = getQty(item.id)
             const cartItem = cart.find(c => c.id === item.id)
@@ -595,9 +569,7 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ═══════════════════════════════════════════════════ */}
-      {/* TAB: MY ORDERS                                      */}
-      {/* ═══════════════════════════════════════════════════ */}
+      {/* TAB: MY ORDERS */}
       {activeTab === 'myorders' && (
         <div className="p-4">
           {orderSummary.length === 0 ? (
@@ -612,14 +584,11 @@ export default function MenuPage() {
             </div>
           ) : (
             <>
-              {/* Summary header */}
               <div className="bg-orange-500 rounded-2xl p-4 mb-4 text-white">
                 <p className="text-sm opacity-80 mb-1">Total items ordered this session</p>
                 <p className="text-3xl font-bold">{totalOrderedItems} items</p>
                 <p className="text-xs opacity-70 mt-1">{orderSummary.length} dish{orderSummary.length !== 1 ? 'es' : ''}</p>
               </div>
-
-              {/* Info note */}
               <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 mb-4 flex items-start gap-2">
                 <span className="text-blue-500 text-lg mt-0.5">ℹ️</span>
                 <p className="text-xs text-blue-600 leading-relaxed">
@@ -627,8 +596,6 @@ export default function MenuPage() {
                   Billing is handled at the counter.
                 </p>
               </div>
-
-              {/* Items list — name + quantity only, no prices */}
               <div className="bg-white rounded-2xl shadow overflow-hidden mb-4">
                 <div className="px-4 py-3 border-b border-gray-100 flex justify-between items-center">
                   <h3 className="font-bold text-gray-700">📋 Ordered Items</h3>
@@ -643,7 +610,6 @@ export default function MenuPage() {
                           <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>
                         )}
                       </div>
-                      {/* Quantity only — NO price */}
                       <span className="bg-orange-100 text-orange-600 font-bold text-sm px-3 py-1 rounded-full ml-3">
                         × {item.quantity}
                       </span>
@@ -656,7 +622,6 @@ export default function MenuPage() {
                   </p>
                 </div>
               </div>
-
               <button onClick={() => setActiveTab('menu')}
                 className="w-full border-2 border-orange-500 text-orange-500 py-3 rounded-2xl font-semibold text-sm hover:bg-orange-50 transition">
                 + Add More Items
@@ -666,7 +631,7 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ── Cart Drawer ─────────────────────────────────────── */}
+      {/* Cart Drawer */}
       {showCart && (
         <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black bg-opacity-40">
           <div className="bg-white rounded-t-3xl p-5 max-h-[85vh] overflow-y-auto">
@@ -705,8 +670,6 @@ export default function MenuPage() {
                 </div>
               ))}
             </div>
-
-            {/* Cart subtotal */}
             <div className="bg-orange-50 rounded-xl px-4 py-3 mb-4">
               <div className="flex justify-between text-sm text-gray-600">
                 <span>Subtotal ({totalItems} item{totalItems !== 1 ? 's' : ''})</span>
@@ -716,7 +679,6 @@ export default function MenuPage() {
               </div>
               <p className="text-xs text-gray-400 mt-1">Final bill at counter includes service charges</p>
             </div>
-
             {cart.length > 0 && (
               <button onClick={placeOrder} disabled={placing}
                 className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg disabled:opacity-50">
@@ -727,7 +689,6 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ── Bottom Bar — only on menu tab ─────────────────── */}
       {activeTab === 'menu' && totalItems > 0 && !showCart && (
         <div className="fixed bottom-0 left-0 right-0 p-4 bg-white border-t shadow-lg">
           <button onClick={() => setShowCart(true)}
