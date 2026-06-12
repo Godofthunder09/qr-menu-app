@@ -110,39 +110,46 @@ export default function MenuPage() {
 
   // ── Upsert one item into table_order_summary ──────────────
   const upsertSummaryItem = async (tid, ver, item) => {
-    // Try to find existing row
-    const { data: existing } = await supabase
-      .from('table_order_summary')
-      .select('id, quantity')
-      .eq('table_id', tid)
-      .eq('session_version', ver)
-      .eq('food_item_id', item.id)
-      .single()
+  // First try to find an existing row
+  const { data: existing, error: fetchErr } = await supabase
+    .from('table_order_summary')
+    .select('id, quantity')
+    .eq('table_id', tid)
+    .eq('session_version', ver)
+    .eq('food_item_id', item.id)
+    .maybeSingle()  // ← use maybeSingle() instead of single() — won't throw on 0 rows
 
-    if (existing) {
-      // Row exists → increment quantity
-      await supabase
-        .from('table_order_summary')
-        .update({
-          quantity: existing.quantity + item.quantity,
-          note: item.note || existing.note || '',
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', existing.id)
-    } else {
-      // New row
-      await supabase
-        .from('table_order_summary')
-        .insert({
-          table_id: tid,
-          session_version: ver,
-          food_item_id: item.id,
-          item_name: item.name,
-          quantity: item.quantity,
-          note: item.note || ''
-        })
-    }
+  if (fetchErr) {
+    console.error('upsertSummaryItem fetch error:', fetchErr.message)
+    return
   }
+
+  if (existing) {
+    const { error: updateErr } = await supabase
+      .from('table_order_summary')
+      .update({
+        quantity: existing.quantity + item.quantity,
+        note: item.note || existing.note || '',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', existing.id)
+
+    if (updateErr) console.error('upsertSummaryItem update error:', updateErr.message)
+  } else {
+    const { error: insertErr } = await supabase
+      .from('table_order_summary')
+      .insert({
+        table_id: tid,
+        session_version: ver,
+        food_item_id: item.id,
+        item_name: item.name,
+        quantity: item.quantity,
+        note: item.note || ''
+      })
+
+    if (insertErr) console.error('upsertSummaryItem insert error:', insertErr.message)
+  }
+}
 
   const clearLocalData = () => {
     localStorage.removeItem(SESSION_KEY)
@@ -220,40 +227,55 @@ export default function MenuPage() {
 
   // ── Place order → upsert each cart item into summary ──────
   const placeOrder = async () => {
-    if (!cart.length) { alert('Add items first!'); return }
-    setPlacing(true)
+  if (!cart.length) { alert('Add items first!'); return }
+  setPlacing(true)
 
-    const { data: order, error } = await supabase
-      .from('orders')
-      .insert({ table_id: tableId, status: 'pending' })
-      .select().single()
+  const { data: order, error } = await supabase
+    .from('orders')
+    .insert({ table_id: tableId, status: 'pending' })
+    .select().single()
 
-    if (error) { alert('Error: ' + error.message); setPlacing(false); return }
+  if (error) { alert('Error placing order: ' + error.message); setPlacing(false); return }
 
-    const { error: e2 } = await supabase.from('order_items').insert(
-      cart.map(i => ({
-        order_id: order.id,
-        food_item_id: i.id,
-        quantity: i.quantity,
-        price_at_order: i.price,
-        note: i.note || ''
-      }))
-    )
+  const { error: e2 } = await supabase.from('order_items').insert(
+    cart.map(i => ({
+      order_id: order.id,
+      food_item_id: i.id,
+      quantity: i.quantity,
+      price_at_order: i.price,
+      note: i.note || ''
+    }))
+  )
 
-    if (e2) { alert('Error: ' + e2.message); setPlacing(false); return }
+  if (e2) { alert('Error saving items: ' + e2.message); setPlacing(false); return }
 
-    // ── Save each cart item to table_order_summary ────────
-    await Promise.all(cart.map(item => upsertSummaryItem(tableId, sessionVersion, item)))
-
-    // ── Reload summary from DB (source of truth) ──────────
-    await loadOrderSummary(tableId, sessionVersion)
-
-    setCart([])
-    setShowCart(false)
-    setPlacing(false)
-    navigate(`/order-confirmation?table=${tableId}&name=${tableName}`)
+  // ── Save each cart item to table_order_summary ────────
+  console.log('Saving to summary — tableId:', tableId, 'sessionVersion:', sessionVersion)
+  
+  // sessionVersion might be null! Re-fetch it to be safe
+  let ver = sessionVersion
+  if (!ver) {
+    const { data: tbl } = await supabase
+      .from('tables').select('session_version').eq('id', tableId).single()
+    ver = tbl?.session_version
+    setSessionVersion(ver)
   }
 
+  console.log('Using version:', ver)
+
+  const results = await Promise.all(
+    cart.map(item => upsertSummaryItem(tableId, ver, item))
+  )
+  console.log('Summary upsert done', results)
+
+  // ── Reload summary from DB ────────────────────────────
+  await loadOrderSummary(tableId, ver)
+
+  setCart([])
+  setShowCart(false)
+  setPlacing(false)
+  navigate(`/order-confirmation?table=${tableId}&name=${tableName}`)
+}
   // ── Cart helpers ──────────────────────────────────────────
   const handleSearch = (q) => {
     setSearchQuery(q)
