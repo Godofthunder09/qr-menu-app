@@ -29,7 +29,7 @@ export default function MenuPage() {
   const navigate = useNavigate()
 
   const SESSION_KEY = `pin_session_${tableId}`
-  const VERSION_KEY  = `ver_${tableId}`
+  const VERSION_KEY = `ver_${tableId}`
 
   // ── Welcome animation ──────────────────────────────────────
   useEffect(() => {
@@ -42,7 +42,7 @@ export default function MenuPage() {
     if (phase === 'ready' && tableId) init()
   }, [phase, tableId])
 
-  // ── Poll every 5s to detect table clear ───────────────────
+  // ── Poll every 5s to detect table clear by admin ──────────
   useEffect(() => {
     if (!tableId || !pinVerified) return
     const t = setInterval(checkSessionValid, 5000)
@@ -91,6 +91,8 @@ export default function MenuPage() {
   }
 
   // ── Load order summary from Supabase ───────────────────────
+  // This reads from table_order_summary — shows all items ordered
+  // this session, accumulating across multiple "Place Order" calls.
   const loadOrderSummary = async (tid, ver) => {
     const { data, error } = await supabase
       .from('table_order_summary')
@@ -114,7 +116,8 @@ export default function MenuPage() {
   }
 
   // ── Save one cart item into table_order_summary ────────────
-  // Uses upsert: if row exists → add qty, else → insert new row
+  // If the customer orders the same item again later, we ADD
+  // the quantity to the existing row (not duplicate it).
   const saveItemToSummary = async (tid, ver, item) => {
     // Check if row already exists for this item in this session
     const { data: existing, error: fetchErr } = await supabase
@@ -131,7 +134,7 @@ export default function MenuPage() {
     }
 
     if (existing) {
-      // Row exists → update quantity (add to it)
+      // Row exists → update quantity (accumulate)
       const { error: updateErr } = await supabase
         .from('table_order_summary')
         .update({
@@ -232,7 +235,7 @@ export default function MenuPage() {
     if (!cart.length) { alert('Add items first!'); return }
     setPlacing(true)
 
-    // Get current session version (re-fetch to be safe)
+    // Re-fetch session version to be safe
     const { data: tbl } = await supabase
       .from('tables').select('session_version').eq('id', tableId).single()
     const ver = tbl?.session_version || sessionVersion
@@ -244,7 +247,7 @@ export default function MenuPage() {
     // 1. Create the order
     const { data: order, error: orderErr } = await supabase
       .from('orders')
-      .insert({ table_id: tableId, status: 'pending' })
+      .insert({ table_id: tableId, status: 'pending', session_id: `${tableId}_${ver}` })
       .select().single()
 
     if (orderErr) {
@@ -268,12 +271,14 @@ export default function MenuPage() {
       setPlacing(false); return
     }
 
-    // 3. Save each item into table_order_summary (one by one, in sequence)
+    // 3. Save each item into table_order_summary
+    //    This is what powers the "My Orders" tab.
+    //    Done sequentially to avoid race conditions on the same row.
     for (const item of cart) {
       await saveItemToSummary(tableId, ver, item)
     }
 
-    // 4. Reload summary from DB so UI reflects latest
+    // 4. Reload summary so UI reflects latest state
     await loadOrderSummary(tableId, ver)
 
     setCart([])
@@ -522,9 +527,9 @@ export default function MenuPage() {
         )}
       </div>
 
-      {/* ═══════════════════════════════════════════════════ */}
+      {/* ════════════════════════════════════════════════════ */}
       {/* TAB: MENU                                           */}
-      {/* ═══════════════════════════════════════════════════ */}
+      {/* ════════════════════════════════════════════════════ */}
       {activeTab === 'menu' && (
         <div className="p-4 space-y-3">
           {filtered.length === 0 && (
@@ -534,8 +539,8 @@ export default function MenuPage() {
             </div>
           )}
           {filtered.map(item => {
-            const qty        = getQty(item.id)
-            const cartItem   = cart.find(c => c.id === item.id)
+            const qty         = getQty(item.id)
+            const cartItem    = cart.find(c => c.id === item.id)
             const summaryItem = orderSummary.find(s => s.id === item.id)
             return (
               <div key={item.id} className="bg-white rounded-2xl shadow p-4 flex gap-3">
@@ -601,9 +606,9 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ═══════════════════════════════════════════════════ */}
+      {/* ════════════════════════════════════════════════════ */}
       {/* TAB: MY ORDERS                                      */}
-      {/* ═══════════════════════════════════════════════════ */}
+      {/* ════════════════════════════════════════════════════ */}
       {activeTab === 'myorders' && (
         <div className="p-4">
           {orderSummary.length === 0 ? (
@@ -631,7 +636,7 @@ export default function MenuPage() {
               <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 mb-4 flex items-start gap-2">
                 <span className="text-blue-500 text-lg mt-0.5">ℹ️</span>
                 <p className="text-xs text-blue-600 leading-relaxed">
-                  These are all the items you have ordered so far.
+                  These are all the items you have ordered so far this session.
                   Your waiter has received each order. Billing is handled at the counter.
                 </p>
               </div>
@@ -651,7 +656,7 @@ export default function MenuPage() {
                           <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>
                         )}
                       </div>
-                      {/* Quantity only — no price */}
+                      {/* Quantity only — no price shown to customer */}
                       <span className="bg-orange-100 text-orange-600 font-bold text-sm px-3 py-1 rounded-full ml-3">
                         × {item.quantity}
                       </span>
