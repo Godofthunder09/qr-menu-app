@@ -24,14 +24,15 @@ export default function MenuPage() {
   const [pinError, setPinError] = useState('')
   const [pinVerified, setPinVerified] = useState(false)
   const [orderSummary, setOrderSummary] = useState([])
-  // ── NEW: active main tab ──────────────────────────────
-  const [activeTab, setActiveTab] = useState('menu') // 'menu' | 'myorders'
+  const [activeTab, setActiveTab] = useState('menu')
   const navigate = useNavigate()
 
+  // ── Storage keys — all scoped to tableId ─────────────────
   const SESSION_KEY = `pin_session_${tableId}`
   const SUMMARY_KEY = `order_summary_${tableId}`
   const VERSION_KEY = `ver_${tableId}`
 
+  // ── Welcome animation ─────────────────────────────────────
   useEffect(() => {
     const t1 = setTimeout(() => setPhase('logo'), 2000)
     const t2 = setTimeout(() => setPhase('ready'), 4000)
@@ -42,12 +43,14 @@ export default function MenuPage() {
     if (phase === 'ready' && tableId) init()
   }, [phase, tableId])
 
+  // ── Poll every 5s to detect table clear ──────────────────
   useEffect(() => {
     if (!tableId || !pinVerified) return
     const t = setInterval(checkSessionValid, 5000)
     return () => clearInterval(t)
   }, [tableId, pinVerified])
 
+  // ── Init: check PIN session, load saved orders ────────────
   const init = async () => {
     setLoading(true)
     const { data: tbl } = await supabase
@@ -59,33 +62,83 @@ export default function MenuPage() {
     const dbVer = tbl.session_version || 1
     const myVer = parseInt(localStorage.getItem(VERSION_KEY) || '0')
 
+    // ── Version mismatch = table was cleared = wipe all data ─
     if (dbVer !== myVer) {
-      localStorage.removeItem(SESSION_KEY)
-      localStorage.removeItem(SUMMARY_KEY)
-      localStorage.removeItem(VERSION_KEY)
-      setOrderSummary([])
-    } else {
-      const saved = localStorage.getItem(SUMMARY_KEY)
-      if (saved) setOrderSummary(JSON.parse(saved))
+      clearTableData()
+      setLoading(false)
+      setPinPhase(true)
+      return
     }
 
+    // ── Version matches — check PIN session ──────────────────
     const session = localStorage.getItem(SESSION_KEY)
     if (session) {
       const parsed = JSON.parse(session)
       if (parsed.version === tbl.session_version) {
-        setPinVerified(true); setPinPhase(false)
+        // Valid session — load saved order summary
+        loadSavedSummary()
+        setPinVerified(true)
+        setPinPhase(false)
+        await loadMenuData()
+        setLoading(false)
       } else {
-        localStorage.removeItem(SESSION_KEY)
-        localStorage.removeItem(SUMMARY_KEY)
-        setOrderSummary([])
-        setLoading(false); setPinPhase(true); return
+        // Session version mismatch
+        clearTableData()
+        setLoading(false)
+        setPinPhase(true)
       }
     } else {
-      setLoading(false); setPinPhase(true); return
+      // No session — show PIN screen
+      setLoading(false)
+      setPinPhase(true)
     }
+  }
 
-    await loadMenuData()
-    setLoading(false)
+  // ── Helper: load saved summary from localStorage ──────────
+  const loadSavedSummary = () => {
+    try {
+      const saved = localStorage.getItem(SUMMARY_KEY)
+      if (saved) {
+        const parsed = JSON.parse(saved)
+        // Only keep id, name, quantity, note — no prices
+        const clean = parsed.map(i => ({
+          id: i.id,
+          name: i.name,
+          quantity: i.quantity,
+          note: i.note || ''
+        }))
+        setOrderSummary(clean)
+      }
+    } catch (e) {
+      console.error('loadSavedSummary error:', e)
+      localStorage.removeItem(SUMMARY_KEY)
+    }
+  }
+
+  // ── Helper: wipe all table-specific data ──────────────────
+  const clearTableData = () => {
+    localStorage.removeItem(SESSION_KEY)
+    localStorage.removeItem(SUMMARY_KEY)
+    localStorage.removeItem(VERSION_KEY)
+    setOrderSummary([])
+    setCart([])
+  }
+
+  // ── Helper: save summary to localStorage ─────────────────
+  // Called synchronously after every order placed
+  const saveSummaryToStorage = (summary) => {
+    try {
+      // Only store id, name, quantity, note — no prices
+      const toStore = summary.map(i => ({
+        id: i.id,
+        name: i.name,
+        quantity: i.quantity,
+        note: i.note || ''
+      }))
+      localStorage.setItem(SUMMARY_KEY, JSON.stringify(toStore))
+    } catch (e) {
+      console.error('saveSummaryToStorage error:', e)
+    }
   }
 
   const loadMenuData = async () => {
@@ -95,28 +148,37 @@ export default function MenuPage() {
 
     const { data: items, error: itemsError } = await supabase
       .from('food_items')
-      .select(`*, category:categories!food_items_category_id_fkey(id, name), subcategory:categories!food_items_subcategory_id_fkey(id, name)`)
+      .select(`*,
+        category:categories!food_items_category_id_fkey(id, name),
+        subcategory:categories!food_items_subcategory_id_fkey(id, name)`)
       .eq('is_available', true).order('created_at')
 
     if (itemsError) console.error('Error fetching food items:', itemsError.message)
     setFoodItems(items || [])
   }
 
+  // ── Poll: check if table was cleared by admin ─────────────
   const checkSessionValid = async () => {
     const { data: tbl } = await supabase
       .from('tables').select('session_version').eq('id', tableId).single()
     if (!tbl) return
 
     const session = localStorage.getItem(SESSION_KEY)
-    if (!session) { setPinVerified(false); setPinPhase(true); setOrderSummary([]); return }
+    if (!session) {
+      clearTableData()
+      setPinVerified(false)
+      setPinPhase(true)
+      return
+    }
 
     const parsed = JSON.parse(session)
     if (parsed.version !== tbl.session_version) {
-      localStorage.removeItem(SESSION_KEY)
-      localStorage.removeItem(SUMMARY_KEY)
-      localStorage.removeItem(VERSION_KEY)
-      setCart([]); setOrderSummary([])
-      setPinVerified(false); setPinInput(''); setPinError(''); setPinPhase(true)
+      // Table was cleared — wipe everything and show PIN
+      clearTableData()
+      setPinVerified(false)
+      setPinInput('')
+      setPinError('')
+      setPinPhase(true)
     }
   }
 
@@ -127,13 +189,20 @@ export default function MenuPage() {
     if (!tbl) { setPinError('Table not found.'); return }
 
     if (pinInput === tbl.pin) {
+      // Save session
       localStorage.setItem(SESSION_KEY, JSON.stringify({
-        version: tbl.session_version, tableId, enteredAt: new Date().toISOString()
+        version: tbl.session_version,
+        tableId,
+        enteredAt: new Date().toISOString()
       }))
       localStorage.setItem(VERSION_KEY, tbl.session_version.toString())
-      setPinVerified(true); setPinPhase(false); setPinError('')
-      const saved = localStorage.getItem(SUMMARY_KEY)
-      if (saved) setOrderSummary(JSON.parse(saved))
+
+      // Load any saved orders for this session
+      loadSavedSummary()
+
+      setPinVerified(true)
+      setPinPhase(false)
+      setPinError('')
       setLoading(true)
       await loadMenuData()
       setLoading(false)
@@ -143,9 +212,13 @@ export default function MenuPage() {
     }
   }
 
+  // ── Merge newly placed cart into order summary ────────────
+  // FIXED: build new summary first, THEN save to storage synchronously
   const mergeIntoSummary = (cartItems) => {
     setOrderSummary(prev => {
-      const updated = [...prev]
+      // Build the new merged summary
+      const updated = prev.map(i => ({ ...i })) // deep copy
+
       cartItems.forEach(cartItem => {
         const existing = updated.find(s => s.id === cartItem.id)
         if (existing) {
@@ -153,21 +226,28 @@ export default function MenuPage() {
           if (cartItem.note) existing.note = cartItem.note
         } else {
           updated.push({
-            id: cartItem.id, name: cartItem.name,
-            quantity: cartItem.quantity, price: cartItem.price,
+            id: cartItem.id,
+            name: cartItem.name,
+            quantity: cartItem.quantity,
             note: cartItem.note || ''
+            // ← no price stored here intentionally
           })
         }
       })
-      localStorage.setItem(SUMMARY_KEY, JSON.stringify(updated))
+
+      // Save synchronously right here, not in a callback
+      saveSummaryToStorage(updated)
       return updated
     })
   }
 
+  // ── Cart helpers ──────────────────────────────────────────
   const handleSearch = (q) => {
     setSearchQuery(q)
     if (q.trim().length < 2) { setSuggestions([]); return }
-    setSuggestions(foodItems.filter(i => i.name.toLowerCase().includes(q.toLowerCase())).slice(0, 5))
+    setSuggestions(
+      foodItems.filter(i => i.name.toLowerCase().includes(q.toLowerCase())).slice(0, 5)
+    )
   }
 
   const addToCart = (item, note = '') => {
@@ -198,24 +278,31 @@ export default function MenuPage() {
       ? foodItems
       : foodItems.filter(i => i.category_id === activeCategory)
 
+  // ── Place order ───────────────────────────────────────────
   const placeOrder = async () => {
     if (!cart.length) { alert('Add items first!'); return }
     setPlacing(true)
 
     const { data: order, error } = await supabase
-      .from('orders').insert({ table_id: tableId, status: 'pending' }).select().single()
+      .from('orders')
+      .insert({ table_id: tableId, status: 'pending' })
+      .select().single()
 
     if (error) { alert('Error: ' + error.message); setPlacing(false); return }
 
     const { error: e2 } = await supabase.from('order_items').insert(
       cart.map(i => ({
-        order_id: order.id, food_item_id: i.id,
-        quantity: i.quantity, price_at_order: i.price, note: i.note || ''
+        order_id: order.id,
+        food_item_id: i.id,
+        quantity: i.quantity,
+        price_at_order: i.price,
+        note: i.note || ''
       }))
     )
 
     if (e2) { alert('Error: ' + e2.message); setPlacing(false); return }
 
+    // Merge and save — synchronous save happens inside mergeIntoSummary
     mergeIntoSummary(cart)
     setCart([])
     setShowCart(false)
@@ -246,13 +333,19 @@ export default function MenuPage() {
 
   if (!tableId) return (
     <div className="min-h-screen bg-orange-50 flex items-center justify-center">
-      <div className="text-center"><div className="text-5xl mb-3">❌</div><p className="text-gray-500">Invalid QR Code.</p></div>
+      <div className="text-center">
+        <div className="text-5xl mb-3">❌</div>
+        <p className="text-gray-500">Invalid QR Code.</p>
+      </div>
     </div>
   )
 
   if (loading) return (
     <div className="min-h-screen bg-orange-50 flex items-center justify-center">
-      <div className="text-center"><div className="text-5xl mb-3">🍽️</div><p className="text-gray-400">Loading...</p></div>
+      <div className="text-center">
+        <div className="text-5xl mb-3">🍽️</div>
+        <p className="text-gray-400">Loading...</p>
+      </div>
     </div>
   )
 
@@ -270,7 +363,9 @@ export default function MenuPage() {
           {[0,1,2,3].map(i => (
             <div key={i}
               className={`w-14 h-14 rounded-xl border-2 flex items-center justify-center text-2xl font-bold
-                ${pinInput.length > i ? 'border-orange-500 bg-orange-50 text-orange-600' : 'border-gray-200 bg-gray-50'}`}>
+                ${pinInput.length > i
+                  ? 'border-orange-500 bg-orange-50 text-orange-600'
+                  : 'border-gray-200 bg-gray-50'}`}>
               {pinInput[i] ? '●' : '○'}
             </div>
           ))}
@@ -305,7 +400,8 @@ export default function MenuPage() {
         <div className="fixed inset-0 z-50 bg-black bg-opacity-80 flex items-center justify-center p-4"
           onClick={() => setZoomedImage(null)}>
           <div className="relative max-w-lg w-full">
-            <img src={zoomedImage} alt="zoom" className="w-full rounded-2xl object-contain max-h-96" />
+            <img src={zoomedImage} alt="zoom"
+              className="w-full rounded-2xl object-contain max-h-96" />
             <button onClick={() => setZoomedImage(null)}
               className="absolute top-2 right-2 bg-white rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg">×</button>
           </div>
@@ -346,7 +442,6 @@ export default function MenuPage() {
             <h1 className="text-xl font-bold text-orange-500">🍽️ Our Menu</h1>
             <p className="text-sm text-gray-400">{tableName}</p>
           </div>
-          {/* Cart button — only on menu tab */}
           {activeTab === 'menu' && totalItems > 0 && (
             <button onClick={() => setShowCart(true)}
               className="relative bg-orange-500 text-white px-4 py-2 rounded-full text-sm font-medium">
@@ -358,17 +453,17 @@ export default function MenuPage() {
           )}
         </div>
 
-        {/* ── Tab bar ─────────────────────────────────────── */}
+        {/* ── Main Tabs ──────────────────────────────────────── */}
         <div className="flex gap-0 rounded-xl overflow-hidden border border-gray-200 mb-3">
           <button
             onClick={() => setActiveTab('menu')}
-            className={`flex-1 py-2 text-sm font-semibold flex items-center justify-center gap-1.5 transition
+            className={`flex-1 py-2.5 text-sm font-semibold flex items-center justify-center gap-1.5 transition
               ${activeTab === 'menu' ? 'bg-orange-500 text-white' : 'bg-white text-gray-500'}`}>
             🍴 Menu
           </button>
           <button
             onClick={() => setActiveTab('myorders')}
-            className={`flex-1 py-2 text-sm font-semibold flex items-center justify-center gap-1.5 transition relative
+            className={`flex-1 py-2.5 text-sm font-semibold flex items-center justify-center gap-1.5 transition
               ${activeTab === 'myorders' ? 'bg-orange-500 text-white' : 'bg-white text-gray-500'}`}>
             📋 My Orders
             {totalOrderedItems > 0 && (
@@ -380,7 +475,7 @@ export default function MenuPage() {
           </button>
         </div>
 
-        {/* Search — only on menu tab */}
+        {/* Search + Categories — only on menu tab */}
         {activeTab === 'menu' && (
           <>
             <div className="relative mb-3">
@@ -400,7 +495,6 @@ export default function MenuPage() {
                 </div>
               )}
             </div>
-
             {!searchQuery && (
               <div className="flex gap-2 overflow-x-auto pb-1">
                 <button onClick={() => setActiveCategory('all')}
@@ -518,7 +612,7 @@ export default function MenuPage() {
             </div>
           ) : (
             <>
-              {/* Summary header card */}
+              {/* Summary header */}
               <div className="bg-orange-500 rounded-2xl p-4 mb-4 text-white">
                 <p className="text-sm opacity-80 mb-1">Total items ordered this session</p>
                 <p className="text-3xl font-bold">{totalOrderedItems} items</p>
@@ -528,14 +622,14 @@ export default function MenuPage() {
               {/* Info note */}
               <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 mb-4 flex items-start gap-2">
                 <span className="text-blue-500 text-lg mt-0.5">ℹ️</span>
-                <p className="text-xs text-blue-600">
+                <p className="text-xs text-blue-600 leading-relaxed">
                   These are all the items you have ordered so far. Your waiter has received each order.
                   Billing is handled at the counter.
                 </p>
               </div>
 
-              {/* Items list */}
-              <div className="bg-white rounded-2xl shadow overflow-hidden">
+              {/* Items list — name + quantity only, no prices */}
+              <div className="bg-white rounded-2xl shadow overflow-hidden mb-4">
                 <div className="px-4 py-3 border-b border-gray-100 flex justify-between items-center">
                   <h3 className="font-bold text-gray-700">📋 Ordered Items</h3>
                   <span className="text-xs text-gray-400">{tableName}</span>
@@ -549,12 +643,10 @@ export default function MenuPage() {
                           <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>
                         )}
                       </div>
-                      {/* Quantity badge — NO price shown */}
-                      <div className="flex items-center gap-2 ml-3">
-                        <span className="bg-orange-100 text-orange-600 font-bold text-sm px-3 py-1 rounded-full">
-                          × {item.quantity}
-                        </span>
-                      </div>
+                      {/* Quantity only — NO price */}
+                      <span className="bg-orange-100 text-orange-600 font-bold text-sm px-3 py-1 rounded-full ml-3">
+                        × {item.quantity}
+                      </span>
                     </div>
                   ))}
                 </div>
@@ -565,9 +657,8 @@ export default function MenuPage() {
                 </div>
               </div>
 
-              {/* Add more button */}
               <button onClick={() => setActiveTab('menu')}
-                className="mt-4 w-full border-2 border-orange-500 text-orange-500 py-3 rounded-2xl font-semibold text-sm hover:bg-orange-50 transition">
+                className="w-full border-2 border-orange-500 text-orange-500 py-3 rounded-2xl font-semibold text-sm hover:bg-orange-50 transition">
                 + Add More Items
               </button>
             </>
@@ -575,7 +666,7 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ── Cart Drawer ─────────────────────────────────── */}
+      {/* ── Cart Drawer ─────────────────────────────────────── */}
       {showCart && (
         <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black bg-opacity-40">
           <div className="bg-white rounded-t-3xl p-5 max-h-[85vh] overflow-y-auto">
@@ -589,8 +680,12 @@ export default function MenuPage() {
                   <div className="flex items-center gap-3">
                     <div className="flex-1">
                       <p className="font-medium text-gray-700">{item.name}</p>
-                      <p className="text-sm text-orange-500 font-semibold">₹{item.price} × {item.quantity} = ₹{item.price * item.quantity}</p>
-                      {item.note && <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>}
+                      <p className="text-sm text-orange-500 font-semibold">
+                        ₹{item.price} × {item.quantity} = ₹{item.price * item.quantity}
+                      </p>
+                      {item.note && (
+                        <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>
+                      )}
                     </div>
                     <div className="flex items-center gap-2">
                       <button onClick={() => updateQty(item.id, item.quantity - 1)}
@@ -610,14 +705,18 @@ export default function MenuPage() {
                 </div>
               ))}
             </div>
+
             {/* Cart subtotal */}
             <div className="bg-orange-50 rounded-xl px-4 py-3 mb-4">
               <div className="flex justify-between text-sm text-gray-600">
-                <span>Subtotal ({totalItems} items)</span>
-                <span className="font-bold text-orange-600">₹{cart.reduce((s, i) => s + i.price * i.quantity, 0)}</span>
+                <span>Subtotal ({totalItems} item{totalItems !== 1 ? 's' : ''})</span>
+                <span className="font-bold text-orange-600">
+                  ₹{cart.reduce((s, i) => s + i.price * i.quantity, 0)}
+                </span>
               </div>
               <p className="text-xs text-gray-400 mt-1">Final bill at counter includes service charges</p>
             </div>
+
             {cart.length > 0 && (
               <button onClick={placeOrder} disabled={placing}
                 className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg disabled:opacity-50">
@@ -628,7 +727,7 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ── Bottom Bar (Cart) — only on menu tab ─────────── */}
+      {/* ── Bottom Bar — only on menu tab ─────────────────── */}
       {activeTab === 'menu' && totalItems > 0 && !showCart && (
         <div className="fixed bottom-0 left-0 right-0 p-4 bg-white border-t shadow-lg">
           <button onClick={() => setShowCart(true)}
