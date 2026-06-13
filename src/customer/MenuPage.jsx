@@ -5,27 +5,27 @@ import { supabase } from '../supabase/client'
 export default function MenuPage() {
   const [searchParams] = useSearchParams()
   const tableId = searchParams.get('table')
-  const [tableName, setTableName] = useState('')
+  const [tableName, setTableName]       = useState('')
   const [sessionVersion, setSessionVersion] = useState(null)
-  const [categories, setCategories] = useState([])
-  const [foodItems, setFoodItems] = useState([])
+  const [categories, setCategories]     = useState([])
+  const [foodItems, setFoodItems]       = useState([])
   const [activeCategory, setActiveCategory] = useState('all')
-  const [cart, setCart] = useState([])
-  const [showCart, setShowCart] = useState(false)
-  const [loading, setLoading] = useState(true)
-  const [placing, setPlacing] = useState(false)
-  const [searchQuery, setSearchQuery] = useState('')
-  const [suggestions, setSuggestions] = useState([])
-  const [zoomedImage, setZoomedImage] = useState(null)
-  const [phase, setPhase] = useState('welcome')
-  const [noteItem, setNoteItem] = useState(null)
-  const [noteText, setNoteText] = useState('')
-  const [pinPhase, setPinPhase] = useState(false)
-  const [pinInput, setPinInput] = useState('')
-  const [pinError, setPinError] = useState('')
-  const [pinVerified, setPinVerified] = useState(false)
-  const [orderSummary, setOrderSummary] = useState([])
-  const [activeTab, setActiveTab] = useState('menu')
+  const [cart, setCart]                 = useState([])
+  const [showCart, setShowCart]         = useState(false)
+  const [showOrders, setShowOrders]     = useState(false)   // ← NEW: order summary drawer
+  const [loading, setLoading]           = useState(true)
+  const [placing, setPlacing]           = useState(false)
+  const [searchQuery, setSearchQuery]   = useState('')
+  const [suggestions, setSuggestions]   = useState([])
+  const [zoomedImage, setZoomedImage]   = useState(null)
+  const [phase, setPhase]               = useState('welcome')
+  const [noteItem, setNoteItem]         = useState(null)
+  const [noteText, setNoteText]         = useState('')
+  const [pinPhase, setPinPhase]         = useState(false)
+  const [pinInput, setPinInput]         = useState('')
+  const [pinError, setPinError]         = useState('')
+  const [pinVerified, setPinVerified]   = useState(false)
+  const [orderSummary, setOrderSummary] = useState([])      // ← persisted per session
   const navigate = useNavigate()
 
   const SESSION_KEY = `pin_session_${tableId}`
@@ -61,12 +61,8 @@ export default function MenuPage() {
     const dbVer = tbl.session_version || 1
     const myVer = parseInt(localStorage.getItem(VERSION_KEY) || '0')
 
-    // Version mismatch = table was cleared = wipe local data
     if (dbVer !== myVer) {
-      clearLocalData()
-      setLoading(false)
-      setPinPhase(true)
-      return
+      clearLocalData(); setLoading(false); setPinPhase(true); return
     }
 
     const session = localStorage.getItem(SESSION_KEY)
@@ -74,25 +70,19 @@ export default function MenuPage() {
       const parsed = JSON.parse(session)
       if (parsed.version === tbl.session_version) {
         setSessionVersion(tbl.session_version)
-        setPinVerified(true)
-        setPinPhase(false)
+        setPinVerified(true); setPinPhase(false)
         await loadMenuData()
         await loadOrderSummary(tableId, tbl.session_version)
         setLoading(false)
       } else {
-        clearLocalData()
-        setLoading(false)
-        setPinPhase(true)
+        clearLocalData(); setLoading(false); setPinPhase(true)
       }
     } else {
-      setLoading(false)
-      setPinPhase(true)
+      setLoading(false); setPinPhase(true)
     }
   }
 
-  // ── Load order summary from Supabase ───────────────────────
-  // This reads from table_order_summary — shows all items ordered
-  // this session, accumulating across multiple "Place Order" calls.
+  // ── Load order summary from table_order_summary ────────────
   const loadOrderSummary = async (tid, ver) => {
     const { data, error } = await supabase
       .from('table_order_summary')
@@ -101,10 +91,7 @@ export default function MenuPage() {
       .eq('session_version', ver)
       .order('updated_at', { ascending: true })
 
-    if (error) {
-      console.error('loadOrderSummary error:', error.message)
-      return
-    }
+    if (error) { console.error('loadOrderSummary error:', error.message); return }
     setOrderSummary(
       (data || []).map(r => ({
         id:       r.food_item_id,
@@ -115,11 +102,8 @@ export default function MenuPage() {
     )
   }
 
-  // ── Save one cart item into table_order_summary ────────────
-  // If the customer orders the same item again later, we ADD
-  // the quantity to the existing row (not duplicate it).
+  // ── Save cart item into table_order_summary ────────────────
   const saveItemToSummary = async (tid, ver, item) => {
-    // Check if row already exists for this item in this session
     const { data: existing, error: fetchErr } = await supabase
       .from('table_order_summary')
       .select('id, quantity')
@@ -128,13 +112,9 @@ export default function MenuPage() {
       .eq('food_item_id', item.id)
       .maybeSingle()
 
-    if (fetchErr) {
-      console.error('saveItemToSummary fetch error:', fetchErr.message)
-      return
-    }
+    if (fetchErr) { console.error('saveItemToSummary fetch error:', fetchErr.message); return }
 
     if (existing) {
-      // Row exists → update quantity (accumulate)
       const { error: updateErr } = await supabase
         .from('table_order_summary')
         .update({
@@ -143,10 +123,8 @@ export default function MenuPage() {
           updated_at: new Date().toISOString()
         })
         .eq('id', existing.id)
-
       if (updateErr) console.error('saveItemToSummary update error:', updateErr.message)
     } else {
-      // No row yet → insert fresh
       const { error: insertErr } = await supabase
         .from('table_order_summary')
         .insert({
@@ -158,18 +136,14 @@ export default function MenuPage() {
           note:            item.note || '',
           updated_at:      new Date().toISOString()
         })
-
       if (insertErr) console.error('saveItemToSummary insert error:', insertErr.message)
     }
   }
 
-  // ── Clear local storage for this table ────────────────────
   const clearLocalData = () => {
     localStorage.removeItem(SESSION_KEY)
     localStorage.removeItem(VERSION_KEY)
-    setOrderSummary([])
-    setCart([])
-    setSessionVersion(null)
+    setOrderSummary([]); setCart([]); setSessionVersion(null)
   }
 
   const loadMenuData = async () => {
@@ -188,21 +162,15 @@ export default function MenuPage() {
     setFoodItems(items || [])
   }
 
-  // ── Poll: detect table clear by admin ──────────────────────
   const checkSessionValid = async () => {
     const { data: tbl } = await supabase
       .from('tables').select('session_version').eq('id', tableId).single()
     if (!tbl) return
-
     const session = localStorage.getItem(SESSION_KEY)
-    if (!session) {
-      clearLocalData(); setPinVerified(false); setPinPhase(true); return
-    }
-
+    if (!session) { clearLocalData(); setPinVerified(false); setPinPhase(true); return }
     const parsed = JSON.parse(session)
     if (parsed.version !== tbl.session_version) {
-      clearLocalData()
-      setPinVerified(false); setPinInput(''); setPinError(''); setPinPhase(true)
+      clearLocalData(); setPinVerified(false); setPinInput(''); setPinError(''); setPinPhase(true)
     }
   }
 
@@ -235,27 +203,19 @@ export default function MenuPage() {
     if (!cart.length) { alert('Add items first!'); return }
     setPlacing(true)
 
-    // Re-fetch session version to be safe
     const { data: tbl } = await supabase
       .from('tables').select('session_version').eq('id', tableId).single()
     const ver = tbl?.session_version || sessionVersion
-    if (!ver) {
-      alert('Session error. Please refresh.'); setPlacing(false); return
-    }
+    if (!ver) { alert('Session error. Please refresh.'); setPlacing(false); return }
     setSessionVersion(ver)
 
-    // 1. Create the order
     const { data: order, error: orderErr } = await supabase
       .from('orders')
       .insert({ table_id: tableId, status: 'pending', session_id: `${tableId}_${ver}` })
       .select().single()
 
-    if (orderErr) {
-      alert('Error placing order: ' + orderErr.message)
-      setPlacing(false); return
-    }
+    if (orderErr) { alert('Error placing order: ' + orderErr.message); setPlacing(false); return }
 
-    // 2. Insert order_items
     const { error: itemsErr } = await supabase.from('order_items').insert(
       cart.map(i => ({
         order_id:       order.id,
@@ -266,19 +226,12 @@ export default function MenuPage() {
       }))
     )
 
-    if (itemsErr) {
-      alert('Error saving items: ' + itemsErr.message)
-      setPlacing(false); return
-    }
+    if (itemsErr) { alert('Error saving items: ' + itemsErr.message); setPlacing(false); return }
 
-    // 3. Save each item into table_order_summary
-    //    This is what powers the "My Orders" tab.
-    //    Done sequentially to avoid race conditions on the same row.
     for (const item of cart) {
       await saveItemToSummary(tableId, ver, item)
     }
 
-    // 4. Reload summary so UI reflects latest state
     await loadOrderSummary(tableId, ver)
 
     setCart([])
@@ -304,17 +257,15 @@ export default function MenuPage() {
     })
   }
 
-  const removeFromCart = (id) => setCart(prev => prev.filter(c => c.id !== id))
-
+  const removeFromCart  = (id) => setCart(prev => prev.filter(c => c.id !== id))
   const updateQty = (id, qty) => {
     if (qty < 1) { removeFromCart(id); return }
     setCart(prev => prev.map(c => c.id === id ? { ...c, quantity: qty } : c))
   }
-
   const updateNote = (id, note) =>
     setCart(prev => prev.map(c => c.id === id ? { ...c, note } : c))
 
-  const getQty  = (id) => cart.find(c => c.id === id)?.quantity || 0
+  const getQty            = (id) => cart.find(c => c.id === id)?.quantity || 0
   const totalItems        = cart.reduce((s, i) => s + i.quantity, 0)
   const totalOrderedItems = orderSummary.reduce((s, i) => s + i.quantity, 0)
 
@@ -324,7 +275,7 @@ export default function MenuPage() {
       ? foodItems
       : foodItems.filter(i => i.category_id === activeCategory)
 
-  // ── Screens ────────────────────────────────────────────────
+  // ── Splash screens ─────────────────────────────────────────
   if (phase === 'welcome') return (
     <div className="min-h-screen bg-orange-500 flex items-center justify-center">
       <div className="text-center animate-pulse">
@@ -409,7 +360,7 @@ export default function MenuPage() {
   return (
     <div className="min-h-screen bg-orange-50 pb-24">
 
-      {/* Zoom Modal */}
+      {/* ── Image Zoom Modal ─────────────────────────────────── */}
       {zoomedImage && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-80 flex items-center justify-center p-4"
           onClick={() => setZoomedImage(null)}>
@@ -422,7 +373,7 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* Customization Modal */}
+      {/* ── Customize Note Modal ──────────────────────────────── */}
       {noteItem && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-5 w-full max-w-sm shadow-xl">
@@ -449,239 +400,161 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ── Header ─────────────────────────────────────────── */}
+      {/* ── Header ───────────────────────────────────────────── */}
       <div className="bg-white shadow px-4 py-3 sticky top-0 z-10">
         <div className="flex justify-between items-center mb-3">
           <div>
             <h1 className="text-xl font-bold text-orange-500">🍽️ Our Menu</h1>
             <p className="text-sm text-gray-400">{tableName}</p>
           </div>
-          {activeTab === 'menu' && totalItems > 0 && (
-            <button onClick={() => setShowCart(true)}
-              className="relative bg-orange-500 text-white px-4 py-2 rounded-full text-sm font-medium">
-              🛒 Cart
-              <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
-                {totalItems}
-              </span>
-            </button>
+
+          {/* ── Top-right button cluster ── */}
+          <div className="flex items-center gap-2">
+
+            {/* My Orders button — shown only when there are ordered items */}
+            {totalOrderedItems > 0 && (
+              <button
+                onClick={() => setShowOrders(true)}
+                className="relative flex items-center gap-1.5 bg-green-50 border border-green-200 text-green-700 px-3 py-2 rounded-full text-sm font-semibold hover:bg-green-100 transition"
+              >
+                <span>📋</span>
+                <span>Orders</span>
+                <span className="bg-green-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                  {totalOrderedItems}
+                </span>
+              </button>
+            )}
+
+            {/* Cart button — shown when cart has items */}
+            {totalItems > 0 && (
+              <button onClick={() => setShowCart(true)}
+                className="relative bg-orange-500 text-white px-4 py-2 rounded-full text-sm font-medium">
+                🛒 Cart
+                <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
+                  {totalItems}
+                </span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Search */}
+        <div className="relative mb-3">
+          <input type="text" value={searchQuery}
+            onChange={e => handleSearch(e.target.value)}
+            placeholder="🔍 Search food items..."
+            className="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50" />
+          {suggestions.length > 0 && (
+            <div className="absolute top-full left-0 right-0 bg-white border rounded-xl shadow-lg z-20 mt-1">
+              {suggestions.map(item => (
+                <div key={item.id}
+                  onClick={() => { setSearchQuery(item.name); setSuggestions([]) }}
+                  className="px-4 py-2 text-sm text-gray-700 hover:bg-orange-50 cursor-pointer flex gap-2">
+                  🍴 {item.name}
+                </div>
+              ))}
+            </div>
           )}
         </div>
 
-        {/* Tab bar */}
-        <div className="flex gap-0 rounded-xl overflow-hidden border border-gray-200 mb-3">
-          <button onClick={() => setActiveTab('menu')}
-            className={`flex-1 py-2.5 text-sm font-semibold flex items-center justify-center gap-1.5 transition
-              ${activeTab === 'menu' ? 'bg-orange-500 text-white' : 'bg-white text-gray-500'}`}>
-            🍴 Menu
-          </button>
-          <button onClick={() => setActiveTab('myorders')}
-            className={`flex-1 py-2.5 text-sm font-semibold flex items-center justify-center gap-1.5 transition
-              ${activeTab === 'myorders' ? 'bg-orange-500 text-white' : 'bg-white text-gray-500'}`}>
-            📋 My Orders
-            {totalOrderedItems > 0 && (
-              <span className={`text-xs font-bold px-1.5 py-0.5 rounded-full ml-0.5
-                ${activeTab === 'myorders' ? 'bg-white text-orange-500' : 'bg-orange-500 text-white'}`}>
-                {totalOrderedItems}
-              </span>
-            )}
-          </button>
-        </div>
-
-        {/* Search + Categories — menu tab only */}
-        {activeTab === 'menu' && (
-          <>
-            <div className="relative mb-3">
-              <input type="text" value={searchQuery}
-                onChange={e => handleSearch(e.target.value)}
-                placeholder="🔍 Search food items..."
-                className="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50" />
-              {suggestions.length > 0 && (
-                <div className="absolute top-full left-0 right-0 bg-white border rounded-xl shadow-lg z-20 mt-1">
-                  {suggestions.map(item => (
-                    <div key={item.id}
-                      onClick={() => { setSearchQuery(item.name); setSuggestions([]) }}
-                      className="px-4 py-2 text-sm text-gray-700 hover:bg-orange-50 cursor-pointer flex gap-2">
-                      🍴 {item.name}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-            {!searchQuery && (
-              <div className="flex gap-2 overflow-x-auto pb-1">
-                <button onClick={() => setActiveCategory('all')}
-                  className={`px-4 py-1 rounded-full text-sm font-medium whitespace-nowrap
-                    ${activeCategory === 'all' ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
-                  All
-                </button>
-                {categories.map(cat => (
-                  <button key={cat.id} onClick={() => setActiveCategory(cat.id)}
-                    className={`px-4 py-1 rounded-full text-sm font-medium whitespace-nowrap
-                      ${activeCategory === cat.id ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
-                    {cat.name}
-                  </button>
-                ))}
-              </div>
-            )}
-          </>
+        {/* Category pills */}
+        {!searchQuery && (
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            <button onClick={() => setActiveCategory('all')}
+              className={`px-4 py-1 rounded-full text-sm font-medium whitespace-nowrap
+                ${activeCategory === 'all' ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
+              All
+            </button>
+            {categories.map(cat => (
+              <button key={cat.id} onClick={() => setActiveCategory(cat.id)}
+                className={`px-4 py-1 rounded-full text-sm font-medium whitespace-nowrap
+                  ${activeCategory === cat.id ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
+                {cat.name}
+              </button>
+            ))}
+          </div>
         )}
       </div>
 
-      {/* ════════════════════════════════════════════════════ */}
-      {/* TAB: MENU                                           */}
-      {/* ════════════════════════════════════════════════════ */}
-      {activeTab === 'menu' && (
-        <div className="p-4 space-y-3">
-          {filtered.length === 0 && (
-            <div className="text-center py-16 text-gray-400">
-              <div className="text-4xl mb-2">🍴</div>
-              <p>No items found</p>
-            </div>
-          )}
-          {filtered.map(item => {
-            const qty         = getQty(item.id)
-            const cartItem    = cart.find(c => c.id === item.id)
-            const summaryItem = orderSummary.find(s => s.id === item.id)
-            return (
-              <div key={item.id} className="bg-white rounded-2xl shadow p-4 flex gap-3">
-                {item.image_url
-                  ? <img src={item.image_url} alt={item.name}
-                      onClick={() => setZoomedImage(item.image_url)}
-                      className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer hover:opacity-90 transition" />
-                  : <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">🍴</div>
-                }
-                <div className="flex-1">
-                  <div className="flex justify-between items-start gap-1">
-                    <h3 className="font-semibold text-gray-800">{item.name}</h3>
-                    {summaryItem && (
-                      <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full font-medium shrink-0">
-                        Ordered ×{summaryItem.quantity}
-                      </span>
-                    )}
-                  </div>
-                  {item.category?.name && (
-                    <p className="text-xs text-orange-400 font-medium mt-0.5">
-                      {item.category.name}{item.subcategory?.name && ` › ${item.subcategory.name}`}
-                    </p>
+      {/* ── Food Items List ───────────────────────────────────── */}
+      <div className="p-4 space-y-3">
+        {filtered.length === 0 && (
+          <div className="text-center py-16 text-gray-400">
+            <div className="text-4xl mb-2">🍴</div>
+            <p>No items found</p>
+          </div>
+        )}
+        {filtered.map(item => {
+          const qty         = getQty(item.id)
+          const cartItem    = cart.find(c => c.id === item.id)
+          const summaryItem = orderSummary.find(s => s.id === item.id)
+          return (
+            <div key={item.id} className="bg-white rounded-2xl shadow p-4 flex gap-3">
+              {item.image_url
+                ? <img src={item.image_url} alt={item.name}
+                    onClick={() => setZoomedImage(item.image_url)}
+                    className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer hover:opacity-90 transition" />
+                : <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">🍴</div>
+              }
+              <div className="flex-1">
+                <div className="flex justify-between items-start gap-1">
+                  <h3 className="font-semibold text-gray-800">{item.name}</h3>
+                  {summaryItem && (
+                    <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full font-medium shrink-0">
+                      Ordered ×{summaryItem.quantity}
+                    </span>
                   )}
-                  {item.description && (
-                    <p className="text-xs text-gray-400 mt-1 line-clamp-2">{item.description}</p>
-                  )}
-                  <p className="text-orange-500 font-bold mt-1">₹{item.price}</p>
-                  {cartItem?.note && (
-                    <p className="text-xs text-orange-400 italic mt-1">📝 "{cartItem.note}"</p>
-                  )}
-                  <div className="mt-2 flex items-center gap-2 flex-wrap">
-                    {qty === 0 ? (
-                      <>
-                        <button onClick={() => addToCart(item)}
-                          className="bg-orange-500 text-white px-4 py-1 rounded-full text-sm font-medium hover:bg-orange-600">
-                          + Add
-                        </button>
-                        <button onClick={() => { setNoteItem(item); setNoteText('') }}
-                          className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
-                          📝 Customize
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <div className="flex items-center gap-2">
-                          <button onClick={() => updateQty(item.id, qty - 1)}
-                            className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
-                          <span className="font-semibold">{qty}</span>
-                          <button onClick={() => updateQty(item.id, qty + 1)}
-                            className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
-                        </div>
-                        <button onClick={() => { setNoteItem(item); setNoteText(cartItem?.note || '') }}
-                          className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
-                          📝 {cartItem?.note ? 'Edit Note' : 'Add Note'}
-                        </button>
-                      </>
-                    )}
-                  </div>
                 </div>
-              </div>
-            )
-          })}
-        </div>
-      )}
-
-      {/* ════════════════════════════════════════════════════ */}
-      {/* TAB: MY ORDERS                                      */}
-      {/* ════════════════════════════════════════════════════ */}
-      {activeTab === 'myorders' && (
-        <div className="p-4">
-          {orderSummary.length === 0 ? (
-            <div className="text-center py-20 text-gray-400">
-              <div className="text-6xl mb-4">🛎️</div>
-              <p className="text-lg font-medium text-gray-500">No orders placed yet</p>
-              <p className="text-sm mt-2 text-gray-400">Browse the menu and add items to your cart</p>
-              <button onClick={() => setActiveTab('menu')}
-                className="mt-6 bg-orange-500 text-white px-6 py-3 rounded-2xl font-medium text-sm">
-                Browse Menu →
-              </button>
-            </div>
-          ) : (
-            <>
-              {/* Header card */}
-              <div className="bg-orange-500 rounded-2xl p-4 mb-4 text-white">
-                <p className="text-sm opacity-80 mb-1">Total items ordered this session</p>
-                <p className="text-3xl font-bold">{totalOrderedItems} items</p>
-                <p className="text-xs opacity-70 mt-1">
-                  {orderSummary.length} dish{orderSummary.length !== 1 ? 'es' : ''}
-                </p>
-              </div>
-
-              {/* Info */}
-              <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 mb-4 flex items-start gap-2">
-                <span className="text-blue-500 text-lg mt-0.5">ℹ️</span>
-                <p className="text-xs text-blue-600 leading-relaxed">
-                  These are all the items you have ordered so far this session.
-                  Your waiter has received each order. Billing is handled at the counter.
-                </p>
-              </div>
-
-              {/* Items — name + qty only, NO prices */}
-              <div className="bg-white rounded-2xl shadow overflow-hidden mb-4">
-                <div className="px-4 py-3 border-b border-gray-100 flex justify-between items-center">
-                  <h3 className="font-bold text-gray-700">📋 Ordered Items</h3>
-                  <span className="text-xs text-gray-400">{tableName}</span>
-                </div>
-                <div className="divide-y divide-gray-50">
-                  {orderSummary.map((item, i) => (
-                    <div key={i} className="px-4 py-3 flex items-center justify-between">
-                      <div className="flex-1">
-                        <p className="font-medium text-gray-800">{item.name}</p>
-                        {item.note && (
-                          <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>
-                        )}
-                      </div>
-                      {/* Quantity only — no price shown to customer */}
-                      <span className="bg-orange-100 text-orange-600 font-bold text-sm px-3 py-1 rounded-full ml-3">
-                        × {item.quantity}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-                <div className="px-4 py-3 bg-gray-50 border-t border-gray-100">
-                  <p className="text-xs text-gray-400 text-center">
-                    Prices and total will be on your final bill 🧾
+                {item.category?.name && (
+                  <p className="text-xs text-orange-400 font-medium mt-0.5">
+                    {item.category.name}{item.subcategory?.name && ` › ${item.subcategory.name}`}
                   </p>
+                )}
+                {item.description && (
+                  <p className="text-xs text-gray-400 mt-1 line-clamp-2">{item.description}</p>
+                )}
+                <p className="text-orange-500 font-bold mt-1">₹{item.price}</p>
+                {cartItem?.note && (
+                  <p className="text-xs text-orange-400 italic mt-1">📝 "{cartItem.note}"</p>
+                )}
+                <div className="mt-2 flex items-center gap-2 flex-wrap">
+                  {qty === 0 ? (
+                    <>
+                      <button onClick={() => addToCart(item)}
+                        className="bg-orange-500 text-white px-4 py-1 rounded-full text-sm font-medium hover:bg-orange-600">
+                        + Add
+                      </button>
+                      <button onClick={() => { setNoteItem(item); setNoteText('') }}
+                        className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
+                        📝 Customize
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-2">
+                        <button onClick={() => updateQty(item.id, qty - 1)}
+                          className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
+                        <span className="font-semibold">{qty}</span>
+                        <button onClick={() => updateQty(item.id, qty + 1)}
+                          className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
+                      </div>
+                      <button onClick={() => { setNoteItem(item); setNoteText(cartItem?.note || '') }}
+                        className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
+                        📝 {cartItem?.note ? 'Edit Note' : 'Add Note'}
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
+            </div>
+          )
+        })}
+      </div>
 
-              <button onClick={() => setActiveTab('menu')}
-                className="w-full border-2 border-orange-500 text-orange-500 py-3 rounded-2xl font-semibold text-sm hover:bg-orange-50 transition">
-                + Add More Items
-              </button>
-            </>
-          )}
-        </div>
-      )}
-
-      {/* ── Cart Drawer ─────────────────────────────────────── */}
+      {/* ── Cart Drawer ───────────────────────────────────────── */}
       {showCart && (
-        <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black bg-opacity-40">
+        <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black bg-opacity-40"
+          onClick={e => { if (e.target === e.currentTarget) setShowCart(false) }}>
           <div className="bg-white rounded-t-3xl p-5 max-h-[85vh] overflow-y-auto">
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-lg font-bold">🛒 Your Cart</h2>
@@ -737,8 +610,72 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ── Bottom bar — menu tab only ─────────────────────── */}
-      {activeTab === 'menu' && totalItems > 0 && !showCart && (
+      {/* ── My Orders Drawer ──────────────────────────────────── */}
+      {showOrders && (
+        <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black bg-opacity-40"
+          onClick={e => { if (e.target === e.currentTarget) setShowOrders(false) }}>
+          <div className="bg-white rounded-t-3xl p-5 max-h-[85vh] overflow-y-auto">
+
+            {/* Drawer header */}
+            <div className="flex justify-between items-center mb-4">
+              <div>
+                <h2 className="text-lg font-bold text-gray-800">📋 My Orders</h2>
+                <p className="text-xs text-gray-400">{tableName}</p>
+              </div>
+              <button onClick={() => setShowOrders(false)} className="text-gray-400 text-2xl font-bold">×</button>
+            </div>
+
+            {/* Summary header card */}
+            <div className="bg-orange-500 rounded-2xl p-4 mb-4 text-white flex justify-between items-center">
+              <div>
+                <p className="text-xs opacity-80">Ordered this session</p>
+                <p className="text-2xl font-bold">{totalOrderedItems} items</p>
+                <p className="text-xs opacity-70">{orderSummary.length} dish{orderSummary.length !== 1 ? 'es' : ''}</p>
+              </div>
+              <div className="text-4xl opacity-80">🧾</div>
+            </div>
+
+            {/* Info banner */}
+            <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 mb-4 flex items-start gap-2">
+              <span className="text-blue-500 mt-0.5">ℹ️</span>
+              <p className="text-xs text-blue-600 leading-relaxed">
+                All items you have ordered this session. Your waiter has received each order.
+                Billing is handled at the counter.
+              </p>
+            </div>
+
+            {/* Ordered items list */}
+            <div className="bg-white border border-gray-100 rounded-2xl overflow-hidden mb-4 shadow-sm">
+              <div className="divide-y divide-gray-50">
+                {orderSummary.map((item, i) => (
+                  <div key={i} className="px-4 py-3 flex items-center justify-between">
+                    <div className="flex-1">
+                      <p className="font-medium text-gray-800">{item.name}</p>
+                      {item.note && (
+                        <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>
+                      )}
+                    </div>
+                    <span className="bg-orange-100 text-orange-600 font-bold text-sm px-3 py-1 rounded-full ml-3">
+                      × {item.quantity}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div className="px-4 py-3 bg-gray-50 border-t border-gray-100">
+                <p className="text-xs text-gray-400 text-center">Prices and total will be on your final bill 🧾</p>
+              </div>
+            </div>
+
+            <button onClick={() => setShowOrders(false)}
+              className="w-full border-2 border-orange-500 text-orange-500 py-3 rounded-2xl font-semibold text-sm hover:bg-orange-50 transition">
+              + Add More Items
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Bottom sticky cart bar ────────────────────────────── */}
+      {totalItems > 0 && !showCart && (
         <div className="fixed bottom-0 left-0 right-0 p-4 bg-white border-t shadow-lg">
           <button onClick={() => setShowCart(true)}
             className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg flex justify-between px-6">
