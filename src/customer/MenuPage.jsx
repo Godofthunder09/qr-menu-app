@@ -1,37 +1,47 @@
+// src/customer/MenuPage.jsx
 import { useEffect, useState } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
+import { useOrderSummary } from './useOrderSummary'   // ← new hook
 
 export default function MenuPage() {
   const [searchParams] = useSearchParams()
   const tableId = searchParams.get('table')
-  const [tableName, setTableName]       = useState('')
+
+  const [tableName, setTableName]           = useState('')
   const [sessionVersion, setSessionVersion] = useState(null)
-  const [categories, setCategories]     = useState([])
-  const [foodItems, setFoodItems]       = useState([])
+  const [categories, setCategories]         = useState([])
+  const [foodItems, setFoodItems]           = useState([])
   const [activeCategory, setActiveCategory] = useState('all')
-  const [cart, setCart]                 = useState([])
-  const [showCart, setShowCart]         = useState(false)
-  const [showOrders, setShowOrders]     = useState(false)   // ← NEW: order summary drawer
-  const [loading, setLoading]           = useState(true)
-  const [placing, setPlacing]           = useState(false)
-  const [searchQuery, setSearchQuery]   = useState('')
-  const [suggestions, setSuggestions]   = useState([])
-  const [zoomedImage, setZoomedImage]   = useState(null)
-  const [phase, setPhase]               = useState('welcome')
-  const [noteItem, setNoteItem]         = useState(null)
-  const [noteText, setNoteText]         = useState('')
-  const [pinPhase, setPinPhase]         = useState(false)
-  const [pinInput, setPinInput]         = useState('')
-  const [pinError, setPinError]         = useState('')
-  const [pinVerified, setPinVerified]   = useState(false)
-  const [orderSummary, setOrderSummary] = useState([])      // ← persisted per session
+  const [cart, setCart]                     = useState([])
+  const [showCart, setShowCart]             = useState(false)
+  const [showOrders, setShowOrders]         = useState(false)  // ← orders drawer
+  const [loading, setLoading]               = useState(true)
+  const [placing, setPlacing]               = useState(false)
+  const [searchQuery, setSearchQuery]       = useState('')
+  const [suggestions, setSuggestions]       = useState([])
+  const [zoomedImage, setZoomedImage]       = useState(null)
+  const [phase, setPhase]                   = useState('welcome')
+  const [noteItem, setNoteItem]             = useState(null)
+  const [noteText, setNoteText]             = useState('')
+  const [pinPhase, setPinPhase]             = useState(false)
+  const [pinInput, setPinInput]             = useState('')
+  const [pinError, setPinError]             = useState('')
+  const [pinVerified, setPinVerified]       = useState(false)
   const navigate = useNavigate()
+
+  // ── All order-summary DB logic lives in this hook ──────────
+  const {
+    orderSummary,
+    loadOrderSummary,
+    saveCartToSummary,
+    clearSummary
+  } = useOrderSummary()
 
   const SESSION_KEY = `pin_session_${tableId}`
   const VERSION_KEY = `ver_${tableId}`
 
-  // ── Welcome animation ──────────────────────────────────────
+  // ── Welcome splash ─────────────────────────────────────────
   useEffect(() => {
     const t1 = setTimeout(() => setPhase('logo'), 2000)
     const t2 = setTimeout(() => setPhase('ready'), 4000)
@@ -49,7 +59,7 @@ export default function MenuPage() {
     return () => clearInterval(t)
   }, [tableId, pinVerified])
 
-  // ── Init ───────────────────────────────────────────────────
+  // ── Init: check version + session ─────────────────────────
   const init = async () => {
     setLoading(true)
     const { data: tbl } = await supabase
@@ -82,70 +92,16 @@ export default function MenuPage() {
     }
   }
 
-  // ── Load order summary from table_order_summary ────────────
-  const loadOrderSummary = async (tid, ver) => {
-    const { data, error } = await supabase
-      .from('table_order_summary')
-      .select('food_item_id, item_name, quantity, note')
-      .eq('table_id', tid)
-      .eq('session_version', ver)
-      .order('updated_at', { ascending: true })
-
-    if (error) { console.error('loadOrderSummary error:', error.message); return }
-    setOrderSummary(
-      (data || []).map(r => ({
-        id:       r.food_item_id,
-        name:     r.item_name,
-        quantity: r.quantity,
-        note:     r.note || ''
-      }))
-    )
-  }
-
-  // ── Save cart item into table_order_summary ────────────────
-  const saveItemToSummary = async (tid, ver, item) => {
-    const { data: existing, error: fetchErr } = await supabase
-      .from('table_order_summary')
-      .select('id, quantity')
-      .eq('table_id', tid)
-      .eq('session_version', ver)
-      .eq('food_item_id', item.id)
-      .maybeSingle()
-
-    if (fetchErr) { console.error('saveItemToSummary fetch error:', fetchErr.message); return }
-
-    if (existing) {
-      const { error: updateErr } = await supabase
-        .from('table_order_summary')
-        .update({
-          quantity:   existing.quantity + item.quantity,
-          note:       item.note || existing.note || '',
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', existing.id)
-      if (updateErr) console.error('saveItemToSummary update error:', updateErr.message)
-    } else {
-      const { error: insertErr } = await supabase
-        .from('table_order_summary')
-        .insert({
-          table_id:        tid,
-          session_version: ver,
-          food_item_id:    item.id,
-          item_name:       item.name,
-          quantity:        item.quantity,
-          note:            item.note || '',
-          updated_at:      new Date().toISOString()
-        })
-      if (insertErr) console.error('saveItemToSummary insert error:', insertErr.message)
-    }
-  }
-
+  // ── Clear all local state + storage ───────────────────────
   const clearLocalData = () => {
     localStorage.removeItem(SESSION_KEY)
     localStorage.removeItem(VERSION_KEY)
-    setOrderSummary([]); setCart([]); setSessionVersion(null)
+    clearSummary()
+    setCart([])
+    setSessionVersion(null)
   }
 
+  // ── Load menu categories + food items ─────────────────────
   const loadMenuData = async () => {
     const { data: cats } = await supabase
       .from('categories').select('*').eq('is_subcategory', false).order('created_at')
@@ -162,18 +118,23 @@ export default function MenuPage() {
     setFoodItems(items || [])
   }
 
+  // ── Poll: detect table reset by admin ─────────────────────
   const checkSessionValid = async () => {
     const { data: tbl } = await supabase
       .from('tables').select('session_version').eq('id', tableId).single()
     if (!tbl) return
     const session = localStorage.getItem(SESSION_KEY)
-    if (!session) { clearLocalData(); setPinVerified(false); setPinPhase(true); return }
+    if (!session) {
+      clearLocalData(); setPinVerified(false); setPinPhase(true); return
+    }
     const parsed = JSON.parse(session)
     if (parsed.version !== tbl.session_version) {
-      clearLocalData(); setPinVerified(false); setPinInput(''); setPinError(''); setPinPhase(true)
+      clearLocalData()
+      setPinVerified(false); setPinInput(''); setPinError(''); setPinPhase(true)
     }
   }
 
+  // ── Verify PIN ─────────────────────────────────────────────
   const verifyPin = async () => {
     if (pinInput.length !== 4) { setPinError('Enter 4 digit PIN'); return }
     const { data: tbl } = await supabase
@@ -209,6 +170,7 @@ export default function MenuPage() {
     if (!ver) { alert('Session error. Please refresh.'); setPlacing(false); return }
     setSessionVersion(ver)
 
+    // 1. Create order row
     const { data: order, error: orderErr } = await supabase
       .from('orders')
       .insert({ table_id: tableId, status: 'pending', session_id: `${tableId}_${ver}` })
@@ -216,6 +178,7 @@ export default function MenuPage() {
 
     if (orderErr) { alert('Error placing order: ' + orderErr.message); setPlacing(false); return }
 
+    // 2. Insert order_items
     const { error: itemsErr } = await supabase.from('order_items').insert(
       cart.map(i => ({
         order_id:       order.id,
@@ -228,10 +191,10 @@ export default function MenuPage() {
 
     if (itemsErr) { alert('Error saving items: ' + itemsErr.message); setPlacing(false); return }
 
-    for (const item of cart) {
-      await saveItemToSummary(tableId, ver, item)
-    }
+    // 3. Accumulate into table_order_summary (via hook)
+    await saveCartToSummary(tableId, ver, cart)
 
+    // 4. Reload summary so "Ordered ×n" badges refresh
     await loadOrderSummary(tableId, ver)
 
     setCart([])
@@ -249,19 +212,20 @@ export default function MenuPage() {
     )
   }
 
-  const addToCart = (item, note = '') => {
+  const addToCart = (item, note = '') =>
     setCart(prev => {
       const ex = prev.find(c => c.id === item.id)
       if (ex) return prev.map(c => c.id === item.id ? { ...c, quantity: c.quantity + 1 } : c)
       return [...prev, { ...item, quantity: 1, note }]
     })
-  }
 
-  const removeFromCart  = (id) => setCart(prev => prev.filter(c => c.id !== id))
+  const removeFromCart = (id) => setCart(prev => prev.filter(c => c.id !== id))
+
   const updateQty = (id, qty) => {
     if (qty < 1) { removeFromCart(id); return }
     setCart(prev => prev.map(c => c.id === id ? { ...c, quantity: qty } : c))
   }
+
   const updateNote = (id, note) =>
     setCart(prev => prev.map(c => c.id === id ? { ...c, note } : c))
 
@@ -360,7 +324,7 @@ export default function MenuPage() {
   return (
     <div className="min-h-screen bg-orange-50 pb-24">
 
-      {/* ── Image Zoom Modal ─────────────────────────────────── */}
+      {/* Image zoom modal */}
       {zoomedImage && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-80 flex items-center justify-center p-4"
           onClick={() => setZoomedImage(null)}>
@@ -373,7 +337,7 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ── Customize Note Modal ──────────────────────────────── */}
+      {/* Customize note modal */}
       {noteItem && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-5 w-full max-w-sm shadow-xl">
@@ -400,7 +364,7 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ── Header ───────────────────────────────────────────── */}
+      {/* ── Header ─────────────────────────────────────────────── */}
       <div className="bg-white shadow px-4 py-3 sticky top-0 z-10">
         <div className="flex justify-between items-center mb-3">
           <div>
@@ -408,24 +372,24 @@ export default function MenuPage() {
             <p className="text-sm text-gray-400">{tableName}</p>
           </div>
 
-          {/* ── Top-right button cluster ── */}
+          {/* Top-right: My Orders + Cart buttons */}
           <div className="flex items-center gap-2">
 
-            {/* My Orders button — shown only when there are ordered items */}
+            {/* My Orders button — appears after first order is placed */}
             {totalOrderedItems > 0 && (
               <button
                 onClick={() => setShowOrders(true)}
                 className="relative flex items-center gap-1.5 bg-green-50 border border-green-200 text-green-700 px-3 py-2 rounded-full text-sm font-semibold hover:bg-green-100 transition"
               >
-                <span>📋</span>
-                <span>Orders</span>
+                📋
+                <span className="hidden sm:inline">Orders</span>
                 <span className="bg-green-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
                   {totalOrderedItems}
                 </span>
               </button>
             )}
 
-            {/* Cart button — shown when cart has items */}
+            {/* Cart button */}
             {totalItems > 0 && (
               <button onClick={() => setShowCart(true)}
                 className="relative bg-orange-500 text-white px-4 py-2 rounded-full text-sm font-medium">
@@ -438,7 +402,7 @@ export default function MenuPage() {
           </div>
         </div>
 
-        {/* Search */}
+        {/* Search bar */}
         <div className="relative mb-3">
           <input type="text" value={searchQuery}
             onChange={e => handleSearch(e.target.value)}
@@ -476,7 +440,7 @@ export default function MenuPage() {
         )}
       </div>
 
-      {/* ── Food Items List ───────────────────────────────────── */}
+      {/* ── Food items list ───────────────────────────────────── */}
       <div className="p-4 space-y-3">
         {filtered.length === 0 && (
           <div className="text-center py-16 text-gray-400">
@@ -610,27 +574,28 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ── My Orders Drawer ──────────────────────────────────── */}
+      {/* ── My Orders Drawer ─────────────────────────────────── */}
       {showOrders && (
         <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black bg-opacity-40"
           onClick={e => { if (e.target === e.currentTarget) setShowOrders(false) }}>
           <div className="bg-white rounded-t-3xl p-5 max-h-[85vh] overflow-y-auto">
 
-            {/* Drawer header */}
             <div className="flex justify-between items-center mb-4">
               <div>
                 <h2 className="text-lg font-bold text-gray-800">📋 My Orders</h2>
-                <p className="text-xs text-gray-400">{tableName}</p>
+                <p className="text-xs text-gray-400 mt-0.5">{tableName}</p>
               </div>
               <button onClick={() => setShowOrders(false)} className="text-gray-400 text-2xl font-bold">×</button>
             </div>
 
-            {/* Summary header card */}
+            {/* Session summary card */}
             <div className="bg-orange-500 rounded-2xl p-4 mb-4 text-white flex justify-between items-center">
               <div>
                 <p className="text-xs opacity-80">Ordered this session</p>
                 <p className="text-2xl font-bold">{totalOrderedItems} items</p>
-                <p className="text-xs opacity-70">{orderSummary.length} dish{orderSummary.length !== 1 ? 'es' : ''}</p>
+                <p className="text-xs opacity-70 mt-0.5">
+                  {orderSummary.length} dish{orderSummary.length !== 1 ? 'es' : ''}
+                </p>
               </div>
               <div className="text-4xl opacity-80">🧾</div>
             </div>
@@ -644,7 +609,7 @@ export default function MenuPage() {
               </p>
             </div>
 
-            {/* Ordered items list */}
+            {/* Ordered items */}
             <div className="bg-white border border-gray-100 rounded-2xl overflow-hidden mb-4 shadow-sm">
               <div className="divide-y divide-gray-50">
                 {orderSummary.map((item, i) => (
@@ -662,7 +627,9 @@ export default function MenuPage() {
                 ))}
               </div>
               <div className="px-4 py-3 bg-gray-50 border-t border-gray-100">
-                <p className="text-xs text-gray-400 text-center">Prices and total will be on your final bill 🧾</p>
+                <p className="text-xs text-gray-400 text-center">
+                  Prices and total will be on your final bill 🧾
+                </p>
               </div>
             </div>
 
