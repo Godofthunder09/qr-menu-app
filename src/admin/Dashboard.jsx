@@ -355,6 +355,7 @@ export default function Dashboard() {
         await supabase.from('order_items').delete().in('order_id', ords.map(o => o.id))
       await supabase.from('orders').delete().eq('table_id', tableId).eq('is_paid', false)
       await supabase.from('table_sessions').delete().eq('table_id', tableId)
+      await supabase.from('table_order_summary').delete().eq('table_id', tableId)
       const { data: tbl } = await supabase
         .from('tables').select('session_version').eq('id', tableId).single()
       await supabase.from('tables').update({
