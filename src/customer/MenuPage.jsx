@@ -1,8 +1,11 @@
 // src/customer/MenuPage.jsx
+// Replace your existing MenuPage.jsx with this file.
+// "My Orders" tab removed — replaced with 📋 Orders button in header.
+
 import { useEffect, useState } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
-import { useOrderSummary } from './useOrderSummary'   // ← new hook
+import { useOrderSummary } from './useOrderSummary'
 
 export default function MenuPage() {
   const [searchParams] = useSearchParams()
@@ -15,7 +18,7 @@ export default function MenuPage() {
   const [activeCategory, setActiveCategory] = useState('all')
   const [cart, setCart]                     = useState([])
   const [showCart, setShowCart]             = useState(false)
-  const [showOrders, setShowOrders]         = useState(false)  // ← orders drawer
+  const [showOrders, setShowOrders]         = useState(false)
   const [loading, setLoading]               = useState(true)
   const [placing, setPlacing]               = useState(false)
   const [searchQuery, setSearchQuery]       = useState('')
@@ -30,18 +33,12 @@ export default function MenuPage() {
   const [pinVerified, setPinVerified]       = useState(false)
   const navigate = useNavigate()
 
-  // ── All order-summary DB logic lives in this hook ──────────
-  const {
-    orderSummary,
-    loadOrderSummary,
-    saveCartToSummary,
-    clearSummary
-  } = useOrderSummary()
+  const { orderSummary, loadOrderSummary, saveCartToSummary, clearSummary } = useOrderSummary()
 
   const SESSION_KEY = `pin_session_${tableId}`
   const VERSION_KEY = `ver_${tableId}`
 
-  // ── Welcome splash ─────────────────────────────────────────
+  // ── Splash animation ───────────────────────────────────────
   useEffect(() => {
     const t1 = setTimeout(() => setPhase('logo'), 2000)
     const t2 = setTimeout(() => setPhase('ready'), 4000)
@@ -52,14 +49,14 @@ export default function MenuPage() {
     if (phase === 'ready' && tableId) init()
   }, [phase, tableId])
 
-  // ── Poll every 5s to detect table clear by admin ──────────
+  // ── Poll every 5s — detect table clear by admin ────────────
   useEffect(() => {
     if (!tableId || !pinVerified) return
     const t = setInterval(checkSessionValid, 5000)
     return () => clearInterval(t)
   }, [tableId, pinVerified])
 
-  // ── Init: check version + session ─────────────────────────
+  // ── Init ───────────────────────────────────────────────────
   const init = async () => {
     setLoading(true)
     const { data: tbl } = await supabase
@@ -92,7 +89,6 @@ export default function MenuPage() {
     }
   }
 
-  // ── Clear all local state + storage ───────────────────────
   const clearLocalData = () => {
     localStorage.removeItem(SESSION_KEY)
     localStorage.removeItem(VERSION_KEY)
@@ -101,24 +97,22 @@ export default function MenuPage() {
     setSessionVersion(null)
   }
 
-  // ── Load menu categories + food items ─────────────────────
   const loadMenuData = async () => {
     const { data: cats } = await supabase
       .from('categories').select('*').eq('is_subcategory', false).order('created_at')
     setCategories(cats || [])
 
-    const { data: items, error: itemsError } = await supabase
+    const { data: items, error } = await supabase
       .from('food_items')
       .select(`*,
         category:categories!food_items_category_id_fkey(id, name),
         subcategory:categories!food_items_subcategory_id_fkey(id, name)`)
       .eq('is_available', true).order('created_at')
 
-    if (itemsError) console.error('Error fetching food items:', itemsError.message)
+    if (error) console.error('loadMenuData error:', error.message)
     setFoodItems(items || [])
   }
 
-  // ── Poll: detect table reset by admin ─────────────────────
   const checkSessionValid = async () => {
     const { data: tbl } = await supabase
       .from('tables').select('session_version').eq('id', tableId).single()
@@ -134,7 +128,6 @@ export default function MenuPage() {
     }
   }
 
-  // ── Verify PIN ─────────────────────────────────────────────
   const verifyPin = async () => {
     if (pinInput.length !== 4) { setPinError('Enter 4 digit PIN'); return }
     const { data: tbl } = await supabase
@@ -170,7 +163,7 @@ export default function MenuPage() {
     if (!ver) { alert('Session error. Please refresh.'); setPlacing(false); return }
     setSessionVersion(ver)
 
-    // 1. Create order row
+    // 1. Create order
     const { data: order, error: orderErr } = await supabase
       .from('orders')
       .insert({ table_id: tableId, status: 'pending', session_id: `${tableId}_${ver}` })
@@ -188,13 +181,12 @@ export default function MenuPage() {
         note:           i.note || ''
       }))
     )
-
     if (itemsErr) { alert('Error saving items: ' + itemsErr.message); setPlacing(false); return }
 
-    // 3. Accumulate into table_order_summary (via hook)
+    // 3. Save to table_order_summary (powers the Orders drawer)
     await saveCartToSummary(tableId, ver, cart)
 
-    // 4. Reload summary so "Ordered ×n" badges refresh
+    // 4. Reload summary so badges update
     await loadOrderSummary(tableId, ver)
 
     setCart([])
@@ -262,19 +254,13 @@ export default function MenuPage() {
 
   if (!tableId) return (
     <div className="min-h-screen bg-orange-50 flex items-center justify-center">
-      <div className="text-center">
-        <div className="text-5xl mb-3">❌</div>
-        <p className="text-gray-500">Invalid QR Code.</p>
-      </div>
+      <div className="text-center"><div className="text-5xl mb-3">❌</div><p className="text-gray-500">Invalid QR Code.</p></div>
     </div>
   )
 
   if (loading) return (
     <div className="min-h-screen bg-orange-50 flex items-center justify-center">
-      <div className="text-center">
-        <div className="text-5xl mb-3">🍽️</div>
-        <p className="text-gray-400">Loading...</p>
-      </div>
+      <div className="text-center"><div className="text-5xl mb-3">🍽️</div><p className="text-gray-400">Loading...</p></div>
     </div>
   )
 
@@ -290,11 +276,8 @@ export default function MenuPage() {
         </p>
         <div className="flex justify-center gap-3 mb-4">
           {[0,1,2,3].map(i => (
-            <div key={i}
-              className={`w-14 h-14 rounded-xl border-2 flex items-center justify-center text-2xl font-bold
-                ${pinInput.length > i
-                  ? 'border-orange-500 bg-orange-50 text-orange-600'
-                  : 'border-gray-200 bg-gray-50'}`}>
+            <div key={i} className={`w-14 h-14 rounded-xl border-2 flex items-center justify-center text-2xl font-bold
+              ${pinInput.length > i ? 'border-orange-500 bg-orange-50 text-orange-600' : 'border-gray-200 bg-gray-50'}`}>
               {pinInput[i] ? '●' : '○'}
             </div>
           ))}
@@ -302,11 +285,8 @@ export default function MenuPage() {
         {pinError && <p className="text-red-500 text-sm mb-4 font-medium">{pinError}</p>}
         <div className="grid grid-cols-3 gap-3 mb-4">
           {[1,2,3,4,5,6,7,8,9].map(n => (
-            <button key={n}
-              onClick={() => { if (pinInput.length < 4) setPinInput(prev => prev + n) }}
-              className="bg-gray-100 hover:bg-orange-100 text-gray-800 font-bold text-xl py-4 rounded-xl transition">
-              {n}
-            </button>
+            <button key={n} onClick={() => { if (pinInput.length < 4) setPinInput(prev => prev + n) }}
+              className="bg-gray-100 hover:bg-orange-100 text-gray-800 font-bold text-xl py-4 rounded-xl transition">{n}</button>
           ))}
           <button onClick={() => setPinInput(prev => prev.slice(0, -1))}
             className="bg-gray-100 hover:bg-red-100 text-gray-600 font-bold py-4 rounded-xl transition text-sm">⌫</button>
@@ -320,7 +300,7 @@ export default function MenuPage() {
     </div>
   )
 
-  // ── Main Menu UI ───────────────────────────────────────────
+  // ── Main Menu ──────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-orange-50 pb-24">
 
@@ -329,8 +309,7 @@ export default function MenuPage() {
         <div className="fixed inset-0 z-50 bg-black bg-opacity-80 flex items-center justify-center p-4"
           onClick={() => setZoomedImage(null)}>
           <div className="relative max-w-lg w-full">
-            <img src={zoomedImage} alt="zoom"
-              className="w-full rounded-2xl object-contain max-h-96" />
+            <img src={zoomedImage} alt="zoom" className="w-full rounded-2xl object-contain max-h-96" />
             <button onClick={() => setZoomedImage(null)}
               className="absolute top-2 right-2 bg-white rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg">×</button>
           </div>
@@ -355,8 +334,7 @@ export default function MenuPage() {
                 if (inCart) updateNote(noteItem.id, noteText)
                 else addToCart(noteItem, noteText)
                 setNoteItem(null); setNoteText('')
-              }}
-                className="flex-1 bg-orange-500 text-white py-2 rounded-xl font-medium text-sm">
+              }} className="flex-1 bg-orange-500 text-white py-2 rounded-xl font-medium text-sm">
                 {cart.find(c => c.id === noteItem.id) ? 'Update Note' : 'Add to Cart'}
               </button>
             </div>
@@ -372,15 +350,11 @@ export default function MenuPage() {
             <p className="text-sm text-gray-400">{tableName}</p>
           </div>
 
-          {/* Top-right: My Orders + Cart buttons */}
+          {/* Top-right: Orders button + Cart button */}
           <div className="flex items-center gap-2">
-
-            {/* My Orders button — appears after first order is placed */}
             {totalOrderedItems > 0 && (
-              <button
-                onClick={() => setShowOrders(true)}
-                className="relative flex items-center gap-1.5 bg-green-50 border border-green-200 text-green-700 px-3 py-2 rounded-full text-sm font-semibold hover:bg-green-100 transition"
-              >
+              <button onClick={() => setShowOrders(true)}
+                className="flex items-center gap-1.5 bg-green-50 border border-green-200 text-green-700 px-3 py-2 rounded-full text-sm font-semibold hover:bg-green-100 transition">
                 📋
                 <span className="hidden sm:inline">Orders</span>
                 <span className="bg-green-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
@@ -388,8 +362,6 @@ export default function MenuPage() {
                 </span>
               </button>
             )}
-
-            {/* Cart button */}
             {totalItems > 0 && (
               <button onClick={() => setShowCart(true)}
                 className="relative bg-orange-500 text-white px-4 py-2 rounded-full text-sm font-medium">
@@ -402,17 +374,15 @@ export default function MenuPage() {
           </div>
         </div>
 
-        {/* Search bar */}
+        {/* Search */}
         <div className="relative mb-3">
-          <input type="text" value={searchQuery}
-            onChange={e => handleSearch(e.target.value)}
+          <input type="text" value={searchQuery} onChange={e => handleSearch(e.target.value)}
             placeholder="🔍 Search food items..."
             className="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50" />
           {suggestions.length > 0 && (
             <div className="absolute top-full left-0 right-0 bg-white border rounded-xl shadow-lg z-20 mt-1">
               {suggestions.map(item => (
-                <div key={item.id}
-                  onClick={() => { setSearchQuery(item.name); setSuggestions([]) }}
+                <div key={item.id} onClick={() => { setSearchQuery(item.name); setSuggestions([]) }}
                   className="px-4 py-2 text-sm text-gray-700 hover:bg-orange-50 cursor-pointer flex gap-2">
                   🍴 {item.name}
                 </div>
@@ -440,7 +410,7 @@ export default function MenuPage() {
         )}
       </div>
 
-      {/* ── Food items list ───────────────────────────────────── */}
+      {/* ── Food Items ────────────────────────────────────────── */}
       <div className="p-4 space-y-3">
         {filtered.length === 0 && (
           <div className="text-center py-16 text-gray-400">
@@ -455,8 +425,7 @@ export default function MenuPage() {
           return (
             <div key={item.id} className="bg-white rounded-2xl shadow p-4 flex gap-3">
               {item.image_url
-                ? <img src={item.image_url} alt={item.name}
-                    onClick={() => setZoomedImage(item.image_url)}
+                ? <img src={item.image_url} alt={item.name} onClick={() => setZoomedImage(item.image_url)}
                     className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer hover:opacity-90 transition" />
                 : <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">🍴</div>
               }
@@ -533,9 +502,7 @@ export default function MenuPage() {
                       <p className="text-sm text-orange-500 font-semibold">
                         ₹{item.price} × {item.quantity} = ₹{item.price * item.quantity}
                       </p>
-                      {item.note && (
-                        <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>
-                      )}
+                      {item.note && <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>}
                     </div>
                     <div className="flex items-center gap-2">
                       <button onClick={() => updateQty(item.id, item.quantity - 1)}
@@ -543,13 +510,11 @@ export default function MenuPage() {
                       <span className="font-semibold w-4 text-center">{item.quantity}</span>
                       <button onClick={() => updateQty(item.id, item.quantity + 1)}
                         className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
-                      <button onClick={() => removeFromCart(item.id)}
-                        className="text-red-400 text-sm ml-1">✕</button>
+                      <button onClick={() => removeFromCart(item.id)} className="text-red-400 text-sm ml-1">✕</button>
                     </div>
                   </div>
-                  <button onClick={() => {
-                    setNoteItem(item); setNoteText(item.note || ''); setShowCart(false)
-                  }} className="mt-1 text-xs text-orange-400 underline">
+                  <button onClick={() => { setNoteItem(item); setNoteText(item.note || ''); setShowCart(false) }}
+                    className="mt-1 text-xs text-orange-400 underline">
                     {item.note ? '✏️ Edit customization' : '📝 Add customization'}
                   </button>
                 </div>
@@ -574,12 +539,11 @@ export default function MenuPage() {
         </div>
       )}
 
-      {/* ── My Orders Drawer ─────────────────────────────────── */}
+      {/* ── My Orders Drawer ──────────────────────────────────── */}
       {showOrders && (
         <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black bg-opacity-40"
           onClick={e => { if (e.target === e.currentTarget) setShowOrders(false) }}>
           <div className="bg-white rounded-t-3xl p-5 max-h-[85vh] overflow-y-auto">
-
             <div className="flex justify-between items-center mb-4">
               <div>
                 <h2 className="text-lg font-bold text-gray-800">📋 My Orders</h2>
@@ -588,7 +552,6 @@ export default function MenuPage() {
               <button onClick={() => setShowOrders(false)} className="text-gray-400 text-2xl font-bold">×</button>
             </div>
 
-            {/* Session summary card */}
             <div className="bg-orange-500 rounded-2xl p-4 mb-4 text-white flex justify-between items-center">
               <div>
                 <p className="text-xs opacity-80">Ordered this session</p>
@@ -600,7 +563,6 @@ export default function MenuPage() {
               <div className="text-4xl opacity-80">🧾</div>
             </div>
 
-            {/* Info banner */}
             <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 mb-4 flex items-start gap-2">
               <span className="text-blue-500 mt-0.5">ℹ️</span>
               <p className="text-xs text-blue-600 leading-relaxed">
@@ -609,16 +571,13 @@ export default function MenuPage() {
               </p>
             </div>
 
-            {/* Ordered items */}
             <div className="bg-white border border-gray-100 rounded-2xl overflow-hidden mb-4 shadow-sm">
               <div className="divide-y divide-gray-50">
                 {orderSummary.map((item, i) => (
                   <div key={i} className="px-4 py-3 flex items-center justify-between">
                     <div className="flex-1">
                       <p className="font-medium text-gray-800">{item.name}</p>
-                      {item.note && (
-                        <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>
-                      )}
+                      {item.note && <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>}
                     </div>
                     <span className="bg-orange-100 text-orange-600 font-bold text-sm px-3 py-1 rounded-full ml-3">
                       × {item.quantity}
@@ -627,9 +586,7 @@ export default function MenuPage() {
                 ))}
               </div>
               <div className="px-4 py-3 bg-gray-50 border-t border-gray-100">
-                <p className="text-xs text-gray-400 text-center">
-                  Prices and total will be on your final bill 🧾
-                </p>
+                <p className="text-xs text-gray-400 text-center">Prices and total will be on your final bill 🧾</p>
               </div>
             </div>
 
