@@ -97,7 +97,14 @@ export default function Dashboard() {
   const [showItemEditor, setShowItemEditor] = useState(false)
   const [allFoodItems, setAllFoodItems] = useState([])
   const [menuSearch, setMenuSearch] = useState('')
-  const [removedItems, setRemovedItems] = useState(new Set())
+
+  // ── FIXED: itemQtyOverrides replaces removedItems ─────────
+  // Map of item key → effective quantity to bill
+  // key format: `${orderId}:${itemIndex}`
+  // If key not in map → use original quantity
+  // If value is 0 → item completely removed
+  const [itemQtyOverrides, setItemQtyOverrides] = useState({})
+
   const [manualItems, setManualItems] = useState([])
   const [showOpenForm, setShowOpenForm] = useState(false)
   const [openDept, setOpenDept] = useState('Food')
@@ -189,12 +196,14 @@ export default function Dashboard() {
   const selectTable = (table) => {
     setSelectedTable(table)
     setNewOrderTables(prev => { const n = new Set(prev); n.delete(table.id); return n })
-    setRemovedItems(new Set()); setManualItems([])
+    // Reset all edits when switching table
+    setItemQtyOverrides({})
+    setManualItems([])
     setShowItemEditor(false); setShowOpenForm(false)
+    setMenuSearch('')
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
-  // ── manual items as order_items shape ─────────────────
   const manualAsOrderItems = manualItems.map(mi => ({
     food_items: { name: mi.name },
     price_at_order: mi.price,
@@ -203,19 +212,33 @@ export default function Dashboard() {
     _isManual: true
   }))
 
+  // ── FIXED: getEffectiveItems respects partial qty overrides ─
   const getEffectiveItems = useCallback((tableId) => {
     const tOrders = orders.filter(o => o.table_id === tableId)
     const result = []
     tOrders.forEach(order => {
       ;(order.order_items || []).forEach((item, idx) => {
         const key = `${order.id}:${idx}`
-        if (!removedItems.has(key))
-          result.push({ ...item, _orderId: order.id, _idx: idx, _key: key })
+        const effectiveQty = itemQtyOverrides.hasOwnProperty(key)
+          ? itemQtyOverrides[key]
+          : item.quantity
+        // Only include if qty > 0
+        if (effectiveQty > 0) {
+          result.push({
+            ...item,
+            quantity: effectiveQty,                     // ← use overridden qty
+            price_at_order: item.price_at_order,
+            _orderId: order.id,
+            _idx: idx,
+            _key: key,
+            _originalQty: item.quantity,               // ← keep original for reference
+          })
+        }
       })
     })
     manualAsOrderItems.forEach(mi => result.push(mi))
     return result
-  }, [orders, removedItems, manualAsOrderItems])
+  }, [orders, itemQtyOverrides, manualAsOrderItems])
 
   const computeTotals = useCallback((tableId) => {
     const items = getEffectiveItems(tableId)
@@ -245,6 +268,22 @@ export default function Dashboard() {
     setShowPreview(true)
   }
 
+  // ── FIXED: set item qty override (partial remove / restore) ─
+  const setItemQty = (key, originalQty, delta) => {
+    setItemQtyOverrides(prev => {
+      const currentQty = prev.hasOwnProperty(key) ? prev[key] : originalQty
+      const newQty = Math.max(0, Math.min(originalQty, currentQty + delta))
+      const updated = { ...prev }
+      if (newQty === originalQty) {
+        // Back to original → remove override
+        delete updated[key]
+      } else {
+        updated[key] = newQty
+      }
+      return updated
+    })
+  }
+
   const addMenuItemToOrder = (foodItem) => {
     setManualItems(prev => {
       const existing = prev.find(m => m.foodItemId === foodItem.id)
@@ -268,10 +307,6 @@ export default function Dashboard() {
       qty: openQty, isOpen: true, dept: openDept
     }])
     setOpenName(''); setOpenPrice(''); setOpenQty(1); setShowOpenForm(false)
-  }
-
-  const toggleRemoveItem = (key) => {
-    setRemovedItems(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n })
   }
 
   const handlePrintAndSave = async () => {
@@ -305,7 +340,6 @@ export default function Dashboard() {
     const tOrders = orders.filter(o => o.table_id === payTableId)
     const nowIST = now.toISOString()
 
-    // ── Save menu items as order_items rows ──────────────
     const menuOnlyItems = manualItems.filter(mi => mi.foodItemId)
     if (menuOnlyItems.length > 0 && tOrders.length > 0) {
       const rows = menuOnlyItems.map(mi => ({
@@ -318,7 +352,6 @@ export default function Dashboard() {
       await supabase.from('order_items').insert(rows)
     }
 
-    // ── Save open items as open_items_json on first order ─
     const openOnlyItems = manualItems.filter(mi => mi.isOpen)
     const openItemsJson = openOnlyItems.map(mi => ({
       name: mi.name, price: mi.price, qty: mi.qty, dept: mi.dept,
@@ -334,14 +367,13 @@ export default function Dashboard() {
         settlement_status: 'pending',
         table_name_snapshot: tblData?.table_name || '',
         payment_type: 'pending',
-        // ── KEY FIX: save open items to DB ──────────────
         open_items_json: openItemsJson
       }).eq('id', order.id)
     }
 
     await nukeClearTable(payTableId)
     setNewOrderIds(prev => { const n = new Set(prev); tOrders.forEach(o => n.delete(o.id)); return n })
-    setRemovedItems(new Set()); setManualItems([])
+    setItemQtyOverrides({}); setManualItems([])
     setShowItemEditor(false); setShowPreview(false)
     if (selectedTable?.id === payTableId) setSelectedTable(null)
     fetchAll()
@@ -389,6 +421,9 @@ export default function Dashboard() {
   const dv = parseFloat(discountValue) || 0
   const filteredMenuItems = allFoodItems.filter(f => f.name.toLowerCase().includes(menuSearch.toLowerCase()))
 
+  // Count how many items have been modified (qty reduced or zeroed)
+  const modifiedCount = Object.keys(itemQtyOverrides).length
+
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col" onClick={initAudio}>
 
@@ -398,7 +433,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* ── Bill Preview Modal ─────────────────────────── */}
+      {/* ── Bill Preview Modal ───────────────────────────── */}
       {showPreview && previewTotals && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl max-h-[92vh] flex flex-col">
@@ -413,9 +448,11 @@ export default function Dashboard() {
                 <span>Table: <strong>{previewTableName}</strong></span>
                 <span>{toISTDate(new Date().toISOString())} {toIST(new Date().toISOString())}</span>
               </div>
-              <div className="mt-2 bg-blue-50 border border-blue-200 rounded-lg px-3 py-1.5">
-                <p className="text-xs text-blue-600 text-center">ℹ️ All edits done before. Print to finalize.</p>
-              </div>
+              {modifiedCount > 0 && (
+                <div className="mt-2 bg-yellow-50 border border-yellow-200 rounded-lg px-3 py-1.5">
+                  <p className="text-xs text-yellow-700 text-center">⚠️ {modifiedCount} item(s) quantity adjusted</p>
+                </div>
+              )}
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 space-y-3">
@@ -573,6 +610,7 @@ export default function Dashboard() {
       </div>
 
       <div className="flex flex-1 overflow-hidden relative">
+        {/* Sidebar */}
         <div className={`${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} transition-all duration-300 bg-white shadow-lg flex-shrink-0 fixed md:relative h-[calc(100vh-56px)] w-64 z-20 top-14 md:top-0 overflow-hidden`}>
           <div className="w-64 h-full flex flex-col">
             <div className="p-4 border-b bg-orange-50">
@@ -617,6 +655,7 @@ export default function Dashboard() {
 
         {sidebarOpen && <div className="fixed inset-0 bg-black bg-opacity-30 z-10 md:hidden" onClick={() => setSidebarOpen(false)} />}
 
+        {/* Main content */}
         <div className="flex-1 overflow-y-auto p-4 md:p-6">
           {!selectedTable && (
             <div className="flex flex-col items-center justify-center h-full min-h-64 text-gray-400">
@@ -632,6 +671,7 @@ export default function Dashboard() {
 
           {selectedTable && (
             <div className="max-w-2xl mx-auto">
+              {/* Table header */}
               <div className="bg-white rounded-2xl shadow p-5 mb-4">
                 <div className="flex justify-between items-start flex-wrap gap-3">
                   <div>
@@ -653,7 +693,7 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {/* ── Item Editor Panel ──────────────────── */}
+              {/* ── Item Editor Panel ──────────────────────── */}
               <div className="bg-white rounded-2xl shadow mb-4 overflow-hidden">
                 <button onClick={() => setShowItemEditor(!showItemEditor)}
                   className="w-full flex items-center justify-between px-5 py-4 hover:bg-gray-50 transition">
@@ -663,7 +703,7 @@ export default function Dashboard() {
                       <p className="font-bold text-gray-700 text-sm">Add / Remove Items</p>
                       <p className="text-xs text-gray-400">
                         {manualItems.length > 0 ? `${manualItems.length} item(s) added` : 'Modify bill before printing'}
-                        {removedItems.size > 0 ? ` · ${removedItems.size} removed` : ''}
+                        {modifiedCount > 0 ? ` · ${modifiedCount} qty adjusted` : ''}
                       </p>
                     </div>
                   </div>
@@ -672,31 +712,98 @@ export default function Dashboard() {
 
                 {showItemEditor && (
                   <div className="border-t">
-                    {/* Remove existing items */}
+
+                    {/* ── FIXED: Quantity-level remove controls ── */}
                     {allOrderItems.length > 0 && (
                       <div className="px-5 py-4 border-b">
-                        <p className="text-xs font-bold text-gray-500 uppercase mb-3">🗑 Remove Items from Order</p>
+                        <div className="flex items-center justify-between mb-3">
+                          <p className="text-xs font-bold text-gray-500 uppercase">🗑 Adjust Item Quantities</p>
+                          {modifiedCount > 0 && (
+                            <button
+                              onClick={() => setItemQtyOverrides({})}
+                              className="text-xs text-red-400 hover:text-red-600 underline">
+                              Reset All
+                            </button>
+                          )}
+                        </div>
+                        <p className="text-xs text-gray-400 mb-3">
+                          Use − to reduce quantity. Set to 0 to remove from bill completely.
+                        </p>
                         <div className="space-y-2">
                           {tableOrders.flatMap(order =>
                             (order.order_items || []).map((item, idx) => {
                               const key = `${order.id}:${idx}`
-                              const isRemoved = removedItems.has(key)
+                              const originalQty = item.quantity
+                              const effectiveQty = itemQtyOverrides.hasOwnProperty(key)
+                                ? itemQtyOverrides[key]
+                                : originalQty
+                              const isFullyRemoved = effectiveQty === 0
+                              const isReduced = effectiveQty < originalQty && effectiveQty > 0
+
                               return (
-                                <div key={key} className={`flex items-center justify-between px-3 py-2 rounded-xl border transition ${isRemoved ? 'bg-red-50 border-red-200 opacity-60' : 'bg-gray-50 border-gray-100'}`}>
-                                  <div className="flex items-center gap-2">
-                                    <span className={`text-sm text-gray-700 ${isRemoved ? 'line-through' : ''}`}>{item.food_items?.name}</span>
-                                    <span className="text-xs text-gray-400">×{item.quantity}</span>
-                                    <span className="text-xs font-medium text-orange-500">₹{item.price_at_order * item.quantity}</span>
+                                <div key={key}
+                                  className={`flex items-center justify-between px-3 py-3 rounded-xl border transition
+                                    ${isFullyRemoved
+                                      ? 'bg-red-50 border-red-200'
+                                      : isReduced
+                                        ? 'bg-yellow-50 border-yellow-200'
+                                        : 'bg-gray-50 border-gray-100'}`}>
+                                  <div className="flex-1 min-w-0">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <span className={`text-sm font-medium text-gray-700 ${isFullyRemoved ? 'line-through text-gray-400' : ''}`}>
+                                        {item.food_items?.name}
+                                      </span>
+                                      {isFullyRemoved && (
+                                        <span className="text-xs bg-red-100 text-red-500 px-2 py-0.5 rounded-full font-medium">Removed</span>
+                                      )}
+                                      {isReduced && (
+                                        <span className="text-xs bg-yellow-100 text-yellow-600 px-2 py-0.5 rounded-full font-medium">
+                                          {originalQty} → {effectiveQty}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <p className="text-xs text-gray-400 mt-0.5">
+                                      ₹{item.price_at_order} × {effectiveQty} = ₹{item.price_at_order * effectiveQty}
+                                      {isReduced && (
+                                        <span className="ml-1 text-red-400 line-through">
+                                          (was ₹{item.price_at_order * originalQty})
+                                        </span>
+                                      )}
+                                    </p>
                                   </div>
-                                  <button onClick={() => toggleRemoveItem(key)}
-                                    className={`text-xs px-3 py-1 rounded-full font-medium transition ${isRemoved ? 'bg-green-100 text-green-600 hover:bg-green-200' : 'bg-red-100 text-red-500 hover:bg-red-200'}`}>
-                                    {isRemoved ? '↩ Restore' : '✕ Remove'}
-                                  </button>
+                                  {/* Qty controls */}
+                                  <div className="flex items-center gap-1 ml-3 flex-shrink-0">
+                                    <button
+                                      onClick={() => setItemQty(key, originalQty, -1)}
+                                      disabled={effectiveQty === 0}
+                                      className="w-8 h-8 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center hover:bg-red-200 disabled:opacity-30 disabled:cursor-not-allowed text-lg">
+                                      −
+                                    </button>
+                                    <span className={`font-bold w-6 text-center text-sm ${isFullyRemoved ? 'text-red-400' : isReduced ? 'text-yellow-600' : 'text-gray-700'}`}>
+                                      {effectiveQty}
+                                    </span>
+                                    <button
+                                      onClick={() => setItemQty(key, originalQty, +1)}
+                                      disabled={effectiveQty === originalQty}
+                                      className="w-8 h-8 rounded-full bg-green-100 text-green-600 font-bold flex items-center justify-center hover:bg-green-200 disabled:opacity-30 disabled:cursor-not-allowed text-lg">
+                                      +
+                                    </button>
+                                  </div>
                                 </div>
                               )
                             })
                           )}
                         </div>
+
+                        {/* Summary of changes */}
+                        {modifiedCount > 0 && (
+                          <div className="mt-3 bg-orange-50 border border-orange-200 rounded-xl px-3 py-2">
+                            <p className="text-xs text-orange-700 font-medium">
+                              ✏️ {Object.values(itemQtyOverrides).filter(q => q === 0).length} item(s) fully removed,{' '}
+                              {Object.values(itemQtyOverrides).filter(q => q > 0).length} item(s) qty reduced
+                            </p>
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -752,7 +859,6 @@ export default function Dashboard() {
                           {showOpenForm ? '✕ Cancel' : '+ Open Item'}
                         </button>
                       </div>
-
                       {showOpenForm && (
                         <div className="bg-orange-50 border border-orange-200 rounded-xl p-4 space-y-3">
                           <div>
@@ -804,7 +910,6 @@ export default function Dashboard() {
                           </button>
                         </div>
                       )}
-
                       {manualItems.filter(m => m.isOpen).length > 0 && (
                         <div className="mt-3 space-y-1.5">
                           <p className="text-xs text-purple-600 font-medium">🆕 Open Items Added:</p>
@@ -830,12 +935,13 @@ export default function Dashboard() {
                 )}
               </div>
 
-              {/* Order rounds */}
+              {/* ── Order rounds display ──────────────────── */}
               <div className="space-y-4 mb-4">
                 {groupedByOrder.map((order, index) => {
                   const isNewOrder = newOrderIds.has(order.id)
                   return (
-                    <div key={order.id} className={`rounded-2xl shadow p-5 ${isNewOrder ? 'bg-yellow-50 border-2 border-yellow-400' : 'bg-white border border-gray-100'}`}>
+                    <div key={order.id}
+                      className={`rounded-2xl shadow p-5 ${isNewOrder ? 'bg-yellow-50 border-2 border-yellow-400' : 'bg-white border border-gray-100'}`}>
                       <div className="flex justify-between items-center mb-3 flex-wrap gap-2">
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="bg-orange-100 text-orange-600 text-xs font-bold px-3 py-1 rounded-full">Round {groupedByOrder.length - index}</span>
@@ -847,12 +953,32 @@ export default function Dashboard() {
                       <div className="space-y-2">
                         {order.items.map((item, i) => {
                           const key = `${order.id}:${i}`
-                          const isRemoved = removedItems.has(key)
+                          const originalQty = item.quantity
+                          const effectiveQty = itemQtyOverrides.hasOwnProperty(key)
+                            ? itemQtyOverrides[key]
+                            : originalQty
+                          const isFullyRemoved = effectiveQty === 0
+                          const isReduced = effectiveQty < originalQty && effectiveQty > 0
+
                           return (
-                            <div key={i} className={`py-2 border-b border-gray-50 last:border-0 ${isRemoved ? 'opacity-40' : ''}`}>
+                            <div key={i} className={`py-2 border-b border-gray-50 last:border-0 ${isFullyRemoved ? 'opacity-40' : ''}`}>
                               <div className="flex justify-between text-sm text-gray-700">
-                                <span className={`font-medium ${isRemoved ? 'line-through' : ''}`}>{item.food_items?.name}</span>
-                                <span className="text-gray-500">× {item.quantity}</span>
+                                <div className="flex items-center gap-2">
+                                  <span className={`font-medium ${isFullyRemoved ? 'line-through text-gray-400' : ''}`}>
+                                    {item.food_items?.name}
+                                  </span>
+                                  {isFullyRemoved && (
+                                    <span className="text-xs bg-red-100 text-red-400 px-1.5 py-0.5 rounded-full">removed</span>
+                                  )}
+                                  {isReduced && (
+                                    <span className="text-xs bg-yellow-100 text-yellow-600 px-1.5 py-0.5 rounded-full">
+                                      {originalQty}→{effectiveQty}
+                                    </span>
+                                  )}
+                                </div>
+                                <span className={`${isFullyRemoved ? 'text-gray-300 line-through' : isReduced ? 'text-yellow-600' : 'text-gray-500'}`}>
+                                  × {isFullyRemoved ? originalQty : effectiveQty}
+                                </span>
                               </div>
                               {item.note && item.note.trim() !== '' && (
                                 <p className="text-xs text-orange-500 italic mt-1">📝 "{item.note}"</p>
@@ -872,9 +998,9 @@ export default function Dashboard() {
                   <span className="font-bold text-lg">Subtotal</span>
                   <span className="font-bold text-2xl">₹{displaySubtotal}</span>
                 </div>
-                {(removedItems.size > 0 || manualItems.length > 0) && (
+                {(modifiedCount > 0 || manualItems.length > 0) && (
                   <p className="text-orange-100 text-xs mb-2">
-                    {removedItems.size > 0 ? `${removedItems.size} item(s) removed · ` : ''}
+                    {modifiedCount > 0 ? `${modifiedCount} item(s) qty adjusted · ` : ''}
                     {manualItems.length > 0 ? `${manualItems.length} item(s) added` : ''}
                   </p>
                 )}
