@@ -98,11 +98,9 @@ export default function Dashboard() {
   const [allFoodItems, setAllFoodItems] = useState([])
   const [menuSearch, setMenuSearch] = useState('')
 
-  // ── FIXED: itemQtyOverrides replaces removedItems ─────────
-  // Map of item key → effective quantity to bill
-  // key format: `${orderId}:${itemIndex}`
+  // itemQtyOverrides: map of `${orderId}:${itemIndex}` → effective qty to bill
   // If key not in map → use original quantity
-  // If value is 0 → item completely removed
+  // If value is 0 → item completely removed from bill
   const [itemQtyOverrides, setItemQtyOverrides] = useState({})
 
   const [manualItems, setManualItems] = useState([])
@@ -163,7 +161,8 @@ export default function Dashboard() {
     setTables(tablesData || [])
     const { data: ordersData } = await supabase
       .from('orders')
-      .select(`*, tables(table_name), order_items(quantity, price_at_order, note, food_items(name))`)
+      // ── FIX: added `id` to order_items so we can update/delete by row id ──
+      .select(`*, tables(table_name), order_items(id, quantity, price_at_order, note, food_items(name))`)
       .eq('is_paid', false).order('created_at', { ascending: false })
     if (ordersData) {
       const addedOrderIds = new Set(); const addedTableIds = new Set()
@@ -212,7 +211,6 @@ export default function Dashboard() {
     _isManual: true
   }))
 
-  // ── FIXED: getEffectiveItems respects partial qty overrides ─
   const getEffectiveItems = useCallback((tableId) => {
     const tOrders = orders.filter(o => o.table_id === tableId)
     const result = []
@@ -222,16 +220,15 @@ export default function Dashboard() {
         const effectiveQty = itemQtyOverrides.hasOwnProperty(key)
           ? itemQtyOverrides[key]
           : item.quantity
-        // Only include if qty > 0
         if (effectiveQty > 0) {
           result.push({
             ...item,
-            quantity: effectiveQty,                     // ← use overridden qty
+            quantity: effectiveQty,
             price_at_order: item.price_at_order,
             _orderId: order.id,
             _idx: idx,
             _key: key,
-            _originalQty: item.quantity,               // ← keep original for reference
+            _originalQty: item.quantity,
           })
         }
       })
@@ -268,14 +265,12 @@ export default function Dashboard() {
     setShowPreview(true)
   }
 
-  // ── FIXED: set item qty override (partial remove / restore) ─
   const setItemQty = (key, originalQty, delta) => {
     setItemQtyOverrides(prev => {
       const currentQty = prev.hasOwnProperty(key) ? prev[key] : originalQty
       const newQty = Math.max(0, Math.min(originalQty, currentQty + delta))
       const updated = { ...prev }
       if (newQty === originalQty) {
-        // Back to original → remove override
         delete updated[key]
       } else {
         updated[key] = newQty
@@ -340,6 +335,31 @@ export default function Dashboard() {
     const tOrders = orders.filter(o => o.table_id === payTableId)
     const nowIST = now.toISOString()
 
+    // ── FIX: Persist itemQtyOverrides to order_items in DB ────────────────
+    // Without this, TodayReport reads stale original quantities from the DB
+    // and shows wrong item list / mismatched totals.
+    if (Object.keys(itemQtyOverrides).length > 0) {
+      for (const order of tOrders) {
+        const items = order.order_items || []
+        for (let idx = 0; idx < items.length; idx++) {
+          const key = `${order.id}:${idx}`
+          if (!itemQtyOverrides.hasOwnProperty(key)) continue
+          const newQty = itemQtyOverrides[key]
+          const rowId = items[idx].id  // available because fetchAll now selects order_items(id, ...)
+          if (!rowId) continue
+          if (newQty === 0) {
+            // Fully removed — delete the row from order_items
+            await supabase.from('order_items').delete().eq('id', rowId)
+          } else {
+            // Partially reduced — update the quantity
+            await supabase.from('order_items').update({ quantity: newQty }).eq('id', rowId)
+          }
+        }
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
+    // Insert any newly added menu items
     const menuOnlyItems = manualItems.filter(mi => mi.foodItemId)
     if (menuOnlyItems.length > 0 && tOrders.length > 0) {
       const rows = menuOnlyItems.map(mi => ({
@@ -420,8 +440,6 @@ export default function Dashboard() {
   const previewTableName = tables.find(t => t.id === payTableId)?.table_name || ''
   const dv = parseFloat(discountValue) || 0
   const filteredMenuItems = allFoodItems.filter(f => f.name.toLowerCase().includes(menuSearch.toLowerCase()))
-
-  // Count how many items have been modified (qty reduced or zeroed)
   const modifiedCount = Object.keys(itemQtyOverrides).length
 
   return (
@@ -713,7 +731,7 @@ export default function Dashboard() {
                 {showItemEditor && (
                   <div className="border-t">
 
-                    {/* ── FIXED: Quantity-level remove controls ── */}
+                    {/* Quantity-level remove controls */}
                     {allOrderItems.length > 0 && (
                       <div className="px-5 py-4 border-b">
                         <div className="flex items-center justify-between mb-3">
@@ -771,7 +789,6 @@ export default function Dashboard() {
                                       )}
                                     </p>
                                   </div>
-                                  {/* Qty controls */}
                                   <div className="flex items-center gap-1 ml-3 flex-shrink-0">
                                     <button
                                       onClick={() => setItemQty(key, originalQty, -1)}
@@ -795,7 +812,6 @@ export default function Dashboard() {
                           )}
                         </div>
 
-                        {/* Summary of changes */}
                         {modifiedCount > 0 && (
                           <div className="mt-3 bg-orange-50 border border-orange-200 rounded-xl px-3 py-2">
                             <p className="text-xs text-orange-700 font-medium">
