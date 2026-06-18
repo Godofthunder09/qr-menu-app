@@ -79,20 +79,6 @@ ${lines.splitInfo ? `<div class="div"></div><div class="center" style="font-size
 <div class="center">${lines.footerNote}</div>
 </body></html>`
 
-// Helper to display payment method nicely
-const payLabel = (type, split) => {
-  if (split) {
-    return Object.entries(split)
-      .filter(([, v]) => v > 0)
-      .map(([k, v]) => `${k === 'cash' ? '💵' : k === 'upi' ? '📱' : '💳'} ₹${v}`)
-      .join(' + ')
-  }
-  if (type === 'cash') return '💵 Cash'
-  if (type === 'upi')  return '📱 UPI'
-  if (type === 'card') return '💳 Card'
-  return type || '—'
-}
-
 export default function TodayReport() {
   const navigate = useNavigate()
   const [bills, setBills] = useState([])
@@ -109,9 +95,9 @@ export default function TodayReport() {
   // Settlement
   const [showSettleModal, setShowSettleModal] = useState(false)
   const [settleBill, setSettleBill] = useState(null)
-  const [settleType, setSettleType] = useState('cash') // 'cash','upi','card','split'
+  const [settleType, setSettleType] = useState('cash')
   // Split payment
-  const [splitMode, setSplitMode] = useState('cash+upi') // 'cash+upi','cash+card','upi+card'
+  const [splitMode, setSplitMode] = useState('cash+upi')
   const [splitAmounts, setSplitAmounts] = useState({ first: '', second: '' })
   const [splitError, setSplitError] = useState('')
 
@@ -189,7 +175,7 @@ export default function TodayReport() {
     setLoading(false)
   }
 
-  // ── Settlement ─────────────────────────────────────────
+  // ── Settlement ──────────────────────────────────────────────────────────
   const openSettle = (bill) => {
     setSettleBill(bill)
     setSettleType('cash')
@@ -199,13 +185,11 @@ export default function TodayReport() {
     setShowSettleModal(true)
   }
 
-  // Parse split mode into two method names
   const parseSplitMode = (mode) => {
     const parts = mode.split('+')
     return { firstMethod: parts[0], secondMethod: parts[1] }
   }
 
-  // Validate and confirm settlement
   const confirmSettle = async () => {
     if (!settleBill) return
 
@@ -225,8 +209,6 @@ export default function TodayReport() {
         setSplitError(`Amounts must add up to ₹${total} (currently ₹${firstAmt + secondAmt})`); return
       }
       setSplitError('')
-
-      // Primary type = whichever is higher
       paymentType = firstAmt >= secondAmt ? firstMethod : secondMethod
       splitPayload = { [firstMethod]: firstAmt, [secondMethod]: secondAmt }
     }
@@ -240,13 +222,11 @@ export default function TodayReport() {
       }).eq('id', orderId)
     }
 
-    // Update daily_reports
     const today = todayIST()
     const { data: existing } = await supabase.from('daily_reports').select('*').eq('report_date', today).single()
     const amt = settleBill.final_amount || 0
     const svc = settleBill.service_charge_amt || 0
 
-    // Calculate per-mode amounts for daily_reports
     const cashAmt = splitPayload ? (splitPayload.cash || 0) : (paymentType === 'cash' ? amt : 0)
     const upiAmt  = splitPayload ? (splitPayload.upi  || 0) : (paymentType === 'upi'  ? amt : 0)
     const cardAmt = splitPayload ? (splitPayload.card || 0) : (paymentType === 'card' ? amt : 0)
@@ -272,7 +252,7 @@ export default function TodayReport() {
     setSettling(null); setShowSettleModal(false); fetchTodayBills()
   }
 
-  // ── Edit helpers ────────────────────────────────────────
+  // ── Edit helpers ─────────────────────────────────────────────────────────
   const openEdit = (bill) => {
     setEditingBillKey(bill._key); setEditingBill(bill)
     setEditRemovedItemKeys(new Set()); setEditManualItems([])
@@ -389,14 +369,41 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         subtotal: totals.subtotal, serviceChargePct: reprintServicePct,
         serviceChargeAmt: totals.serviceChargeAmt, discountAmt: totals.discountAmt,
         finalAmount: totals.finalAmount,
+        splitInfo: null,
       }
       const w = window.open('', '_blank', 'width=400,height=600')
       if (w) { w.document.write(buildHtmlReceipt(lines)); w.document.close(); w.focus(); setTimeout(() => { w.print(); w.close() }, 300) }
 
+      // ── FIX: Persist removed items to order_items in DB ──────────────────
+      // editRemovedItemKeys contains keys like "item:0", "item:1" — these map
+      // directly to the index of editingBill.order_items array.
+      // We use the row `id` (now fetched in fetchTodayBills) to delete precisely.
+      if (editRemovedItemKeys.size > 0) {
+        for (const key of editRemovedItemKeys) {
+          // key format: "item:N"
+          const idx = parseInt(key.split(':')[1], 10)
+          const item = editingBill.order_items?.[idx]
+          if (!item?.id) continue
+          await supabase.from('order_items').delete().eq('id', item.id)
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
+      // Insert newly added menu items
+      const newMenuItems = editManualItems.filter(m => m.foodItemId)
+      if (newMenuItems.length > 0) {
+        await supabase.from('order_items').insert(newMenuItems.map(mi => ({
+          order_id: editingBill._orderIds[0], food_item_id: mi.foodItemId,
+          quantity: mi.qty, price_at_order: mi.price, note: "Added at Today's Report"
+        })))
+      }
+
+      // Append new open items to open_items_json
       const newOpenItems = editManualItems.filter(m => m.isOpen)
         .map(mi => ({ name: mi.name, price: mi.price, qty: mi.qty, dept: mi.dept, total: mi.price * mi.qty }))
       const updatedOpenItems = [...(editingBill.open_items || []), ...newOpenItems]
 
+      // Update orders row with new totals
       for (const orderId of editingBill._orderIds) {
         await supabase.from('orders').update({
           subtotal: totals.subtotal, service_charge_pct: reprintServicePct,
@@ -406,13 +413,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
           final_amount: totals.finalAmount, open_items_json: updatedOpenItems,
         }).eq('id', orderId)
       }
-      const newMenuItems = editManualItems.filter(m => m.foodItemId)
-      if (newMenuItems.length > 0) {
-        await supabase.from('order_items').insert(newMenuItems.map(mi => ({
-          order_id: editingBill._orderIds[0], food_item_id: mi.foodItemId,
-          quantity: mi.qty, price_at_order: mi.price, note: "Added at Today's Report"
-        })))
-      }
+
       closeEdit(); setShowReprintPreview(false); fetchTodayBills()
       alert('✅ Bill updated and reprinted!')
     } catch (err) { alert('❌ Error: ' + err.message) }
@@ -437,7 +438,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
   const filteredEditMenuItems = allFoodItems.filter(f => f.name.toLowerCase().includes(editMenuSearch.toLowerCase()))
   const reprintDv = parseFloat(reprintDiscount.value) || 0
 
-  // Split auto-fill second amount when first is entered
   const handleSplitFirstChange = (val) => {
     setSplitError('')
     const v = parseFloat(val) || 0
@@ -448,7 +448,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
 
   const PayBadge = ({ type, split }) => {
     if (split) {
-      const parts = Object.entries(split).filter(([, v]) => v > 0)
       return (
         <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-indigo-100 text-indigo-700">
           🔀 Split
@@ -466,14 +465,13 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
   return (
     <div className="min-h-screen bg-gray-50">
 
-      {/* ── Settlement Modal ─────────────────────────── */}
+      {/* ── Settlement Modal ──────────────────────────────────────────────── */}
       {showSettleModal && settleBill && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-2xl">
             <h2 className="text-xl font-bold text-gray-800 mb-1">💰 Settle Bill</h2>
             <p className="text-sm text-gray-400 mb-3">{settleBill.table_name_snapshot || 'Table'}</p>
 
-            {/* Amount summary */}
             <div className="bg-gray-50 rounded-xl p-3 mb-4 space-y-1.5">
               <div className="flex justify-between text-sm text-gray-500"><span>Subtotal</span><span>₹{settleBill.subtotal}</span></div>
               {settleBill.service_charge_amt > 0 && (
@@ -490,7 +488,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
 
             <p className="text-sm font-medium text-gray-700 mb-2">How did they pay?</p>
 
-            {/* 4 payment type tabs */}
             <div className="grid grid-cols-4 gap-1.5 mb-4">
               {[
                 { id: 'cash', label: '💵 Cash' },
@@ -506,10 +503,8 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
               ))}
             </div>
 
-            {/* Split payment UI */}
             {settleType === 'split' && (
               <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-3 mb-4 space-y-3">
-                {/* Split mode selector */}
                 <div>
                   <p className="text-xs text-gray-500 mb-1.5 font-medium">Choose payment combination</p>
                   <div className="grid grid-cols-3 gap-1.5">
@@ -527,7 +522,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                   </div>
                 </div>
 
-                {/* Amount inputs */}
                 <div className="grid grid-cols-2 gap-2">
                   <div>
                     <label className="text-xs text-gray-500 block mb-1">
@@ -555,7 +549,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                   </div>
                 </div>
 
-                {/* Running total check */}
                 <div className="flex justify-between text-xs">
                   <span className="text-gray-500">Entered total:</span>
                   <span className={`font-bold ${Math.abs(((parseFloat(splitAmounts.first)||0) + (parseFloat(splitAmounts.second)||0)) - (settleBill.final_amount||0)) <= 1 ? 'text-green-600' : 'text-red-500'}`}>
@@ -579,7 +572,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         </div>
       )}
 
-      {/* ── Reprint Preview Modal ─────────────────────── */}
+      {/* ── Reprint Preview Modal ──────────────────────────────────────────── */}
       {showReprintPreview && editingBill && reprintTotals && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl max-h-[92vh] flex flex-col">
@@ -691,7 +684,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         </div>
       )}
 
-      {/* ── Close Day Modal ───────────────────────────── */}
+      {/* ── Close Day Modal ───────────────────────────────────────────────── */}
       {showCloseDay && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl">
@@ -1030,7 +1023,6 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                       </div>
                     ))}
                   </div>
-                  {/* Show split payment breakdown */}
                   {bill.split_payment && (
                     <div className="mt-2 bg-indigo-50 rounded-lg px-3 py-2">
                       <p className="text-xs text-indigo-600 font-medium mb-1">🔀 Split Payment</p>
