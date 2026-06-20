@@ -31,6 +31,8 @@ const groupOrdersIntoBills = (orders) => {
         discount_value: order.discount_value || 0,
         discount_amt: order.discount_amt || 0,
         final_amount: order.final_amount || 0,
+        // NOTE: order_items here carries the real DB row `id` — required
+        // so edits in this screen can update/delete the exact row.
         order_items: [...(order.order_items || [])],
         open_items: [...(order.open_items_json || [])],
       }
@@ -95,16 +97,17 @@ export default function TodayReport() {
   // Settlement
   const [showSettleModal, setShowSettleModal] = useState(false)
   const [settleBill, setSettleBill] = useState(null)
-  const [settleType, setSettleType] = useState('cash')
-  // Split payment
+  const [settleType, setSettleType] = useState('cash') // 'cash','upi','card','split'
   const [splitMode, setSplitMode] = useState('cash+upi')
   const [splitAmounts, setSplitAmounts] = useState({ first: '', second: '' })
   const [splitError, setSplitError] = useState('')
 
-  // Edit state
+  // ── Edit state ─────────────────────────────────────────
+  // editItemQtyOverrides replaces the old binary editRemovedItemKeys.
+  // Map of `item:${idx}` → effective qty (same pattern as Dashboard.jsx)
   const [editingBillKey, setEditingBillKey] = useState(null)
   const [editingBill, setEditingBill] = useState(null)
-  const [editRemovedItemKeys, setEditRemovedItemKeys] = useState(new Set())
+  const [editItemQtyOverrides, setEditItemQtyOverrides] = useState({})
   const [editManualItems, setEditManualItems] = useState([])
   const [editMenuSearch, setEditMenuSearch] = useState('')
   const [showEditOpenForm, setShowEditOpenForm] = useState(false)
@@ -145,6 +148,11 @@ export default function TodayReport() {
     const endISO   = new Date(today + 'T23:59:59+05:30').toISOString()
     const { data, error } = await supabase
       .from('orders')
+      // NOTE: order_items(id, ...) — row `id` is required so the Edit panel
+      // can write quantity changes / deletions back to the exact DB row.
+      // This is what keeps Dashboard, TodayReport, and Reports in sync —
+      // all three read the same order_items table, so once one screen
+      // commits a change, every other screen sees it immediately.
       .select(`id, payment_type, split_payment, is_paid, paid_at, settlement_status,
         subtotal, service_charge_pct, service_charge_amt,
         discount_type, discount_value, discount_amt,
@@ -175,7 +183,7 @@ export default function TodayReport() {
     setLoading(false)
   }
 
-  // ── Settlement ──────────────────────────────────────────────────────────
+  // ── Settlement ─────────────────────────────────────────
   const openSettle = (bill) => {
     setSettleBill(bill)
     setSettleType('cash')
@@ -252,23 +260,32 @@ export default function TodayReport() {
     setSettling(null); setShowSettleModal(false); fetchTodayBills()
   }
 
-  // ── Edit helpers ─────────────────────────────────────────────────────────
+  // ── Edit helpers ────────────────────────────────────────
   const openEdit = (bill) => {
     setEditingBillKey(bill._key); setEditingBill(bill)
-    setEditRemovedItemKeys(new Set()); setEditManualItems([])
+    setEditItemQtyOverrides({}); setEditManualItems([])
     setEditMenuSearch(''); setShowEditOpenForm(false)
     setEditOpenName(''); setEditOpenPrice(''); setEditOpenQty(1)
   }
 
   const closeEdit = () => {
     setEditingBillKey(null); setEditingBill(null)
-    setEditRemovedItemKeys(new Set()); setEditManualItems([])
+    setEditItemQtyOverrides({}); setEditManualItems([])
     setShowEditOpenForm(false)
   }
 
-  const toggleEditRemove = (key) => {
-    setEditRemovedItemKeys(prev => {
-      const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n
+  // ── Set qty override for an item (mirrors Dashboard.jsx pattern) ───────
+  const setEditItemQty = (key, originalQty, delta) => {
+    setEditItemQtyOverrides(prev => {
+      const currentQty = prev.hasOwnProperty(key) ? prev[key] : originalQty
+      const newQty = Math.max(0, Math.min(originalQty, currentQty + delta))
+      const updated = { ...prev }
+      if (newQty === originalQty) {
+        delete updated[key]
+      } else {
+        updated[key] = newQty
+      }
+      return updated
     })
   }
 
@@ -297,11 +314,16 @@ export default function TodayReport() {
     setEditOpenName(''); setEditOpenPrice(''); setEditOpenQty(1); setShowEditOpenForm(false)
   }
 
-  const computeCurrentTotals = (bill, removedKeys, manualItems, svcPct, discType, discVal) => {
+  // ── computeCurrentTotals — now qty-aware instead of binary remove ──────
+  const computeCurrentTotals = (bill, qtyOverrides, manualItems, svcPct, discType, discVal) => {
     if (!bill) return null
     const effectiveItems = (bill.order_items || [])
-      .map((item, idx) => ({ ...item, _stableKey: `item:${idx}` }))
-      .filter(item => !removedKeys.has(item._stableKey))
+      .map((item, idx) => {
+        const key = `item:${idx}`
+        const effectiveQty = qtyOverrides.hasOwnProperty(key) ? qtyOverrides[key] : item.quantity
+        return { ...item, quantity: effectiveQty, _stableKey: key, _originalQty: item.quantity }
+      })
+      .filter(item => item.quantity > 0)
     const existingOpenAsItems = (bill.open_items || []).map(oi => ({
       food_items: { name: oi.name }, price_at_order: oi.price, quantity: oi.qty
     }))
@@ -324,7 +346,7 @@ export default function TodayReport() {
   }
 
   const editTotals = editingBill
-    ? computeCurrentTotals(editingBill, editRemovedItemKeys, editManualItems,
+    ? computeCurrentTotals(editingBill, editItemQtyOverrides, editManualItems,
         editingBill.service_charge_pct, editingBill.discount_type,
         editingBill.discount_value?.toString() || '')
     : null
@@ -337,10 +359,22 @@ export default function TodayReport() {
   }
 
   const reprintTotals = showReprintPreview && editingBill
-    ? computeCurrentTotals(editingBill, editRemovedItemKeys, editManualItems,
+    ? computeCurrentTotals(editingBill, editItemQtyOverrides, editManualItems,
         reprintServicePct, reprintDiscount.type, reprintDiscount.value)
     : null
 
+  // ── handleReprintAndSave — now COMMITS qty overrides to order_items ────
+  // This is the critical fix: previously this function only updated the
+  // `orders` row (subtotal/final_amount/open_items_json) while leaving the
+  // underlying order_items rows completely untouched. That meant Dashboard
+  // and Reports — which both read order_items directly — kept showing the
+  // OLD quantities/items, causing the exact mismatch you saw (₹540 bill but
+  // item list still showing the original unedited rows).
+  //
+  // Now, exactly like Dashboard.jsx's handlePrintAndSave:
+  //   - qty reduced to >0  → UPDATE that order_items row's quantity
+  //   - qty reduced to 0   → DELETE that order_items row entirely
+  // After this, every screen reading order_items sees the corrected state.
   const handleReprintAndSave = async () => {
     const dv = parseFloat(reprintDiscount.value) || 0
     if (dv > 0 && !reprintDiscount.reason.trim()) { setReprintDiscountError(true); return }
@@ -374,20 +408,25 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
       const w = window.open('', '_blank', 'width=400,height=600')
       if (w) { w.document.write(buildHtmlReceipt(lines)); w.document.close(); w.focus(); setTimeout(() => { w.print(); w.close() }, 300) }
 
-      // ── FIX: Persist removed items to order_items in DB ──────────────────
-      // editRemovedItemKeys contains keys like "item:0", "item:1" — these map
-      // directly to the index of editingBill.order_items array.
-      // We use the row `id` (now fetched in fetchTodayBills) to delete precisely.
-      if (editRemovedItemKeys.size > 0) {
-        for (const key of editRemovedItemKeys) {
-          // key format: "item:N"
-          const idx = parseInt(key.split(':')[1], 10)
-          const item = editingBill.order_items?.[idx]
-          if (!item?.id) continue
-          await supabase.from('order_items').delete().eq('id', item.id)
+      // ── CRITICAL FIX: commit qty overrides to real order_items rows ────
+      if (Object.keys(editItemQtyOverrides).length > 0) {
+        const items = editingBill.order_items || []
+        for (let idx = 0; idx < items.length; idx++) {
+          const key = `item:${idx}`
+          if (!editItemQtyOverrides.hasOwnProperty(key)) continue
+          const newQty = editItemQtyOverrides[key]
+          const rowId = items[idx].id
+          if (!rowId) continue
+          if (newQty === 0) {
+            // Fully removed — delete the row
+            await supabase.from('order_items').delete().eq('id', rowId)
+          } else {
+            // Partially reduced — update quantity in place
+            await supabase.from('order_items').update({ quantity: newQty }).eq('id', rowId)
+          }
         }
       }
-      // ─────────────────────────────────────────────────────────────────────
+      // ─────────────────────────────────────────────────────────────────
 
       // Insert newly added menu items
       const newMenuItems = editManualItems.filter(m => m.foodItemId)
@@ -403,7 +442,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         .map(mi => ({ name: mi.name, price: mi.price, qty: mi.qty, dept: mi.dept, total: mi.price * mi.qty }))
       const updatedOpenItems = [...(editingBill.open_items || []), ...newOpenItems]
 
-      // Update orders row with new totals
+      // Update orders row with the new, now-consistent totals
       for (const orderId of editingBill._orderIds) {
         await supabase.from('orders').update({
           subtotal: totals.subtotal, service_charge_pct: reprintServicePct,
@@ -437,6 +476,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
   const settledBills  = bills.filter(b => b.settlement_status === 'settled' || b.settlement_status === 'day_closed')
   const filteredEditMenuItems = allFoodItems.filter(f => f.name.toLowerCase().includes(editMenuSearch.toLowerCase()))
   const reprintDv = parseFloat(reprintDiscount.value) || 0
+  const editModifiedCount = Object.keys(editItemQtyOverrides).length
 
   const handleSplitFirstChange = (val) => {
     setSplitError('')
@@ -465,7 +505,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
   return (
     <div className="min-h-screen bg-gray-50">
 
-      {/* ── Settlement Modal ──────────────────────────────────────────────── */}
+      {/* ── Settlement Modal ─────────────────────────── */}
       {showSettleModal && settleBill && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-2xl">
@@ -572,7 +612,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         </div>
       )}
 
-      {/* ── Reprint Preview Modal ──────────────────────────────────────────── */}
+      {/* ── Reprint Preview Modal ─────────────────────── */}
       {showReprintPreview && editingBill && reprintTotals && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl max-h-[92vh] flex flex-col">
@@ -584,6 +624,11 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
               <button onClick={() => setShowReprintPreview(false)} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-sm">✕</button>
             </div>
             <div className="flex-1 overflow-y-auto p-4 space-y-3">
+              {editModifiedCount > 0 && (
+                <div className="bg-yellow-50 border border-yellow-200 rounded-lg px-3 py-1.5">
+                  <p className="text-xs text-yellow-700 text-center">⚠️ {editModifiedCount} item(s) quantity adjusted</p>
+                </div>
+              )}
               {reprintTotals.foodItems.length > 0 && (
                 <div>
                   <div className="flex items-center gap-2 mb-2">
@@ -684,7 +729,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         </div>
       )}
 
-      {/* ── Close Day Modal ───────────────────────────────────────────────── */}
+      {/* ── Close Day Modal ───────────────────────────── */}
       {showCloseDay && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl">
@@ -787,30 +832,25 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                         </div>
                       </div>
 
-                      <div className="space-y-1 mb-2">
-                        {bill.order_items?.map((item, i) => {
-                          const key = `item:${i}`
-                          const isRemoved = isEditing && editRemovedItemKeys.has(key)
-                          return (
-                            <div key={i} className={`flex justify-between text-xs ${isRemoved ? 'line-through opacity-40 text-red-400' : 'text-gray-500'}`}>
+                      {/* When NOT editing — show raw order_items exactly as in DB.
+                          This is now guaranteed to match the bill total, because
+                          any prior edit already wrote real quantities into these rows. */}
+                      {!isEditing && (
+                        <div className="space-y-1 mb-2">
+                          {bill.order_items?.map((item, i) => (
+                            <div key={i} className="flex justify-between text-xs text-gray-500">
                               <span>{item.food_items?.name} × {item.quantity}</span>
                               <span>₹{item.price_at_order * item.quantity}</span>
                             </div>
-                          )
-                        })}
-                        {(bill.open_items || []).map((oi, i) => (
-                          <div key={`open-${i}`} className="flex justify-between text-xs text-purple-600">
-                            <span>{oi.dept === 'Food' ? '🍽' : oi.dept === 'Beverage' ? '🥤' : '🍺'} {oi.name} × {oi.qty} <span className="opacity-60">(open)</span></span>
-                            <span>₹{oi.price * oi.qty}</span>
-                          </div>
-                        ))}
-                        {isEditing && editManualItems.map(mi => (
-                          <div key={mi.tempId} className="flex justify-between text-xs text-green-600 font-medium">
-                            <span>+ {mi.name} × {mi.qty}</span>
-                            <span>₹{mi.price * mi.qty}</span>
-                          </div>
-                        ))}
-                      </div>
+                          ))}
+                          {(bill.open_items || []).map((oi, i) => (
+                            <div key={`open-${i}`} className="flex justify-between text-xs text-purple-600">
+                              <span>{oi.dept === 'Food' ? '🍽' : oi.dept === 'Beverage' ? '🥤' : '🍺'} {oi.name} × {oi.qty} <span className="opacity-60">(open)</span></span>
+                              <span>₹{oi.price * oi.qty}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
 
                       {(bill.service_charge_amt > 0 || bill.discount_amt > 0) && !isEditing && (
                         <div className="border-t pt-2 space-y-0.5 mb-3">
@@ -841,7 +881,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                       )}
                     </div>
 
-                    {/* Edit Panel */}
+                    {/* ── Edit Panel — now qty-level like Dashboard ──────── */}
                     {isEditing && (
                       <div className="border-t bg-blue-50">
                         <div className="px-4 pt-3 pb-2">
@@ -853,26 +893,85 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
 
                         {bill.order_items?.length > 0 && (
                           <div className="px-4 py-3 border-b border-blue-100">
-                            <p className="text-xs font-bold text-gray-500 uppercase mb-2">🗑 Remove Items</p>
+                            <div className="flex items-center justify-between mb-2">
+                              <p className="text-xs font-bold text-gray-500 uppercase">🗑 Adjust Item Quantities</p>
+                              {editModifiedCount > 0 && (
+                                <button onClick={() => setEditItemQtyOverrides({})}
+                                  className="text-xs text-red-400 hover:text-red-600 underline">
+                                  Reset All
+                                </button>
+                              )}
+                            </div>
+                            <p className="text-xs text-gray-400 mb-2">
+                              Use − to reduce quantity. Set to 0 to remove from bill completely.
+                            </p>
                             <div className="space-y-1.5">
                               {bill.order_items.map((item, i) => {
                                 const key = `item:${i}`
-                                const isRemoved = editRemovedItemKeys.has(key)
+                                const originalQty = item.quantity
+                                const effectiveQty = editItemQtyOverrides.hasOwnProperty(key)
+                                  ? editItemQtyOverrides[key]
+                                  : originalQty
+                                const isFullyRemoved = effectiveQty === 0
+                                const isReduced = effectiveQty < originalQty && effectiveQty > 0
                                 return (
-                                  <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-xl border ${isRemoved ? 'bg-red-50 border-red-100 opacity-60' : 'bg-white border-gray-100'}`}>
-                                    <div className="flex items-center gap-2">
-                                      <span className={`text-sm text-gray-700 ${isRemoved ? 'line-through' : ''}`}>{item.food_items?.name}</span>
-                                      <span className="text-xs text-gray-400">×{item.quantity}</span>
-                                      <span className="text-xs font-medium text-orange-500">₹{item.price_at_order * item.quantity}</span>
+                                  <div key={i}
+                                    className={`flex items-center justify-between px-3 py-2.5 rounded-xl border transition
+                                      ${isFullyRemoved ? 'bg-red-50 border-red-200'
+                                        : isReduced ? 'bg-yellow-50 border-yellow-200'
+                                        : 'bg-white border-gray-100'}`}>
+                                    <div className="flex-1 min-w-0">
+                                      <div className="flex items-center gap-2 flex-wrap">
+                                        <span className={`text-sm text-gray-700 ${isFullyRemoved ? 'line-through text-gray-400' : ''}`}>
+                                          {item.food_items?.name}
+                                        </span>
+                                        {isFullyRemoved && (
+                                          <span className="text-xs bg-red-100 text-red-500 px-2 py-0.5 rounded-full font-medium">Removed</span>
+                                        )}
+                                        {isReduced && (
+                                          <span className="text-xs bg-yellow-100 text-yellow-600 px-2 py-0.5 rounded-full font-medium">
+                                            {originalQty} → {effectiveQty}
+                                          </span>
+                                        )}
+                                      </div>
+                                      <p className="text-xs text-gray-400 mt-0.5">
+                                        ₹{item.price_at_order} × {effectiveQty} = ₹{item.price_at_order * effectiveQty}
+                                        {isReduced && (
+                                          <span className="ml-1 text-red-400 line-through">
+                                            (was ₹{item.price_at_order * originalQty})
+                                          </span>
+                                        )}
+                                      </p>
                                     </div>
-                                    <button onClick={() => toggleEditRemove(key)}
-                                      className={`text-xs px-3 py-1 rounded-full font-medium ${isRemoved ? 'bg-green-100 text-green-600 hover:bg-green-200' : 'bg-red-100 text-red-500 hover:bg-red-200'}`}>
-                                      {isRemoved ? '↩ Restore' : '✕ Remove'}
-                                    </button>
+                                    <div className="flex items-center gap-1 ml-3 flex-shrink-0">
+                                      <button
+                                        onClick={() => setEditItemQty(key, originalQty, -1)}
+                                        disabled={effectiveQty === 0}
+                                        className="w-7 h-7 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center hover:bg-red-200 disabled:opacity-30 disabled:cursor-not-allowed">
+                                        −
+                                      </button>
+                                      <span className={`font-bold w-5 text-center text-sm ${isFullyRemoved ? 'text-red-400' : isReduced ? 'text-yellow-600' : 'text-gray-700'}`}>
+                                        {effectiveQty}
+                                      </span>
+                                      <button
+                                        onClick={() => setEditItemQty(key, originalQty, +1)}
+                                        disabled={effectiveQty === originalQty}
+                                        className="w-7 h-7 rounded-full bg-green-100 text-green-600 font-bold flex items-center justify-center hover:bg-green-200 disabled:opacity-30 disabled:cursor-not-allowed">
+                                        +
+                                      </button>
+                                    </div>
                                   </div>
                                 )
                               })}
                             </div>
+                            {editModifiedCount > 0 && (
+                              <div className="mt-2 bg-orange-50 border border-orange-200 rounded-xl px-3 py-2">
+                                <p className="text-xs text-orange-700 font-medium">
+                                  ✏️ {Object.values(editItemQtyOverrides).filter(q => q === 0).length} item(s) fully removed,{' '}
+                                  {Object.values(editItemQtyOverrides).filter(q => q > 0).length} item(s) qty reduced
+                                </p>
+                              </div>
+                            )}
                           </div>
                         )}
 
