@@ -161,7 +161,8 @@ export default function Dashboard() {
     setTables(tablesData || [])
     const { data: ordersData } = await supabase
       .from('orders')
-      // ── FIX: added `id` to order_items so we can update/delete by row id ──
+      // NOTE: order_items(id, ...) — the row `id` is required so we can
+      // update/delete the exact row when committing quantity overrides.
       .select(`*, tables(table_name), order_items(id, quantity, price_at_order, note, food_items(name))`)
       .eq('is_paid', false).order('created_at', { ascending: false })
     if (ordersData) {
@@ -195,7 +196,6 @@ export default function Dashboard() {
   const selectTable = (table) => {
     setSelectedTable(table)
     setNewOrderTables(prev => { const n = new Set(prev); n.delete(table.id); return n })
-    // Reset all edits when switching table
     setItemQtyOverrides({})
     setManualItems([])
     setShowItemEditor(false); setShowOpenForm(false)
@@ -335,9 +335,11 @@ export default function Dashboard() {
     const tOrders = orders.filter(o => o.table_id === payTableId)
     const nowIST = now.toISOString()
 
-    // ── FIX: Persist itemQtyOverrides to order_items in DB ────────────────
-    // Without this, TodayReport reads stale original quantities from the DB
-    // and shows wrong item list / mismatched totals.
+    // ── CRITICAL: Persist itemQtyOverrides into real order_items rows ──
+    // This is what keeps Dashboard, TodayReport, and Reports in sync.
+    // Without this write-back, the DB still holds the ORIGINAL quantities,
+    // so any screen that reads order_items directly (TodayReport, Reports)
+    // would show different numbers than what Dashboard billed.
     if (Object.keys(itemQtyOverrides).length > 0) {
       for (const order of tOrders) {
         const items = order.order_items || []
@@ -345,19 +347,19 @@ export default function Dashboard() {
           const key = `${order.id}:${idx}`
           if (!itemQtyOverrides.hasOwnProperty(key)) continue
           const newQty = itemQtyOverrides[key]
-          const rowId = items[idx].id  // available because fetchAll now selects order_items(id, ...)
+          const rowId = items[idx].id
           if (!rowId) continue
           if (newQty === 0) {
-            // Fully removed — delete the row from order_items
+            // Fully removed — delete the row entirely
             await supabase.from('order_items').delete().eq('id', rowId)
           } else {
-            // Partially reduced — update the quantity
+            // Partially reduced — update the quantity in place
             await supabase.from('order_items').update({ quantity: newQty }).eq('id', rowId)
           }
         }
       }
     }
-    // ─────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────
 
     // Insert any newly added menu items
     const menuOnlyItems = manualItems.filter(mi => mi.foodItemId)
