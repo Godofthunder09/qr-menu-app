@@ -45,6 +45,32 @@ const groupOrdersIntoBills = (orders) => {
   return Object.values(map)
 }
 
+// ── Merge order_items by food item id (or name, for legacy rows) ──────
+// Multiple rounds can each contribute a separate order_items row for the
+// "same" item (e.g. Juice ordered in round 1, then again in round 2).
+// Those are genuinely separate DB rows, which is correct — but for DISPLAY
+// we want them shown as one combined line, exactly like Dashboard.jsx does
+// with its mergeItems() helper. This is purely cosmetic; it never changes
+// what gets written back to the DB — _rowRefs below still points at every
+// underlying physical row so edits remain precise.
+const mergeOrderItemsForDisplay = (orderItems = []) => {
+  const map = {}
+  orderItems.forEach((item, idx) => {
+    const groupKey = item.food_item_id || item.food_items?.name || `idx-${idx}`
+    if (!map[groupKey]) {
+      map[groupKey] = {
+        name: item.food_items?.name || 'Unknown',
+        price_at_order: item.price_at_order,
+        quantity: 0,
+        _rowRefs: [], // every physical row (id + its own quantity) folded into this line
+      }
+    }
+    map[groupKey].quantity += item.quantity
+    map[groupKey]._rowRefs.push({ id: item.id, quantity: item.quantity })
+  })
+  return Object.values(map)
+}
+
 const LIQUOR_KEYWORDS = [
   'beer','wine','whisky','whiskey','vodka','rum','gin','tequila','brandy',
   'champagne','cocktail','scotch','bourbon','ale','lager','cider','sake','mead',
@@ -103,8 +129,12 @@ export default function TodayReport() {
   const [splitError, setSplitError] = useState('')
 
   // ── Edit state ─────────────────────────────────────────
-  // editItemQtyOverrides replaces the old binary editRemovedItemKeys.
-  // Map of `item:${idx}` → effective qty (same pattern as Dashboard.jsx)
+  // editItemQtyOverrides is now keyed by the REAL order_items row id
+  // (e.g. "row:<uuid>"), never by array index. Index-based keys broke
+  // the moment two orders/rounds were merged into one bill, because the
+  // concatenated order_items array's index has no fixed relationship to
+  // which physical DB row it came from. Row-id keys are stable no matter
+  // how the bill was assembled or re-fetched.
   const [editingBillKey, setEditingBillKey] = useState(null)
   const [editingBill, setEditingBill] = useState(null)
   const [editItemQtyOverrides, setEditItemQtyOverrides] = useState({})
@@ -150,6 +180,8 @@ export default function TodayReport() {
       .from('orders')
       // NOTE: order_items(id, ...) — row `id` is required so the Edit panel
       // can write quantity changes / deletions back to the exact DB row.
+      // food_item_id is required too, so display-merging can group rows by
+      // the same underlying menu item instead of by name string-matching.
       // This is what keeps Dashboard, TodayReport, and Reports in sync —
       // all three read the same order_items table, so once one screen
       // commits a change, every other screen sees it immediately.
@@ -157,7 +189,7 @@ export default function TodayReport() {
         subtotal, service_charge_pct, service_charge_amt,
         discount_type, discount_value, discount_amt,
         final_amount, table_name_snapshot, open_items_json,
-        order_items(id, quantity, price_at_order, food_items(name))`)
+        order_items(id, food_item_id, quantity, price_at_order, food_items(name))`)
       .eq('is_paid', true)
       .gte('paid_at', startISO).lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
@@ -274,16 +306,22 @@ export default function TodayReport() {
     setShowEditOpenForm(false)
   }
 
-  // ── Set qty override for an item (mirrors Dashboard.jsx pattern) ───────
-  const setEditItemQty = (key, originalQty, delta) => {
+  // ── Set qty override for a MERGED display line ──────────────────────
+  // key = `row:${rowId}` for single-row lines, but a merged line can
+  // represent MULTIPLE physical rows (e.g. juice from round 1 + round 2).
+  // We store the override against the merged line's combined originalQty,
+  // then on commit we fan the new total back out across the underlying
+  // rows (see fanOutQtyToRows below) so each physical row gets the right
+  // quantity written back — never relying on array index.
+  const setEditItemQty = (lineKey, originalQty, delta) => {
     setEditItemQtyOverrides(prev => {
-      const currentQty = prev.hasOwnProperty(key) ? prev[key] : originalQty
+      const currentQty = prev.hasOwnProperty(lineKey) ? prev[lineKey] : originalQty
       const newQty = Math.max(0, Math.min(originalQty, currentQty + delta))
       const updated = { ...prev }
       if (newQty === originalQty) {
-        delete updated[key]
+        delete updated[lineKey]
       } else {
-        updated[key] = newQty
+        updated[lineKey] = newQty
       }
       return updated
     })
@@ -314,14 +352,33 @@ export default function TodayReport() {
     setEditOpenName(''); setEditOpenPrice(''); setEditOpenQty(1); setShowEditOpenForm(false)
   }
 
-  // ── computeCurrentTotals — now qty-aware instead of binary remove ──────
+  // ── Build merged display lines for the bill being edited ───────────
+  // Each line has a stable lineKey (`row:<firstRowId>`), a combined
+  // originalQty, and `_rowRefs` listing every physical order_items row
+  // (id + its own quantity) that was folded into it.
+  const getMergedEditLines = (bill) => {
+    if (!bill) return []
+    return mergeOrderItemsForDisplay(bill.order_items).map(line => ({
+      ...line,
+      lineKey: `row:${line._rowRefs[0]?.id ?? line.name}`,
+    }))
+  }
+
+  // ── computeCurrentTotals — works off merged lines, qty-aware ───────
   const computeCurrentTotals = (bill, qtyOverrides, manualItems, svcPct, discType, discVal) => {
     if (!bill) return null
-    const effectiveItems = (bill.order_items || [])
-      .map((item, idx) => {
-        const key = `item:${idx}`
-        const effectiveQty = qtyOverrides.hasOwnProperty(key) ? qtyOverrides[key] : item.quantity
-        return { ...item, quantity: effectiveQty, _stableKey: key, _originalQty: item.quantity }
+    const mergedLines = getMergedEditLines(bill)
+    const effectiveItems = mergedLines
+      .map(line => {
+        const effectiveQty = qtyOverrides.hasOwnProperty(line.lineKey) ? qtyOverrides[line.lineKey] : line.quantity
+        return {
+          food_items: { name: line.name },
+          price_at_order: line.price_at_order,
+          quantity: effectiveQty,
+          _lineKey: line.lineKey,
+          _originalQty: line.quantity,
+          _rowRefs: line._rowRefs,
+        }
       })
       .filter(item => item.quantity > 0)
     const existingOpenAsItems = (bill.open_items || []).map(oi => ({
@@ -351,6 +408,22 @@ export default function TodayReport() {
         editingBill.discount_value?.toString() || '')
     : null
 
+  // ── Desync check ────────────────────────────────────────────────────
+  // If the bill's stored order_items (with ZERO overrides applied) don't
+  // add up to the bill's stored final_amount, something upstream (e.g. a
+  // prior edit elsewhere) didn't write back cleanly. Surface this clearly
+  // instead of silently showing a different number — that silent mismatch
+  // is exactly what caused the ₹540 vs ₹690 confusion.
+  const getUneditedTotals = (bill) => bill
+    ? computeCurrentTotals(bill, {}, [], bill.service_charge_pct, bill.discount_type, bill.discount_value?.toString() || '')
+    : null
+
+  const isBillDesynced = (bill) => {
+    const unedited = getUneditedTotals(bill)
+    if (!unedited || !bill) return false
+    return Math.abs(unedited.finalAmount - (bill.final_amount || 0)) > 1
+  }
+
   const openReprintPreview = (bill) => {
     setReprintServicePct(bill.service_charge_pct || 0)
     setReprintDiscount({ type: bill.discount_type || 'percent', value: bill.discount_value?.toString() || '', reason: '' })
@@ -363,18 +436,31 @@ export default function TodayReport() {
         reprintServicePct, reprintDiscount.type, reprintDiscount.value)
     : null
 
-  // ── handleReprintAndSave — now COMMITS qty overrides to order_items ────
-  // This is the critical fix: previously this function only updated the
-  // `orders` row (subtotal/final_amount/open_items_json) while leaving the
-  // underlying order_items rows completely untouched. That meant Dashboard
-  // and Reports — which both read order_items directly — kept showing the
-  // OLD quantities/items, causing the exact mismatch you saw (₹540 bill but
-  // item list still showing the original unedited rows).
-  //
-  // Now, exactly like Dashboard.jsx's handlePrintAndSave:
-  //   - qty reduced to >0  → UPDATE that order_items row's quantity
-  //   - qty reduced to 0   → DELETE that order_items row entirely
-  // After this, every screen reading order_items sees the corrected state.
+  // ── fanOutQtyToRows ──────────────────────────────────────────────────
+  // Given a merged line's new total quantity, distributes it across the
+  // physical order_items rows it was built from, largest-row-first. This
+  // guarantees we always update/delete REAL rows by their REAL id — never
+  // by a guessed array index — no matter how many rounds contributed to
+  // the merged line.
+  const fanOutQtyToRows = (rowRefs, newTotalQty) => {
+    let remaining = newTotalQty
+    const ops = []
+    // Stable order: as given (insertion order from the merge)
+    rowRefs.forEach(ref => {
+      const take = Math.min(ref.quantity, remaining)
+      remaining -= take
+      ops.push({ id: ref.id, newQty: take })
+    })
+    return ops // ops[i].newQty === 0 means delete that row; otherwise update to newQty
+  }
+
+  // ── handleReprintAndSave — commits qty overrides to real order_items ──
+  // For every merged line that was touched, fan the new quantity back out
+  // across its underlying physical rows and write each one individually:
+  //   newQty === 0   → DELETE that order_items row
+  //   newQty > 0     → UPDATE that row's quantity
+  // This guarantees order_items always reflects exactly what was billed,
+  // so Dashboard, TodayReport, and Reports never diverge again.
   const handleReprintAndSave = async () => {
     const dv = parseFloat(reprintDiscount.value) || 0
     if (dv > 0 && !reprintDiscount.reason.trim()) { setReprintDiscountError(true); return }
@@ -409,20 +495,18 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
       if (w) { w.document.write(buildHtmlReceipt(lines)); w.document.close(); w.focus(); setTimeout(() => { w.print(); w.close() }, 300) }
 
       // ── CRITICAL FIX: commit qty overrides to real order_items rows ────
-      if (Object.keys(editItemQtyOverrides).length > 0) {
-        const items = editingBill.order_items || []
-        for (let idx = 0; idx < items.length; idx++) {
-          const key = `item:${idx}`
-          if (!editItemQtyOverrides.hasOwnProperty(key)) continue
-          const newQty = editItemQtyOverrides[key]
-          const rowId = items[idx].id
-          if (!rowId) continue
-          if (newQty === 0) {
-            // Fully removed — delete the row
-            await supabase.from('order_items').delete().eq('id', rowId)
+      // Fan each touched merged line back out to its underlying physical
+      // rows by real DB id. No array indices anywhere in this path.
+      const mergedLines = getMergedEditLines(editingBill)
+      for (const line of mergedLines) {
+        if (!editItemQtyOverrides.hasOwnProperty(line.lineKey)) continue
+        const newTotalQty = editItemQtyOverrides[line.lineKey]
+        const ops = fanOutQtyToRows(line._rowRefs, newTotalQty)
+        for (const op of ops) {
+          if (op.newQty === 0) {
+            await supabase.from('order_items').delete().eq('id', op.id)
           } else {
-            // Partially reduced — update quantity in place
-            await supabase.from('order_items').update({ quantity: newQty }).eq('id', rowId)
+            await supabase.from('order_items').update({ quantity: op.newQty }).eq('id', op.id)
           }
         }
       }
@@ -442,7 +526,12 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
         .map(mi => ({ name: mi.name, price: mi.price, qty: mi.qty, dept: mi.dept, total: mi.price * mi.qty }))
       const updatedOpenItems = [...(editingBill.open_items || []), ...newOpenItems]
 
-      // Update orders row with the new, now-consistent totals
+      // Update orders row with the new, now-consistent totals.
+      // NOTE: every order belonging to this bill is stamped with the same
+      // bill-level totals (subtotal/SC/discount/final), since settlement,
+      // close-day, and reports all read off the `orders` row's own columns,
+      // not by re-deriving from order_items. Keeping every order row in a
+      // multi-round bill consistent here is what keeps everything in sync.
       for (const orderId of editingBill._orderIds) {
         await supabase.from('orders').update({
           subtotal: totals.subtotal, service_charge_pct: reprintServicePct,
@@ -816,6 +905,12 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
             <div className="space-y-4">
               {pendingBills.map(bill => {
                 const isEditing = editingBillKey === bill._key
+                const desynced = isBillDesynced(bill)
+                // For display in the non-editing card, merge same-item rows
+                // (e.g. two rounds of the same juice) into one line — exactly
+                // like Dashboard does — so the line items always visually add
+                // up to the bill total shown above them.
+                const displayLines = mergeOrderItemsForDisplay(bill.order_items)
                 return (
                   <div key={bill._key} className="bg-white border-2 border-yellow-300 rounded-2xl shadow-sm overflow-hidden">
                     <div className="p-4">
@@ -832,15 +927,28 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                         </div>
                       </div>
 
-                      {/* When NOT editing — show raw order_items exactly as in DB.
-                          This is now guaranteed to match the bill total, because
-                          any prior edit already wrote real quantities into these rows. */}
+                      {/* Desync warning — surfaces instead of silently
+                          showing mismatched numbers. This is the safety net:
+                          if order_items and final_amount ever drift apart for
+                          any reason, you'll see this banner rather than
+                          discovering it mid-settlement. */}
+                      {desynced && !isEditing && (
+                        <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-3">
+                          <p className="text-xs text-red-600 font-medium">
+                            ⚠️ Item list total doesn't match the bill amount. Open "Edit Bill" to review and re-save.
+                          </p>
+                        </div>
+                      )}
+
+                      {/* When NOT editing — show MERGED order_items, so
+                          duplicate-named rows from separate rounds collapse
+                          into one line, matching the Dashboard's billed view. */}
                       {!isEditing && (
                         <div className="space-y-1 mb-2">
-                          {bill.order_items?.map((item, i) => (
+                          {displayLines.map((line, i) => (
                             <div key={i} className="flex justify-between text-xs text-gray-500">
-                              <span>{item.food_items?.name} × {item.quantity}</span>
-                              <span>₹{item.price_at_order * item.quantity}</span>
+                              <span>{line.name} × {line.quantity}</span>
+                              <span>₹{line.price_at_order * line.quantity}</span>
                             </div>
                           ))}
                           {(bill.open_items || []).map((oi, i) => (
@@ -881,7 +989,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                       )}
                     </div>
 
-                    {/* ── Edit Panel — now qty-level like Dashboard ──────── */}
+                    {/* ── Edit Panel — qty-level, keyed by real row id ───── */}
                     {isEditing && (
                       <div className="border-t bg-blue-50">
                         <div className="px-4 pt-3 pb-2">
@@ -889,9 +997,16 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                             <span>✏️</span>
                             <p className="text-xs text-blue-700 font-medium">2nd & Last Chance — After reprinting, bill will be locked on settlement.</p>
                           </div>
+                          {desynced && (
+                            <div className="mt-2 bg-red-100 border border-red-200 rounded-xl px-3 py-2">
+                              <p className="text-xs text-red-700 font-medium">
+                                ⚠️ This bill's saved total (₹{bill.final_amount}) doesn't match what its items currently add up to (₹{getUneditedTotals(bill)?.finalAmount}). Review the items below, then save to fix it.
+                              </p>
+                            </div>
+                          )}
                         </div>
 
-                        {bill.order_items?.length > 0 && (
+                        {getMergedEditLines(bill).length > 0 && (
                           <div className="px-4 py-3 border-b border-blue-100">
                             <div className="flex items-center justify-between mb-2">
                               <p className="text-xs font-bold text-gray-500 uppercase">🗑 Adjust Item Quantities</p>
@@ -904,18 +1019,18 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                             </div>
                             <p className="text-xs text-gray-400 mb-2">
                               Use − to reduce quantity. Set to 0 to remove from bill completely.
+                              {' '}Items ordered across multiple rounds are combined into one line here.
                             </p>
                             <div className="space-y-1.5">
-                              {bill.order_items.map((item, i) => {
-                                const key = `item:${i}`
-                                const originalQty = item.quantity
-                                const effectiveQty = editItemQtyOverrides.hasOwnProperty(key)
-                                  ? editItemQtyOverrides[key]
+                              {getMergedEditLines(bill).map((line) => {
+                                const originalQty = line.quantity
+                                const effectiveQty = editItemQtyOverrides.hasOwnProperty(line.lineKey)
+                                  ? editItemQtyOverrides[line.lineKey]
                                   : originalQty
                                 const isFullyRemoved = effectiveQty === 0
                                 const isReduced = effectiveQty < originalQty && effectiveQty > 0
                                 return (
-                                  <div key={i}
+                                  <div key={line.lineKey}
                                     className={`flex items-center justify-between px-3 py-2.5 rounded-xl border transition
                                       ${isFullyRemoved ? 'bg-red-50 border-red-200'
                                         : isReduced ? 'bg-yellow-50 border-yellow-200'
@@ -923,8 +1038,13 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                                     <div className="flex-1 min-w-0">
                                       <div className="flex items-center gap-2 flex-wrap">
                                         <span className={`text-sm text-gray-700 ${isFullyRemoved ? 'line-through text-gray-400' : ''}`}>
-                                          {item.food_items?.name}
+                                          {line.name}
                                         </span>
+                                        {line._rowRefs.length > 1 && (
+                                          <span className="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full">
+                                            {line._rowRefs.length} rounds
+                                          </span>
+                                        )}
                                         {isFullyRemoved && (
                                           <span className="text-xs bg-red-100 text-red-500 px-2 py-0.5 rounded-full font-medium">Removed</span>
                                         )}
@@ -935,17 +1055,17 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                                         )}
                                       </div>
                                       <p className="text-xs text-gray-400 mt-0.5">
-                                        ₹{item.price_at_order} × {effectiveQty} = ₹{item.price_at_order * effectiveQty}
+                                        ₹{line.price_at_order} × {effectiveQty} = ₹{line.price_at_order * effectiveQty}
                                         {isReduced && (
                                           <span className="ml-1 text-red-400 line-through">
-                                            (was ₹{item.price_at_order * originalQty})
+                                            (was ₹{line.price_at_order * originalQty})
                                           </span>
                                         )}
                                       </p>
                                     </div>
                                     <div className="flex items-center gap-1 ml-3 flex-shrink-0">
                                       <button
-                                        onClick={() => setEditItemQty(key, originalQty, -1)}
+                                        onClick={() => setEditItemQty(line.lineKey, originalQty, -1)}
                                         disabled={effectiveQty === 0}
                                         className="w-7 h-7 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center hover:bg-red-200 disabled:opacity-30 disabled:cursor-not-allowed">
                                         −
@@ -954,7 +1074,7 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                                         {effectiveQty}
                                       </span>
                                       <button
-                                        onClick={() => setEditItemQty(key, originalQty, +1)}
+                                        onClick={() => setEditItemQty(line.lineKey, originalQty, +1)}
                                         disabled={effectiveQty === originalQty}
                                         className="w-7 h-7 rounded-full bg-green-100 text-green-600 font-bold flex items-center justify-center hover:bg-green-200 disabled:opacity-30 disabled:cursor-not-allowed">
                                         +
@@ -1096,7 +1216,9 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
               <span className="ml-2 text-xs font-normal text-gray-400">🔒 Locked after settlement</span>
             </h2>
             <div className="space-y-3">
-              {settledBills.map(bill => (
+              {settledBills.map(bill => {
+                const displayLines = mergeOrderItemsForDisplay(bill.order_items)
+                return (
                 <div key={bill._key} className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm opacity-90">
                   <div className="flex justify-between items-start mb-2">
                     <div>
@@ -1109,10 +1231,10 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                     </div>
                   </div>
                   <div className="space-y-1">
-                    {bill.order_items?.map((item, i) => (
+                    {displayLines.map((line, i) => (
                       <div key={i} className="flex justify-between text-xs text-gray-400">
-                        <span>{item.food_items?.name} × {item.quantity}</span>
-                        <span>₹{item.price_at_order * item.quantity}</span>
+                        <span>{line.name} × {line.quantity}</span>
+                        <span>₹{line.price_at_order * line.quantity}</span>
                       </div>
                     ))}
                     {(bill.open_items || []).map((oi, i) => (
@@ -1141,7 +1263,8 @@ ${totals.liquorItems.map(i => `<div class="row"><span>${i.food_items?.name || 'I
                   )}
                   <div className="mt-2 flex items-center gap-1 text-xs text-gray-300"><span>🔒</span><span>Locked after settlement</span></div>
                 </div>
-              ))}
+                )
+              })}
             </div>
           </div>
         )}
