@@ -98,9 +98,25 @@ export default function Dashboard() {
   const [allFoodItems, setAllFoodItems] = useState([])
   const [menuSearch, setMenuSearch] = useState('')
 
-  // itemQtyOverrides: map of `${orderId}:${itemIndex}` → effective qty to bill
-  // If key not in map → use original quantity
-  // If value is 0 → item completely removed from bill
+  // ── itemQtyOverrides — keyed by the REAL order_items row id ─────────
+  // Map of `row:<order_items.id>` → effective qty to bill.
+  // If key not in map → use original quantity.
+  // If value is 0 → item completely removed from bill.
+  //
+  // WHY NOT array index ("orderId:idx"): Supabase/PostgREST gives no
+  // ordering guarantee for a nested `order_items(...)` select unless you
+  // add an explicit `.order()`. Dashboard polls `fetchAll()` every 4s and
+  // also on every realtime INSERT/DELETE on `orders`. If a poll lands
+  // between the moment you click "−" on an item and the moment you click
+  // "Print & Save Bill", the freshly fetched `orders` array can hand back
+  // `order_items` in a different position. An index-based key silently
+  // stops matching, the write-back loop's `continue` fires for every row,
+  // and ZERO order_items rows get updated — while `orders.final_amount`
+  // still gets written (since that part never depended on index matching).
+  // That mismatch is exactly what produced ₹980 (orders row) sitting next
+  // to "Veg Kolhapuri × 2 = ₹630" (untouched order_items row) on every
+  // downstream screen. Keying by real row id makes the override immune to
+  // re-fetches, re-ordering, or polling entirely.
   const [itemQtyOverrides, setItemQtyOverrides] = useState({})
 
   const [manualItems, setManualItems] = useState([])
@@ -109,6 +125,17 @@ export default function Dashboard() {
   const [openName, setOpenName] = useState('')
   const [openPrice, setOpenPrice] = useState('')
   const [openQty, setOpenQty] = useState(1)
+
+  // ── Frozen billing snapshot ──────────────────────────────────────────
+  // The moment you select a table OR open the bill preview, we snapshot
+  // that table's current order_items (with their real row ids) into this
+  // ref. All editing, total computation, and the final write-back read
+  // from THIS snapshot — never from the live `orders` state directly.
+  // This means a background poll tick can refresh `orders` for other
+  // tables / the sidebar counts without ever touching the data you're
+  // actively billing. The snapshot is only replaced when you select a
+  // table fresh or after a successful save.
+  const billingSnapshotRef = useRef({ tableId: null, items: [] })
 
   const prevOrderIds = useRef(new Set())
   const audioCtxRef = useRef(null)
@@ -156,6 +183,12 @@ export default function Dashboard() {
     } catch (e) {}
   }, [])
 
+  // ── fetchAll — now orders order_items explicitly by id ───────────────
+  // Adding `.order('id')` on the embedded order_items select doesn't
+  // remove the need for row-id keys (a poll mid-edit could still in
+  // theory race with a fresh insert), but it does make the array stable
+  // across repeated fetches when nothing changed, which is good hygiene.
+  // The real safety net is the frozen snapshot + row-id keys above.
   const fetchAll = useCallback(async () => {
     const { data: tablesData } = await supabase.from('tables').select('*').order('created_at')
     setTables(tablesData || [])
@@ -163,7 +196,7 @@ export default function Dashboard() {
       .from('orders')
       // NOTE: order_items(id, ...) — the row `id` is required so we can
       // update/delete the exact row when committing quantity overrides.
-      .select(`*, tables(table_name), order_items(id, quantity, price_at_order, note, food_items(name))`)
+      .select(`*, tables(table_name), order_items(id, food_item_id, quantity, price_at_order, note, food_items(name))`)
       .eq('is_paid', false).order('created_at', { ascending: false })
     if (ordersData) {
       const addedOrderIds = new Set(); const addedTableIds = new Set()
@@ -193,6 +226,30 @@ export default function Dashboard() {
     return () => { clearInterval(poll); supabase.removeChannel(sub) }
   }, [fetchAll])
 
+  // ── Build a frozen, row-id-keyed snapshot for a table ────────────────
+  // Flattens every order_items row across every order/round for this
+  // table into one list, each entry carrying its real DB id. This is
+  // computed once (on table select, or on opening the preview if it
+  // hasn't been built yet) and then frozen — later polls of `orders`
+  // do not mutate it.
+  const buildSnapshot = (tableId) => {
+    const tOrders = orders.filter(o => o.table_id === tableId)
+    const rows = []
+    tOrders.forEach(order => {
+      ;(order.order_items || []).forEach(item => {
+        rows.push({
+          rowId: item.id,
+          orderId: order.id,
+          food_items: item.food_items,
+          price_at_order: item.price_at_order,
+          originalQty: item.quantity,
+          note: item.note,
+        })
+      })
+    })
+    return { tableId, items: rows, orderIds: tOrders.map(o => o.id) }
+  }
+
   const selectTable = (table) => {
     setSelectedTable(table)
     setNewOrderTables(prev => { const n = new Set(prev); n.delete(table.id); return n })
@@ -200,6 +257,8 @@ export default function Dashboard() {
     setManualItems([])
     setShowItemEditor(false); setShowOpenForm(false)
     setMenuSearch('')
+    // Freeze a fresh snapshot the moment a table is opened.
+    billingSnapshotRef.current = buildSnapshot(table.id)
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
 
@@ -211,31 +270,33 @@ export default function Dashboard() {
     _isManual: true
   }))
 
+  // ── getEffectiveItems — reads from the FROZEN snapshot, not `orders` ──
   const getEffectiveItems = useCallback((tableId) => {
-    const tOrders = orders.filter(o => o.table_id === tableId)
+    const snapshot = billingSnapshotRef.current.tableId === tableId
+      ? billingSnapshotRef.current
+      : buildSnapshot(tableId) // fallback safety net; should rarely trigger
     const result = []
-    tOrders.forEach(order => {
-      ;(order.order_items || []).forEach((item, idx) => {
-        const key = `${order.id}:${idx}`
-        const effectiveQty = itemQtyOverrides.hasOwnProperty(key)
-          ? itemQtyOverrides[key]
-          : item.quantity
-        if (effectiveQty > 0) {
-          result.push({
-            ...item,
-            quantity: effectiveQty,
-            price_at_order: item.price_at_order,
-            _orderId: order.id,
-            _idx: idx,
-            _key: key,
-            _originalQty: item.quantity,
-          })
-        }
-      })
+    snapshot.items.forEach(row => {
+      const key = `row:${row.rowId}`
+      const effectiveQty = itemQtyOverrides.hasOwnProperty(key)
+        ? itemQtyOverrides[key]
+        : row.originalQty
+      if (effectiveQty > 0) {
+        result.push({
+          food_items: row.food_items,
+          price_at_order: row.price_at_order,
+          quantity: effectiveQty,
+          _rowId: row.rowId,
+          _orderId: row.orderId,
+          _key: key,
+          _originalQty: row.originalQty,
+        })
+      }
     })
     manualAsOrderItems.forEach(mi => result.push(mi))
     return result
-  }, [orders, itemQtyOverrides, manualAsOrderItems])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [itemQtyOverrides, manualAsOrderItems])
 
   const computeTotals = useCallback((tableId) => {
     const items = getEffectiveItems(tableId)
@@ -259,13 +320,22 @@ export default function Dashboard() {
   }, [getEffectiveItems, serviceChargePct, discountType, discountValue])
 
   const openPreview = (tableId) => {
+    // If, for any reason, there's no live snapshot for this table yet
+    // (e.g. preview opened in a way that bypassed selectTable), freeze
+    // one now — but otherwise NEVER rebuild it here, so we don't discard
+    // overrides already set against the existing snapshot.
+    if (billingSnapshotRef.current.tableId !== tableId) {
+      billingSnapshotRef.current = buildSnapshot(tableId)
+    }
     setPayTableId(tableId)
     setServiceChargePct(0); setDiscountType('percent')
     setDiscountValue(''); setDiscountReason(''); setDiscountReasonError(false)
     setShowPreview(true)
   }
 
-  const setItemQty = (key, originalQty, delta) => {
+  // ── setItemQty — keyed by real row id, immune to re-fetch reordering ─
+  const setItemQty = (rowId, originalQty, delta) => {
+    const key = `row:${rowId}`
     setItemQtyOverrides(prev => {
       const currentQty = prev.hasOwnProperty(key) ? prev[key] : originalQty
       const newQty = Math.max(0, Math.min(originalQty, currentQty + delta))
@@ -332,30 +402,31 @@ export default function Dashboard() {
     w.document.write(buildHtmlReceipt(lines))
     w.document.close(); w.focus(); w.print(); w.close()
 
-    const tOrders = orders.filter(o => o.table_id === payTableId)
+    // ── Use the FROZEN snapshot for write-back, never live `orders` ────
+    // This guarantees the rowIds we update/delete are exactly the rows
+    // the override keys were built against — no index, no re-fetch race.
+    const snapshot = billingSnapshotRef.current.tableId === payTableId
+      ? billingSnapshotRef.current
+      : buildSnapshot(payTableId)
     const nowIST = now.toISOString()
 
     // ── CRITICAL: Persist itemQtyOverrides into real order_items rows ──
     // This is what keeps Dashboard, TodayReport, and Reports in sync.
-    // Without this write-back, the DB still holds the ORIGINAL quantities,
-    // so any screen that reads order_items directly (TodayReport, Reports)
-    // would show different numbers than what Dashboard billed.
+    // Every override is applied by the row's real DB id, taken from the
+    // frozen snapshot — so it is correct regardless of how many times
+    // `orders` has been re-fetched/reordered since the snapshot was taken.
     if (Object.keys(itemQtyOverrides).length > 0) {
-      for (const order of tOrders) {
-        const items = order.order_items || []
-        for (let idx = 0; idx < items.length; idx++) {
-          const key = `${order.id}:${idx}`
-          if (!itemQtyOverrides.hasOwnProperty(key)) continue
-          const newQty = itemQtyOverrides[key]
-          const rowId = items[idx].id
-          if (!rowId) continue
-          if (newQty === 0) {
-            // Fully removed — delete the row entirely
-            await supabase.from('order_items').delete().eq('id', rowId)
-          } else {
-            // Partially reduced — update the quantity in place
-            await supabase.from('order_items').update({ quantity: newQty }).eq('id', rowId)
-          }
+      for (const row of snapshot.items) {
+        const key = `row:${row.rowId}`
+        if (!itemQtyOverrides.hasOwnProperty(key)) continue
+        const newQty = itemQtyOverrides[key]
+        if (!row.rowId) continue
+        if (newQty === 0) {
+          // Fully removed — delete the row entirely
+          await supabase.from('order_items').delete().eq('id', row.rowId)
+        } else {
+          // Partially reduced — update the quantity in place
+          await supabase.from('order_items').update({ quantity: newQty }).eq('id', row.rowId)
         }
       }
     }
@@ -363,9 +434,9 @@ export default function Dashboard() {
 
     // Insert any newly added menu items
     const menuOnlyItems = manualItems.filter(mi => mi.foodItemId)
-    if (menuOnlyItems.length > 0 && tOrders.length > 0) {
+    if (menuOnlyItems.length > 0 && snapshot.orderIds.length > 0) {
       const rows = menuOnlyItems.map(mi => ({
-        order_id: tOrders[0].id,
+        order_id: snapshot.orderIds[0],
         food_item_id: mi.foodItemId,
         quantity: mi.qty,
         price_at_order: mi.price,
@@ -380,7 +451,7 @@ export default function Dashboard() {
       total: mi.price * mi.qty
     }))
 
-    for (const order of tOrders) {
+    for (const orderId of snapshot.orderIds) {
       await supabase.from('orders').update({
         is_paid: true, paid_at: nowIST, subtotal,
         service_charge_pct: serviceChargePct, service_charge_amt: serviceChargeAmt,
@@ -390,13 +461,14 @@ export default function Dashboard() {
         table_name_snapshot: tblData?.table_name || '',
         payment_type: 'pending',
         open_items_json: openItemsJson
-      }).eq('id', order.id)
+      }).eq('id', orderId)
     }
 
     await nukeClearTable(payTableId)
-    setNewOrderIds(prev => { const n = new Set(prev); tOrders.forEach(o => n.delete(o.id)); return n })
+    setNewOrderIds(prev => { const n = new Set(prev); snapshot.orderIds.forEach(id => n.delete(id)); return n })
     setItemQtyOverrides({}); setManualItems([])
     setShowItemEditor(false); setShowPreview(false)
+    billingSnapshotRef.current = { tableId: null, items: [] }
     if (selectedTable?.id === payTableId) setSelectedTable(null)
     fetchAll()
   }
@@ -430,11 +502,25 @@ export default function Dashboard() {
 
   const handleLogout = async () => { await supabase.auth.signOut(); navigate('/') }
 
+  // ── Display data now reads from the FROZEN snapshot when a table is
+  // selected, so the round-by-round list on screen always matches exactly
+  // what computeTotals/getEffectiveItems will bill — no possibility of
+  // the visible item list and the subtotal drifting apart mid-edit.
+  const liveSnapshot = selectedTable && billingSnapshotRef.current.tableId === selectedTable.id
+    ? billingSnapshotRef.current
+    : (selectedTable ? buildSnapshot(selectedTable.id) : { tableId: null, items: [], orderIds: [] })
+
   const tableOrders = selectedTable ? orders.filter(o => o.table_id === selectedTable.id) : []
-  const allOrderItems = tableOrders.flatMap(o => o.order_items || [])
+  const allOrderItems = liveSnapshot.items // flat list with stable rowId, used by the qty editor
   const editorTotals = selectedTable ? computeTotals(selectedTable.id) : null
   const displaySubtotal = editorTotals ? editorTotals.subtotal : 0
-  const groupedByOrder = tableOrders.map(o => ({ ...o, items: o.order_items || [] }))
+  // Group the frozen snapshot rows back by their originating order id, so
+  // the "Round N" cards still render per-round, but every item carries its
+  // real rowId for override matching (instead of a render-time index).
+  const groupedByOrder = tableOrders.map(o => ({
+    ...o,
+    items: liveSnapshot.items.filter(row => row.orderId === o.id),
+  }))
   const activeTables = tables.filter(t => orders.some(o => o.table_id === t.id))
   const selectedTableData = tables.find(t => t.id === selectedTable?.id)
   const currentPin = selectedTableData?.pin || '----'
@@ -733,7 +819,8 @@ export default function Dashboard() {
                 {showItemEditor && (
                   <div className="border-t">
 
-                    {/* Quantity-level remove controls */}
+                    {/* Quantity-level remove controls — driven by the frozen
+                        snapshot (allOrderItems), each row keyed by its real id */}
                     {allOrderItems.length > 0 && (
                       <div className="px-5 py-4 border-b">
                         <div className="flex items-center justify-between mb-3">
@@ -750,68 +837,66 @@ export default function Dashboard() {
                           Use − to reduce quantity. Set to 0 to remove from bill completely.
                         </p>
                         <div className="space-y-2">
-                          {tableOrders.flatMap(order =>
-                            (order.order_items || []).map((item, idx) => {
-                              const key = `${order.id}:${idx}`
-                              const originalQty = item.quantity
-                              const effectiveQty = itemQtyOverrides.hasOwnProperty(key)
-                                ? itemQtyOverrides[key]
-                                : originalQty
-                              const isFullyRemoved = effectiveQty === 0
-                              const isReduced = effectiveQty < originalQty && effectiveQty > 0
+                          {allOrderItems.map((row) => {
+                            const key = `row:${row.rowId}`
+                            const originalQty = row.originalQty
+                            const effectiveQty = itemQtyOverrides.hasOwnProperty(key)
+                              ? itemQtyOverrides[key]
+                              : originalQty
+                            const isFullyRemoved = effectiveQty === 0
+                            const isReduced = effectiveQty < originalQty && effectiveQty > 0
 
-                              return (
-                                <div key={key}
-                                  className={`flex items-center justify-between px-3 py-3 rounded-xl border transition
-                                    ${isFullyRemoved
-                                      ? 'bg-red-50 border-red-200'
-                                      : isReduced
-                                        ? 'bg-yellow-50 border-yellow-200'
-                                        : 'bg-gray-50 border-gray-100'}`}>
-                                  <div className="flex-1 min-w-0">
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                      <span className={`text-sm font-medium text-gray-700 ${isFullyRemoved ? 'line-through text-gray-400' : ''}`}>
-                                        {item.food_items?.name}
-                                      </span>
-                                      {isFullyRemoved && (
-                                        <span className="text-xs bg-red-100 text-red-500 px-2 py-0.5 rounded-full font-medium">Removed</span>
-                                      )}
-                                      {isReduced && (
-                                        <span className="text-xs bg-yellow-100 text-yellow-600 px-2 py-0.5 rounded-full font-medium">
-                                          {originalQty} → {effectiveQty}
-                                        </span>
-                                      )}
-                                    </div>
-                                    <p className="text-xs text-gray-400 mt-0.5">
-                                      ₹{item.price_at_order} × {effectiveQty} = ₹{item.price_at_order * effectiveQty}
-                                      {isReduced && (
-                                        <span className="ml-1 text-red-400 line-through">
-                                          (was ₹{item.price_at_order * originalQty})
-                                        </span>
-                                      )}
-                                    </p>
-                                  </div>
-                                  <div className="flex items-center gap-1 ml-3 flex-shrink-0">
-                                    <button
-                                      onClick={() => setItemQty(key, originalQty, -1)}
-                                      disabled={effectiveQty === 0}
-                                      className="w-8 h-8 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center hover:bg-red-200 disabled:opacity-30 disabled:cursor-not-allowed text-lg">
-                                      −
-                                    </button>
-                                    <span className={`font-bold w-6 text-center text-sm ${isFullyRemoved ? 'text-red-400' : isReduced ? 'text-yellow-600' : 'text-gray-700'}`}>
-                                      {effectiveQty}
+                            return (
+                              <div key={row.rowId}
+                                className={`flex items-center justify-between px-3 py-3 rounded-xl border transition
+                                  ${isFullyRemoved
+                                    ? 'bg-red-50 border-red-200'
+                                    : isReduced
+                                      ? 'bg-yellow-50 border-yellow-200'
+                                      : 'bg-gray-50 border-gray-100'}`}>
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className={`text-sm font-medium text-gray-700 ${isFullyRemoved ? 'line-through text-gray-400' : ''}`}>
+                                      {row.food_items?.name}
                                     </span>
-                                    <button
-                                      onClick={() => setItemQty(key, originalQty, +1)}
-                                      disabled={effectiveQty === originalQty}
-                                      className="w-8 h-8 rounded-full bg-green-100 text-green-600 font-bold flex items-center justify-center hover:bg-green-200 disabled:opacity-30 disabled:cursor-not-allowed text-lg">
-                                      +
-                                    </button>
+                                    {isFullyRemoved && (
+                                      <span className="text-xs bg-red-100 text-red-500 px-2 py-0.5 rounded-full font-medium">Removed</span>
+                                    )}
+                                    {isReduced && (
+                                      <span className="text-xs bg-yellow-100 text-yellow-600 px-2 py-0.5 rounded-full font-medium">
+                                        {originalQty} → {effectiveQty}
+                                      </span>
+                                    )}
                                   </div>
+                                  <p className="text-xs text-gray-400 mt-0.5">
+                                    ₹{row.price_at_order} × {effectiveQty} = ₹{row.price_at_order * effectiveQty}
+                                    {isReduced && (
+                                      <span className="ml-1 text-red-400 line-through">
+                                        (was ₹{row.price_at_order * originalQty})
+                                      </span>
+                                    )}
+                                  </p>
                                 </div>
-                              )
-                            })
-                          )}
+                                <div className="flex items-center gap-1 ml-3 flex-shrink-0">
+                                  <button
+                                    onClick={() => setItemQty(row.rowId, originalQty, -1)}
+                                    disabled={effectiveQty === 0}
+                                    className="w-8 h-8 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center hover:bg-red-200 disabled:opacity-30 disabled:cursor-not-allowed text-lg">
+                                    −
+                                  </button>
+                                  <span className={`font-bold w-6 text-center text-sm ${isFullyRemoved ? 'text-red-400' : isReduced ? 'text-yellow-600' : 'text-gray-700'}`}>
+                                    {effectiveQty}
+                                  </span>
+                                  <button
+                                    onClick={() => setItemQty(row.rowId, originalQty, +1)}
+                                    disabled={effectiveQty === originalQty}
+                                    className="w-8 h-8 rounded-full bg-green-100 text-green-600 font-bold flex items-center justify-center hover:bg-green-200 disabled:opacity-30 disabled:cursor-not-allowed text-lg">
+                                    +
+                                  </button>
+                                </div>
+                              </div>
+                            )
+                          })}
                         </div>
 
                         {modifiedCount > 0 && (
@@ -953,7 +1038,7 @@ export default function Dashboard() {
                 )}
               </div>
 
-              {/* ── Order rounds display ──────────────────── */}
+              {/* ── Order rounds display — sourced from the frozen snapshot ── */}
               <div className="space-y-4 mb-4">
                 {groupedByOrder.map((order, index) => {
                   const isNewOrder = newOrderIds.has(order.id)
@@ -969,9 +1054,9 @@ export default function Dashboard() {
                         <span className="text-xs text-gray-400">🕐 {toIST(order.created_at)}</span>
                       </div>
                       <div className="space-y-2">
-                        {order.items.map((item, i) => {
-                          const key = `${order.id}:${i}`
-                          const originalQty = item.quantity
+                        {order.items.map((row) => {
+                          const key = `row:${row.rowId}`
+                          const originalQty = row.originalQty
                           const effectiveQty = itemQtyOverrides.hasOwnProperty(key)
                             ? itemQtyOverrides[key]
                             : originalQty
@@ -979,11 +1064,11 @@ export default function Dashboard() {
                           const isReduced = effectiveQty < originalQty && effectiveQty > 0
 
                           return (
-                            <div key={i} className={`py-2 border-b border-gray-50 last:border-0 ${isFullyRemoved ? 'opacity-40' : ''}`}>
+                            <div key={row.rowId} className={`py-2 border-b border-gray-50 last:border-0 ${isFullyRemoved ? 'opacity-40' : ''}`}>
                               <div className="flex justify-between text-sm text-gray-700">
                                 <div className="flex items-center gap-2">
                                   <span className={`font-medium ${isFullyRemoved ? 'line-through text-gray-400' : ''}`}>
-                                    {item.food_items?.name}
+                                    {row.food_items?.name}
                                   </span>
                                   {isFullyRemoved && (
                                     <span className="text-xs bg-red-100 text-red-400 px-1.5 py-0.5 rounded-full">removed</span>
@@ -998,8 +1083,8 @@ export default function Dashboard() {
                                   × {isFullyRemoved ? originalQty : effectiveQty}
                                 </span>
                               </div>
-                              {item.note && item.note.trim() !== '' && (
-                                <p className="text-xs text-orange-500 italic mt-1">📝 "{item.note}"</p>
+                              {row.note && row.note.trim() !== '' && (
+                                <p className="text-xs text-orange-500 italic mt-1">📝 "{row.note}"</p>
                               )}
                             </div>
                           )
