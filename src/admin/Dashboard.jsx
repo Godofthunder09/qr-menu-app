@@ -415,6 +415,16 @@ export default function Dashboard() {
     // Every override is applied by the row's real DB id, taken from the
     // frozen snapshot — so it is correct regardless of how many times
     // `orders` has been re-fetched/reordered since the snapshot was taken.
+    //
+    // This is exactly the "3 Water Bottles ordered, customer only drank
+    // 2, reduce qty before printing" scenario: the order_items row for
+    // Water Bottle is updated from quantity=3 to quantity=2 (or deleted
+    // outright if reduced to 0) BEFORE the order is marked is_paid=true.
+    // TodayReport.jsx and Reports.jsx both query order_items fresh on
+    // every load — they never cache the customer's original order — so
+    // once this write completes, every downstream screen sees quantity=2
+    // and ₹30, matching exactly what was printed. There is no separate
+    // "what the customer sent" record that could drift out of sync.
     if (Object.keys(itemQtyOverrides).length > 0) {
       for (const row of snapshot.items) {
         const key = `row:${row.rowId}`
@@ -464,7 +474,10 @@ export default function Dashboard() {
       }).eq('id', orderId)
     }
 
-    await nukeClearTable(payTableId)
+    // ── FIX: only clear the orders we just billed (snapshot.orderIds) ──
+    // never delete unpaid orders blindly by re-querying is_paid=false.
+    // See nukeClearTable below for why this matters.
+    await nukeClearTable(payTableId, snapshot.orderIds)
     setNewOrderIds(prev => { const n = new Set(prev); snapshot.orderIds.forEach(id => n.delete(id)); return n })
     setItemQtyOverrides({}); setManualItems([])
     setShowItemEditor(false); setShowPreview(false)
@@ -473,21 +486,57 @@ export default function Dashboard() {
     fetchAll()
   }
 
-  const nukeClearTable = async (tableId) => {
+  // ── nukeClearTable — FIXED to avoid deleting orders placed mid-billing ─
+  // BEFORE: this re-queried `orders where table_id=X and is_paid=false`
+  // and deleted everything found. Dashboard polls every 4s, so if a
+  // customer placed a NEW order on this table in the gap between you
+  // opening the bill preview and clicking "Print & Save", that brand-new
+  // unpaid order (which was never part of the bill you just printed)
+  // would get silently deleted along with its order_items — with no
+  // error, no trace, and no way to recover it. The customer's new order
+  // simply vanished.
+  //
+  // AFTER: we accept the list of order IDs that were ACTUALLY just
+  // billed (settledOrderIds, taken from the frozen snapshot used to
+  // print/save). We only ever delete orders for this table that are
+  // is_paid=false AND not in that already-billed set. Any order that
+  // snuck in after the snapshot was frozen (and is therefore still
+  // is_paid=false and NOT in settledOrderIds) survives and stays visible
+  // on the dashboard for the next round.
+  //
+  // We only reset the table's session_version/PIN when there is nothing
+  // left unpaid on the table — i.e. the table is genuinely empty after
+  // clearing. If a new order survived, we leave the session alive so the
+  // customer doesn't lose their table session mid-order.
+  const nukeClearTable = async (tableId, settledOrderIds = []) => {
     try {
       const { data: ords } = await supabase
         .from('orders').select('id').eq('table_id', tableId).eq('is_paid', false)
-      if (ords && ords.length > 0)
-        await supabase.from('order_items').delete().in('order_id', ords.map(o => o.id))
-      await supabase.from('orders').delete().eq('table_id', tableId).eq('is_paid', false)
-      await supabase.from('table_sessions').delete().eq('table_id', tableId)
-      await supabase.from('table_order_summary').delete().eq('table_id', tableId)
-      const { data: tbl } = await supabase
-        .from('tables').select('session_version').eq('id', tableId).single()
-      await supabase.from('tables').update({
-        session_version: (tbl?.session_version || 1) + 1,
-        pin: generatePin()
-      }).eq('id', tableId)
+      const allUnpaidIds = (ords || []).map(o => o.id)
+      // Only delete unpaid orders that are NOT part of what we just billed
+      // and were NOT already paid by this print — i.e. genuinely stale/
+      // leftover unpaid rows for this table.
+      const toDelete = allUnpaidIds.filter(id => !settledOrderIds.includes(id))
+
+      if (toDelete.length > 0) {
+        await supabase.from('order_items').delete().in('order_id', toDelete)
+        await supabase.from('orders').delete().in('id', toDelete)
+      }
+
+      // If nothing unpaid remains for this table after clearing stale
+      // rows (i.e. no new order snuck in during billing), it's safe to
+      // fully reset the session and rotate the PIN.
+      const remainingUnpaid = allUnpaidIds.length - toDelete.length
+      if (remainingUnpaid === 0) {
+        await supabase.from('table_sessions').delete().eq('table_id', tableId)
+        await supabase.from('table_order_summary').delete().eq('table_id', tableId)
+        const { data: tbl } = await supabase
+          .from('tables').select('session_version').eq('id', tableId).single()
+        await supabase.from('tables').update({
+          session_version: (tbl?.session_version || 1) + 1,
+          pin: generatePin()
+        }).eq('id', tableId)
+      }
       return true
     } catch (err) { return false }
   }
@@ -495,7 +544,10 @@ export default function Dashboard() {
   const clearAllTables = async () => {
     setShowClearAllConfirm(false); setClearing(true)
     const active = tables.filter(t => orders.some(o => o.table_id === t.id))
-    for (const table of active) await nukeClearTable(table.id)
+    // Manual "Clear All" is an explicit admin action with no in-flight
+    // bill being printed, so there is no settledOrderIds set to protect —
+    // everything currently unpaid on these tables is intentionally wiped.
+    for (const table of active) await nukeClearTable(table.id, [])
     setNewOrderIds(new Set()); setNewOrderTables(new Set())
     setSelectedTable(null); setClearing(false); fetchAll()
   }
