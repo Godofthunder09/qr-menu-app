@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 
@@ -70,6 +70,7 @@ const LIQUOR_KEYWORDS = [
 ]
 const isLiquorItem = (name = '') => LIQUOR_KEYWORDS.some(k => name.toLowerCase().includes(k))
 
+// ── Receipt HTML builder (same structure as Dashboard) ─────────────────
 const buildHtmlReceipt = (lines) => `
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
@@ -143,9 +144,7 @@ export default function TodayReport() {
       })
   }, [])
 
-  // ── Fetch today's bills — reads actual order_items from DB ──────────
-  // Items shown here are exactly what is in the DB (set by Dashboard at
-  // print time). No edit capability exists here — only discount changes.
+  // ── Fetch today's bills ─────────────────────────────────────────────
   const fetchTodayBills = async () => {
     setLoading(true)
     const today = todayIST()
@@ -206,7 +205,6 @@ export default function TodayReport() {
   const openModify = (bill) => {
     setModifyingBillKey(bill._key)
     setModifyingBill(bill)
-    // Pre-fill with existing discount if any
     setModDiscountType(bill.discount_type || 'percent')
     setModDiscountValue(bill.discount_value ? bill.discount_value.toString() : '')
     setModDiscountReason(bill.discount_reason || '')
@@ -222,10 +220,89 @@ export default function TodayReport() {
     setModDiscountReasonError(false)
   }
 
-  // ── Save discount changes ────────────────────────────────────────────
-  // Only updates discount fields + final_amount in `orders`.
-  // Also patches `daily_reports` if the bill is already settled, so the
-  // revenue numbers stay consistent everywhere.
+  // ── Print the modified bill receipt ────────────────────────────────
+  // Called after discount is saved to DB, uses the saved bill data +
+  // the new discount totals to build and print a fresh receipt.
+  // Reads restaurant info from settings (same as Dashboard).
+  const printModifiedBill = useCallback((bill, totals, discReason) => {
+    if (!bill || !totals) return
+
+    const allItems = bill.order_items || []
+    const openItems = bill.open_items || []
+
+    // Separate food vs liquor, merge duplicates for receipt display
+    const mergeForReceipt = (items) => {
+      const map = {}
+      items.forEach(i => {
+        const name = i.food_items?.name || 'Unknown'
+        if (!map[name]) map[name] = { name, price: i.price_at_order, qty: 0 }
+        map[name].qty += i.quantity
+      })
+      return Object.values(map)
+    }
+
+    const foodMerged  = mergeForReceipt(allItems.filter(i => !isLiquorItem(i.food_items?.name)))
+    const liquorMerged = mergeForReceipt(allItems.filter(i =>  isLiquorItem(i.food_items?.name)))
+    const openFood    = openItems.filter(oi => oi.dept !== 'Liquor')
+    const openLiquor  = openItems.filter(oi => oi.dept === 'Liquor')
+
+    const foodSubtotal   = foodMerged.reduce((s, i) => s + i.price * i.qty, 0) + openFood.reduce((s, oi) => s + oi.price * oi.qty, 0)
+    const liquorSubtotal = liquorMerged.reduce((s, i) => s + i.price * i.qty, 0) + openLiquor.reduce((s, oi) => s + oi.price * oi.qty, 0)
+
+    const foodLines = [
+      ...foodMerged.map(i => `<div class="row"><span>${i.name} x${i.qty}</span><span>Rs.${i.price * i.qty}</span></div>`),
+      ...openFood.map(oi => `<div class="row"><span>${oi.name} x${oi.qty}</span><span>Rs.${oi.price * oi.qty}</span></div>`)
+    ]
+    const liquorLines = [
+      ...liquorMerged.map(i => `<div class="row"><span>${i.name} x${i.qty}</span><span>Rs.${i.price * i.qty}</span></div>`),
+      ...openLiquor.map(oi => `<div class="row"><span>${oi.name} x${oi.qty}</span><span>Rs.${oi.price * oi.qty}</span></div>`)
+    ]
+
+    const foodSection = foodLines.length > 0 ? `
+      <div class="section-title">FOOD</div>
+      ${foodLines.join('')}
+      <div class="row bold"><span>Food Subtotal</span><span>Rs.${foodSubtotal}</span></div>
+      <div class="div"></div>` : ''
+
+    const liquorSection = liquorLines.length > 0 ? `
+      <div class="section-title">LIQUOR</div>
+      ${liquorLines.join('')}
+      <div class="row bold"><span>Liquor Subtotal</span><span>Rs.${liquorSubtotal}</span></div>
+      <div class="div"></div>` : ''
+
+    const now = new Date()
+    const html = buildHtmlReceipt({
+      restaurantName: restaurant.name,
+      address:        restaurant.address,
+      phone:          restaurant.phone,
+      gstNumber:      restaurant.gst_number,
+      footerNote:     restaurant.footer_note,
+      tableName:      bill.table_name_snapshot,
+      date:           formatDate(now.toISOString()),
+      time:           toIST(now.toISOString()),
+      foodSection,
+      liquorSection,
+      subtotal:          totals.subtotal,
+      serviceChargePct:  bill.service_charge_pct,
+      serviceChargeAmt:  totals.serviceChargeAmt,
+      discountAmt:       totals.discountAmt,
+      discountReason:    discReason,
+      finalAmount:       totals.finalAmount,
+      splitInfo:         null,
+    })
+
+    const w = window.open('', '_blank', 'width=400,height=600')
+    if (!w) { alert('⚠️ Pop-up blocked — allow pop-ups then try again.'); return }
+    w.document.write(html)
+    w.document.close()
+    w.focus()
+    w.print()
+    w.close()
+  }, [restaurant])
+
+  // ── Save discount changes + print receipt ───────────────────────────
+  // Saves discount to orders + patches daily_reports if already settled,
+  // then immediately prints the updated bill — no separate Save button.
   const handleSaveModify = async () => {
     const dv = parseFloat(modDiscountValue) || 0
     if (dv > 0 && !modDiscountReason.trim()) {
@@ -243,18 +320,15 @@ export default function TodayReport() {
       // Update every order row belonging to this bill
       for (const orderId of modifyingBill._orderIds) {
         await supabase.from('orders').update({
-          discount_type: modDiscountType,
-          discount_value: dv,
-          discount_amt: modTotals.discountAmt,
+          discount_type:   modDiscountType,
+          discount_value:  dv,
+          discount_amt:    modTotals.discountAmt,
           discount_reason: modDiscountReason.trim(),
-          final_amount: newFinalAmount,
+          final_amount:    newFinalAmount,
         }).eq('id', orderId)
       }
 
-      // ── Patch daily_reports if bill is already settled ───────────────
-      // Settlement wrote the OLD final_amount into daily_reports.
-      // If a discount is now applied after settlement, we must subtract
-      // the delta so daily totals stay accurate.
+      // Patch daily_reports if bill is already settled so totals stay accurate
       if (
         (modifyingBill.settlement_status === 'settled' || modifyingBill.settlement_status === 'day_closed')
         && Math.abs(amtDelta) > 0
@@ -263,22 +337,29 @@ export default function TodayReport() {
         const { data: dr } = await supabase
           .from('daily_reports').select('*').eq('report_date', today).single()
         if (dr) {
-          const pt = modifyingBill.payment_type
-          const sp = modifyingBill.split_payment
+          const pt   = modifyingBill.payment_type
+          const sp   = modifyingBill.split_payment
           const base = oldFinalAmount || 1
           await supabase.from('daily_reports').update({
-            total_revenue:  dr.total_revenue + amtDelta,
-            cash_revenue:   dr.cash_revenue  + (sp ? Math.round(amtDelta * (sp.cash || 0) / base) : pt === 'cash' ? amtDelta : 0),
-            upi_revenue:    dr.upi_revenue   + (sp ? Math.round(amtDelta * (sp.upi  || 0) / base) : pt === 'upi'  ? amtDelta : 0),
-            card_revenue:   dr.card_revenue  + (sp ? Math.round(amtDelta * (sp.card || 0) / base) : pt === 'card' ? amtDelta : 0),
+            total_revenue: dr.total_revenue + amtDelta,
+            cash_revenue:  dr.cash_revenue  + (sp ? Math.round(amtDelta * (sp.cash || 0) / base) : pt === 'cash' ? amtDelta : 0),
+            upi_revenue:   dr.upi_revenue   + (sp ? Math.round(amtDelta * (sp.upi  || 0) / base) : pt === 'upi'  ? amtDelta : 0),
+            card_revenue:  dr.card_revenue  + (sp ? Math.round(amtDelta * (sp.card || 0) / base) : pt === 'card' ? amtDelta : 0),
             updated_at: new Date().toISOString()
           }).eq('report_date', today)
         }
       }
 
+      // ── Print the updated bill immediately after saving ─────────────
+      // We pass the bill, totals, and reason explicitly so the print
+      // function doesn't depend on state that closeModify() is about
+      // to clear. This guarantees the receipt is built from the exact
+      // values we just saved to the DB.
+      printModifiedBill(modifyingBill, modTotals, modDiscountReason.trim())
+      // ────────────────────────────────────────────────────────────────
+
       closeModify()
       await fetchTodayBills()
-      alert('✅ Discount applied successfully!')
     } catch (err) {
       alert('❌ Error: ' + err.message)
     } finally {
@@ -309,7 +390,7 @@ export default function TodayReport() {
 
     if (settleType === 'split') {
       const { firstMethod, secondMethod } = parseSplitMode(splitMode)
-      const firstAmt = parseFloat(splitAmounts.first) || 0
+      const firstAmt  = parseFloat(splitAmounts.first)  || 0
       const secondAmt = parseFloat(splitAmounts.second) || 0
       const total = settleBill.final_amount || 0
       if (firstAmt <= 0 && secondAmt <= 0) { setSplitError('Enter amounts for both payment methods'); return }
@@ -317,7 +398,7 @@ export default function TodayReport() {
         setSplitError(`Amounts must add up to ₹${total} (currently ₹${firstAmt + secondAmt})`); return
       }
       setSplitError('')
-      paymentType = firstAmt >= secondAmt ? firstMethod : secondMethod
+      paymentType  = firstAmt >= secondAmt ? firstMethod : secondMethod
       splitPayload = { [firstMethod]: firstAmt, [secondMethod]: secondAmt }
     }
 
@@ -330,23 +411,21 @@ export default function TodayReport() {
       }).eq('id', orderId)
     }
 
-    // Write to daily_reports using the bill's current final_amount
-    // (which already includes any discount applied via Modify)
     const today = todayIST()
     const { data: existing } = await supabase.from('daily_reports').select('*').eq('report_date', today).single()
-    const amt = settleBill.final_amount || 0
-    const svc = settleBill.service_charge_amt || 0
+    const amt     = settleBill.final_amount || 0
+    const svc     = settleBill.service_charge_amt || 0
     const cashAmt = splitPayload ? (splitPayload.cash || 0) : (paymentType === 'cash' ? amt : 0)
     const upiAmt  = splitPayload ? (splitPayload.upi  || 0) : (paymentType === 'upi'  ? amt : 0)
     const cardAmt = splitPayload ? (splitPayload.card || 0) : (paymentType === 'card' ? amt : 0)
 
     if (existing) {
       await supabase.from('daily_reports').update({
-        total_orders: existing.total_orders + 1,
-        total_revenue: existing.total_revenue + amt,
-        cash_revenue:  existing.cash_revenue  + cashAmt,
-        upi_revenue:   existing.upi_revenue   + upiAmt,
-        card_revenue:  existing.card_revenue  + cardAmt,
+        total_orders:         existing.total_orders + 1,
+        total_revenue:        existing.total_revenue + amt,
+        cash_revenue:         existing.cash_revenue  + cashAmt,
+        upi_revenue:          existing.upi_revenue   + upiAmt,
+        card_revenue:         existing.card_revenue  + cardAmt,
         service_charge_total: existing.service_charge_total + svc,
         updated_at: new Date().toISOString()
       }).eq('report_date', today)
@@ -403,7 +482,6 @@ export default function TodayReport() {
   }
 
   const { firstMethod, secondMethod } = parseSplitMode(splitMode)
-  const modDv = parseFloat(modDiscountValue) || 0
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -437,9 +515,9 @@ export default function TodayReport() {
             <p className="text-sm font-medium text-gray-700 mb-2">How did they pay?</p>
             <div className="grid grid-cols-4 gap-1.5 mb-4">
               {[
-                { id: 'cash', label: '💵 Cash' },
-                { id: 'upi',  label: '📱 UPI' },
-                { id: 'card', label: '💳 Card' },
+                { id: 'cash',  label: '💵 Cash' },
+                { id: 'upi',   label: '📱 UPI' },
+                { id: 'card',  label: '💳 Card' },
                 { id: 'split', label: '🔀 Split' },
               ].map(p => (
                 <button key={p.id} onClick={() => { setSettleType(p.id); setSplitError('') }}
@@ -595,8 +673,7 @@ export default function TodayReport() {
             <h2 className="text-base font-bold text-red-500 mb-3">⏳ Unsettled Bills ({pendingBills.length})</h2>
             <div className="space-y-4">
               {pendingBills.map(bill => {
-                const isModifying = modifyingBillKey === bill._key
-                // Items come directly from DB (set by Dashboard at print time)
+                const isModifying  = modifyingBillKey === bill._key
                 const displayLines = mergeOrderItemsForDisplay(bill.order_items)
                 const liveModTotals = isModifying
                   ? computeModifyTotals(bill, modDiscountType, modDiscountValue)
@@ -618,7 +695,7 @@ export default function TodayReport() {
                         </div>
                       </div>
 
-                      {/* ── Item list — exact DB values, read-only ─────── */}
+                      {/* Item list — exact DB values, read-only */}
                       <div className="space-y-1 mb-2">
                         {displayLines.map((line, i) => (
                           <div key={i} className="flex justify-between text-xs text-gray-500">
@@ -655,7 +732,6 @@ export default function TodayReport() {
                         )}
                       </div>
 
-                      {/* Action buttons — NO Edit button */}
                       {!isModifying && (
                         <div className="flex gap-2 mt-2">
                           <button onClick={() => openSettle(bill)}
@@ -683,7 +759,7 @@ export default function TodayReport() {
                         </div>
 
                         <div className="px-4 py-3 space-y-3">
-                          {/* Food items (read-only, for reference) */}
+                          {/* Billed items read-only reference */}
                           <div>
                             <p className="text-xs font-bold text-gray-500 uppercase mb-1">🍽 Billed Items (locked)</p>
                             <div className="bg-white rounded-xl px-3 py-2 space-y-1">
@@ -713,7 +789,6 @@ export default function TodayReport() {
                           {/* Discount controls */}
                           <div className="bg-white rounded-xl p-3 space-y-3">
                             <p className="text-xs font-bold text-gray-500 uppercase">Apply Discount</p>
-
                             <div className="flex items-center gap-2">
                               <select
                                 value={modDiscountType}
@@ -734,9 +809,11 @@ export default function TodayReport() {
                               )}
                             </div>
 
-                            {/* Reason — mandatory */}
+                            {/* Reason — mandatory when discount > 0 */}
                             <div>
-                              <label className="text-xs text-gray-500 mb-1 block">Reason <span className="text-red-500">*</span></label>
+                              <label className="text-xs text-gray-500 mb-1 block">
+                                Reason {(parseFloat(modDiscountValue) || 0) > 0 && <span className="text-red-500">*</span>}
+                              </label>
                               <input
                                 type="text"
                                 value={modDiscountReason}
@@ -769,16 +846,23 @@ export default function TodayReport() {
                             )}
                           </div>
 
+                          {/* ── ACTION BUTTONS ─────────────────────────────
+                              Save button replaced with Print & Save — clicking
+                              saves discount to DB and immediately prints the
+                              updated receipt. Cancel discards without saving. */}
                           <div className="flex gap-2">
                             <button onClick={closeModify}
                               className="flex-1 bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium">
                               Cancel
                             </button>
                             <button onClick={handleSaveModify} disabled={modSaving}
-                              className="flex-1 bg-purple-500 text-white py-2.5 rounded-xl font-bold hover:bg-purple-600 disabled:opacity-50">
-                              {modSaving ? '⏳ Saving...' : '✅ Apply Discount'}
+                              className="flex-1 bg-purple-500 text-white py-2.5 rounded-xl font-bold hover:bg-purple-600 disabled:opacity-50 flex items-center justify-center gap-2">
+                              {modSaving ? '⏳ Saving...' : '🖨️ Print & Save'}
                             </button>
                           </div>
+                          <p className="text-xs text-gray-400 text-center">
+                            Saves discount to DB and prints updated receipt in one click
+                          </p>
                         </div>
                       </div>
                     )}
