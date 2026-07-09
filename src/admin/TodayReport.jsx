@@ -641,7 +641,7 @@ export default function TodayReport() {
               <button onClick={() => setShowCloseDay(false)} className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
               <button onClick={closeDay} disabled={closingDay || pendingBills.length > 0}
                 className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold disabled:opacity-50">
-                {closingDay ? '⏳ Closing...' : '🌙 Close Day'}
+                {closingDay ? '⏳ Closing...' : '🌙 Close Day for yash'}
               </button>
             </div>
           </div>
