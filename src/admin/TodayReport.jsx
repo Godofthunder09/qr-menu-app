@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 
@@ -10,12 +10,42 @@ const formatDate = (d) => new Date(d).toLocaleDateString('en-IN', {
   timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric'
 })
 
-// ── Group multiple order rows for the same table+minute into one bill ──
+// ─────────────────────────────────────────────────────────────────────
+// FIX (root cause of the "3 Mineral Water still shows after reducing
+// to 1" bug):
+//
+// The OLD grouping key was `${table_name_snapshot}__${paid_at.substr(0,16)}`
+// i.e. table name + the MINUTE the order was paid (truncated to the
+// minute, seconds/millis dropped). This is NOT a unique key. Any two
+// distinct `orders` rows for the same table that happen to get paid in
+// the same clock-minute (e.g. two rounds billed back-to-back, or a
+// retry) get silently merged into ONE display "bill", and their
+// order_items arrays get CONCATENATED with `[...a, ...b]`.
+//
+// Concatenating item arrays is the bug: it doesn't replace/dedupe by
+// food_item — it just appends. So if Round 1 had "Mineral Water x3" as
+// one order_items row and Round 2 (billed in the same minute, after you
+// reduced quantity down in the editor) had "Mineral Water x1" as a
+// SEPARATE order_items row belonging to a SEPARATE order, the grouped
+// bill showed BOTH rows: "Mineral Water x3" AND "Mineral Water x1" —
+// while `final_amount` on the row that matters was computed fresh and
+// correctly at print time, so the ₹ total looked right (₹30) but the
+// item list still showed x3.
+//
+// THE FIX: never merge order_items across DIFFERENT order ids for
+// display unless they share the EXACT SAME `paid_at` timestamp (full
+// ISO string, not truncated to the minute). An identical-to-the-
+// millisecond `paid_at` can only happen when Dashboard's
+// `handlePrintAndSave` stamped the SAME `nowIST` value across every
+// order in `snapshot.orderIds` in a single write-back loop — i.e. they
+// are genuinely part of the same bill. Different bills (different
+// print actions) will never share the exact same timestamp.
+// ─────────────────────────────────────────────────────────────────────
 const groupOrdersIntoBills = (orders) => {
   const map = {}
   orders.forEach(order => {
-    const minuteKey = order.paid_at ? order.paid_at.substring(0, 16) : order.id
-    const key = `${order.table_name_snapshot || ''}__${minuteKey}`
+    // Exact paid_at match (not truncated to the minute) + table name.
+    const key = `${order.table_name_snapshot || ''}__${order.paid_at || order.id}`
     if (!map[key]) {
       map[key] = {
         _orderIds: [order.id], _key: key,
@@ -38,6 +68,13 @@ const groupOrdersIntoBills = (orders) => {
     } else {
       map[key]._orderIds.push(order.id)
       map[key].order_items = [...map[key].order_items, ...(order.order_items || [])]
+      // If genuinely-merged (same exact paid_at), sum the money fields
+      // too, since each underlying orders row only carries its own
+      // slice of subtotal/final_amount.
+      map[key].subtotal += order.subtotal || 0
+      map[key].service_charge_amt += order.service_charge_amt || 0
+      map[key].discount_amt += order.discount_amt || 0
+      map[key].final_amount += order.final_amount || 0
       if (order.settlement_status === 'pending') map[key].settlement_status = 'pending'
     }
   })
@@ -45,6 +82,9 @@ const groupOrdersIntoBills = (orders) => {
 }
 
 // ── Merge order_items by food_item_id for display (cosmetic only) ──────
+// This merge is safe: it only ever runs WITHIN a single already-correct
+// bill's order_items array (post the fix above), so summing quantities
+// here reflects the true, current, post-edit quantity — not a stale one.
 const mergeOrderItemsForDisplay = (orderItems = []) => {
   const map = {}
   orderItems.forEach((item, idx) => {
@@ -221,16 +261,12 @@ export default function TodayReport() {
   }
 
   // ── Print the modified bill receipt ────────────────────────────────
-  // Called after discount is saved to DB, uses the saved bill data +
-  // the new discount totals to build and print a fresh receipt.
-  // Reads restaurant info from settings (same as Dashboard).
   const printModifiedBill = useCallback((bill, totals, discReason) => {
     if (!bill || !totals) return
 
     const allItems = bill.order_items || []
     const openItems = bill.open_items || []
 
-    // Separate food vs liquor, merge duplicates for receipt display
     const mergeForReceipt = (items) => {
       const map = {}
       items.forEach(i => {
@@ -301,8 +337,6 @@ export default function TodayReport() {
   }, [restaurant])
 
   // ── Save discount changes + print receipt ───────────────────────────
-  // Saves discount to orders + patches daily_reports if already settled,
-  // then immediately prints the updated bill — no separate Save button.
   const handleSaveModify = async () => {
     const dv = parseFloat(modDiscountValue) || 0
     if (dv > 0 && !modDiscountReason.trim()) {
@@ -317,7 +351,11 @@ export default function TodayReport() {
       const oldFinalAmount = modifyingBill.final_amount || 0
       const amtDelta = newFinalAmount - oldFinalAmount
 
-      // Update every order row belonging to this bill
+      // Update every order row belonging to this bill.
+      // NOTE: when this bill is a genuine multi-order merge (identical
+      // paid_at across _orderIds), the discount is intentionally applied
+      // uniformly across each underlying order row's own discount fields
+      // — matching prior behavior.
       for (const orderId of modifyingBill._orderIds) {
         await supabase.from('orders').update({
           discount_type:   modDiscountType,
@@ -350,13 +388,7 @@ export default function TodayReport() {
         }
       }
 
-      // ── Print the updated bill immediately after saving ─────────────
-      // We pass the bill, totals, and reason explicitly so the print
-      // function doesn't depend on state that closeModify() is about
-      // to clear. This guarantees the receipt is built from the exact
-      // values we just saved to the DB.
       printModifiedBill(modifyingBill, modTotals, modDiscountReason.trim())
-      // ────────────────────────────────────────────────────────────────
 
       closeModify()
       await fetchTodayBills()
@@ -846,10 +878,6 @@ export default function TodayReport() {
                             )}
                           </div>
 
-                          {/* ── ACTION BUTTONS ─────────────────────────────
-                              Save button replaced with Print & Save — clicking
-                              saves discount to DB and immediately prints the
-                              updated receipt. Cancel discards without saving. */}
                           <div className="flex gap-2">
                             <button onClick={closeModify}
                               className="flex-1 bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium">
