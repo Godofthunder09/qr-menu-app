@@ -337,34 +337,36 @@ export default function Dashboard() {
   }
 
   // ── handlePrintAndSave — FIXED write-back verification ───────────────
-  // ROOT CAUSE of "Veg Spring Roll × 5" still showing after reducing to
-  // 3: the previous version wrote item-quantity changes to `order_items`
-  // and, separately and UNCONDITIONALLY, wrote the computed subtotal /
-  // final_amount to `orders` — regardless of whether the order_items
-  // write actually succeeded. Supabase does NOT throw an error when an
-  // UPDATE or DELETE matches 0 rows (e.g. because an RLS policy quietly
-  // filtered it out) — it just reports success with no rows affected.
-  // So a blocked write could silently no-op while the rest of the
-  // function carried on, printing/saving a receipt whose money (built
-  // from the client's itemQtyOverrides state) no longer matched what
-  // was actually sitting in the order_items table.
+  // ROOT CAUSE of "Classic LIIT × 4" still showing in DB reads (Reports /
+  // Today's Report) after reducing to 2 in the editor, while the money
+  // fields (subtotal/final_amount) were correct:
+  //
+  // The previous verification only checked that the UPDATE matched a row
+  // at all (`updatedRows.length === 0` as the sole failure condition). It
+  // never checked that the row it got back actually carried the NEW
+  // quantity. Supabase/PostgREST can return success with a matched row
+  // whose value didn't change the way you expect in edge cases (e.g. a
+  // stale closure value, a trigger normalizing/rejecting the value, a
+  // concurrent write racing it) — and none of those show up as a thrown
+  // error or an empty result set. So the function sailed past STEP 1,
+  // printed the receipt, and wrote the (correct) computed totals to
+  // `orders` in STEP 2 — leaving `order_items.quantity` permanently out
+  // of sync with `orders.subtotal` / `orders.final_amount`.
   //
   // FIX:
-  //   1. Every order_items write now uses `.select('id')` so we can see
-  //      exactly how many rows were actually affected.
-  //   2. We NEVER delete a row to remove it — we UPDATE its quantity to
-  //      0 instead. Deletes are more likely to be blocked by an RLS
-  //      policy that was only set up for UPDATE/SELECT, and (per point
-  //      1) a blocked delete is otherwise undetectable. Downstream
-  //      display code (Dashboard's own snapshot builder, TodayReport,
-  //      Reports) now treats quantity <= 0 as "not shown" instead of
-  //      relying on the row being physically gone.
-  //   3. If ANY item write fails to affect a row, we STOP — no receipt
-  //      is printed, no order is marked paid, and the admin sees exactly
-  //      which item(s) failed to update. This guarantees money and item
-  //      details can never again drift apart from a partially-failed
-  //      save: either the whole bill saves consistently, or none of it
-  //      does.
+  //   1. Every order_items write now checks the RETURNED quantity value,
+  //      not just row presence — `updatedRows[0].quantity !== newQty` is
+  //      now itself a failure condition.
+  //   2. As a second, independent safety net, we re-SELECT every touched
+  //      row after the update loop completes and confirm the persisted
+  //      quantity matches what we intended, before allowing anything to
+  //      print or save. This guards against any write that reports
+  //      "success" with the right shape but wrong value, or gets quietly
+  //      reverted between the UPDATE and here.
+  //   3. If ANY item fails either check, we STOP — no receipt is printed,
+  //      no order is marked paid — exactly as before, just with a
+  //      verification step that can no longer be fooled by a partially
+  //      "successful-looking" write.
   const handlePrintAndSave = async () => {
     const dv = parseFloat(discountValue) || 0
     if (dv > 0 && !discountReason.trim()) { setDiscountReasonError(true); return }
@@ -388,6 +390,8 @@ export default function Dashboard() {
     // totals don't match its item rows.
     if (Object.keys(itemQtyOverrides).length > 0) {
       const failedItems = []
+      const writtenRowIds = []
+
       for (const row of snapshot.items) {
         const key = `row:${row.rowId}`
         if (!itemQtyOverrides.hasOwnProperty(key)) continue
@@ -400,10 +404,20 @@ export default function Dashboard() {
           .from('order_items')
           .update({ quantity: newQty })
           .eq('id', row.rowId)
-          .select('id')
+          .select('id, quantity')
 
-        if (error || !updatedRows || updatedRows.length === 0) {
+        // FIX: check the VALUE that came back, not just that a row
+        // was matched. A matched row with the wrong quantity is just
+        // as much a failure as no row at all.
+        if (
+          error ||
+          !updatedRows ||
+          updatedRows.length === 0 ||
+          updatedRows[0].quantity !== newQty
+        ) {
           failedItems.push(row.food_items?.name || 'Unknown item')
+        } else {
+          writtenRowIds.push({ id: row.rowId, expectedQty: newQty })
         }
       }
 
@@ -415,6 +429,49 @@ export default function Dashboard() {
           `in sync. Please try again, or check with support if this repeats.`
         )
         return
+      }
+
+      // ── STEP 1b: Independent read-back verification ──────────────────
+      // Second safety net: re-fetch every row we just wrote and confirm
+      // what's actually persisted in the DB matches what we intended.
+      // This catches any write that reported "success" with the right
+      // shape but the wrong value, or got reverted between the UPDATE
+      // and now (e.g. by a concurrent process).
+      if (writtenRowIds.length > 0) {
+        const { data: verifyRows, error: verifyError } = await supabase
+          .from('order_items')
+          .select('id, quantity')
+          .in('id', writtenRowIds.map(r => r.id))
+
+        if (verifyError) {
+          setSaving(false)
+          alert(
+            `⚠️ Could not verify saved quantities (${verifyError.message}).\n\n` +
+            `Nothing was printed or saved. Please try again.`
+          )
+          return
+        }
+
+        const verifyMap = {}
+        ;(verifyRows || []).forEach(r => { verifyMap[r.id] = r.quantity })
+
+        const mismatches = writtenRowIds.filter(
+          r => verifyMap[r.id] !== r.expectedQty
+        )
+
+        if (mismatches.length > 0) {
+          setSaving(false)
+          const names = mismatches.map(m => {
+            const match = snapshot.items.find(i => i.rowId === m.id)
+            return match?.food_items?.name || 'Unknown item'
+          })
+          alert(
+            `⚠️ Quantity did not save correctly for: ${names.join(', ')}.\n\n` +
+            `Nothing was printed or saved, so your totals and item list stay ` +
+            `in sync. Please try again, or check with support if this repeats.`
+          )
+          return
+        }
       }
     }
 
@@ -716,7 +773,7 @@ export default function Dashboard() {
             </button>
           )}
           <button onClick={() => navigate('/admin/today-report')} className="bg-green-100 text-green-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-green-200">📋 Today's Report</button>
-          <button onClick={() => navigate('/admin/reports')} className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">📊 Reports</button>
+          <button onClick={() => navigate('/admin/reports')} className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">📊 Reports of Yash </button>
           <button onClick={() => navigate('/admin/menu')} className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Menu</button>
           <button onClick={() => navigate('/admin/tables')} className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Tables</button>
           <button onClick={() => navigate('/admin/settings')} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-gray-200">⚙️ Settings</button>
