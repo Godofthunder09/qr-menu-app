@@ -388,6 +388,26 @@ export default function Dashboard() {
     // This must succeed BEFORE we print anything or touch `orders`, so
     // that a partial failure never results in a printed/saved bill whose
     // totals don't match its item rows.
+    //
+    // DIAGNOSTIC UPGRADE: every failure is now classified into ONE of
+    // exactly 3 plain-language reasons, and that reason is shown right
+    // inside the popup — no browser console needed:
+    //
+    //   Reason A — "Database rejected the change"
+    //     Supabase itself returned an error (network drop, permissions,
+    //     server-side rule). The `error.message` is included verbatim.
+    //
+    //   Reason B — "This item's record could not be found"
+    //     The UPDATE ran but matched ZERO rows — the row id this screen
+    //     was holding no longer exists in the database. Usually means
+    //     this bill was already modified/printed elsewhere (a second
+    //     browser tab, or the table was cleared) while this screen was
+    //     still open with old data.
+    //
+    //   Reason C — "Change was sent but did not save correctly"
+    //     The UPDATE matched the row, but when we immediately re-checked
+    //     it, the value wasn't what we asked for. Something else wrote
+    //     to this row at nearly the same time.
     if (Object.keys(itemQtyOverrides).length > 0) {
       const failedItems = []
       const writtenRowIds = []
@@ -406,27 +426,39 @@ export default function Dashboard() {
           .eq('id', row.rowId)
           .select('id, quantity')
 
-        // FIX: check the VALUE that came back, not just that a row
-        // was matched. A matched row with the wrong quantity is just
-        // as much a failure as no row at all.
-        if (
-          error ||
-          !updatedRows ||
-          updatedRows.length === 0 ||
-          updatedRows[0].quantity !== newQty
-        ) {
-          failedItems.push(row.food_items?.name || 'Unknown item')
+        const itemName = row.food_items?.name || 'Unknown item'
+
+        if (error) {
+          // Reason A
+          failedItems.push({
+            name: itemName,
+            reason: `Database rejected the change (${error.message || 'unknown error'})`,
+          })
+        } else if (!updatedRows || updatedRows.length === 0) {
+          // Reason B
+          failedItems.push({
+            name: itemName,
+            reason: `This item's record could not be found — it may have been changed in another tab/session. Please refresh and try again.`,
+          })
+        } else if (updatedRows[0].quantity !== newQty) {
+          // Reason C
+          failedItems.push({
+            name: itemName,
+            reason: `Change was sent but did not save correctly (tried to set ${newQty}, database still shows ${updatedRows[0].quantity}). Something else may be editing this bill at the same time.`,
+          })
         } else {
-          writtenRowIds.push({ id: row.rowId, expectedQty: newQty })
+          writtenRowIds.push({ id: row.rowId, expectedQty: newQty, name: itemName })
         }
       }
 
       if (failedItems.length > 0) {
         setSaving(false)
+        const detail = failedItems
+          .map(f => `• ${f.name}\n   → ${f.reason}`)
+          .join('\n\n')
         alert(
-          `⚠️ Could not update quantity for: ${failedItems.join(', ')}.\n\n` +
-          `Nothing was printed or saved, so your totals and item list stay ` +
-          `in sync. Please try again, or check with support if this repeats.`
+          `⚠️ Could not save the following item(s):\n\n${detail}\n\n` +
+          `Nothing was printed or saved, so your totals and item list stay in sync.`
         )
         return
       }
@@ -436,7 +468,9 @@ export default function Dashboard() {
       // what's actually persisted in the DB matches what we intended.
       // This catches any write that reported "success" with the right
       // shape but the wrong value, or got reverted between the UPDATE
-      // and now (e.g. by a concurrent process).
+      // and now (e.g. by a concurrent process). This is a 4th check —
+      // "looked fine a moment ago, but isn't anymore" — reported with
+      // its own plain-language reason (Reason D).
       if (writtenRowIds.length > 0) {
         const { data: verifyRows, error: verifyError } = await supabase
           .from('order_items')
@@ -446,7 +480,8 @@ export default function Dashboard() {
         if (verifyError) {
           setSaving(false)
           alert(
-            `⚠️ Could not verify saved quantities (${verifyError.message}).\n\n` +
+            `⚠️ Could not double-check the saved quantities.\n\n` +
+            `Reason: ${verifyError.message}\n\n` +
             `Nothing was printed or saved. Please try again.`
           )
           return
@@ -461,14 +496,12 @@ export default function Dashboard() {
 
         if (mismatches.length > 0) {
           setSaving(false)
-          const names = mismatches.map(m => {
-            const match = snapshot.items.find(i => i.rowId === m.id)
-            return match?.food_items?.name || 'Unknown item'
-          })
+          const detail = mismatches
+            .map(m => `• ${m.name}\n   → Saved as ${verifyMap[m.id]}, but expected ${m.expectedQty}. Likely another tab/session changed this bill at the same moment.`)
+            .join('\n\n')
           alert(
-            `⚠️ Quantity did not save correctly for: ${names.join(', ')}.\n\n` +
-            `Nothing was printed or saved, so your totals and item list stay ` +
-            `in sync. Please try again, or check with support if this repeats.`
+            `⚠️ Double-check found a mismatch for:\n\n${detail}\n\n` +
+            `Nothing was printed or saved, so your totals and item list stay in sync.`
           )
           return
         }
@@ -773,7 +806,7 @@ export default function Dashboard() {
             </button>
           )}
           <button onClick={() => navigate('/admin/today-report')} className="bg-green-100 text-green-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-green-200">📋 Today's Report</button>
-          <button onClick={() => navigate('/admin/reports')} className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">📊 Reports of Yash </button>
+          <button onClick={() => navigate('/admin/reports')} className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">📊 Reports</button>
           <button onClick={() => navigate('/admin/menu')} className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Menu</button>
           <button onClick={() => navigate('/admin/tables')} className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Tables</button>
           <button onClick={() => navigate('/admin/settings')} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-gray-200">⚙️ Settings</button>
