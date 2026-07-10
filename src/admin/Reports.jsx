@@ -35,6 +35,38 @@ const downloadCSV = (rows, filename) => {
   a.download = filename; document.body.appendChild(a); a.click(); document.body.removeChild(a)
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// ROOT CAUSE OF THE "quantity shows 3 after being reduced to 1" BUG
+// (Table 3 / Mineral Water case):
+//
+// Every bill-grouping routine in this file used to build a dedup key as:
+//
+//    const key = `${table_name_snapshot}__${paid_at.substring(0, 16)}`
+//
+// i.e. table name + the MINUTE the order was paid (truncated to the
+// minute, seconds/millis dropped). This is not a safe unique key for a
+// single bill — it just means "any orders row for this table paid in
+// this same clock-minute." When that happened, the code did:
+//
+//    map[key].order_items = [...map[key].order_items, ...(o.order_items || [])]
+//
+// which CONCATENATES item arrays rather than replacing them. So if the
+// same table had two distinct `orders` DB rows land in the same minute
+// bucket — e.g. an original round and a subsequent print/edit — their
+// item lists got appended together instead of only the latest/correct
+// one being shown. The money fields (`final_amount`, `subtotal` etc.)
+// were taken only from the FIRST row encountered (`if (!map[key])`), so
+// totals looked right/self-consistent while the item list silently
+// showed stale, larger quantities — exactly matching the customer's
+// bug report (₹30 total, but "Mineral Water × 3" still displayed).
+//
+// FIX: key strictly by table + the EXACT `paid_at` timestamp (full ISO
+// string, not truncated), which only coincides across rows when
+// Dashboard's handlePrintAndSave() genuinely stamped multiple orders
+// with the identical `nowIST` value in one save (a true multi-round
+// single bill) — never an unrelated coincidence.
+// ─────────────────────────────────────────────────────────────────────
+
 const LIQUOR_KEYWORDS = [
   'beer','wine','whisky','whiskey','vodka','rum','gin','tequila','brandy',
   'champagne','scotch','bourbon','ale','lager','cider','sake','mead','port',
@@ -110,37 +142,84 @@ const TABS = [
   { id: 'settlement', label: '💰 Settlement' },
 ]
 
+// ── FIXED: group orders into per-order "bills" for table view, keyed by
+// exact order.id — each orders row is its own bill (Dashboard already
+// finalizes final_amount/order_items per row correctly). Rows that share
+// an identical paid_at (genuine same-print multi-round bill) are still
+// merged, exactly like the other grouping functions below.
 const buildTableGroups = (orders) => {
   const map = {}
   orders.forEach(o => {
-    const key = o.table_name_snapshot || 'Unknown'
-    if (!map[key]) map[key] = { name: key, orders: [] }
-    map[key].orders.push(o)
+    const key = `${o.table_name_snapshot || 'Unknown'}__${o.paid_at || o.id}`
+    if (!map[key]) {
+      map[key] = {
+        name: o.table_name_snapshot || 'Unknown',
+        activatedAt: o.created_at,
+        paidAt: o.paid_at,
+        _orders: [o],
+      }
+    } else {
+      map[key]._orders.push(o)
+      if (new Date(o.created_at) < new Date(map[key].activatedAt)) map[key].activatedAt = o.created_at
+      if (new Date(o.paid_at) > new Date(map[key].paidAt)) map[key].paidAt = o.paid_at
+    }
   })
-  return Object.values(map).map(tbl => {
-    const sorted = [...tbl.orders].sort((a, b) => new Date(a.paid_at) - new Date(b.paid_at))
-    const activatedAt = tbl.orders.reduce((min, o) =>
-      !min || new Date(o.created_at) < new Date(min) ? o.created_at : min, null)
-    const paidAt = tbl.orders.reduce((max, o) =>
-      !max || new Date(o.paid_at) > new Date(max) ? o.paid_at : max, null)
+
+  // Now group those merged-bill-buckets back up by table name, so the
+  // per-table card can list multiple distinct bills (rounds settled at
+  // genuinely different times).
+  const byTable = {}
+  Object.values(map).forEach(bucket => {
+    const tName = bucket.name
+    if (!byTable[tName]) byTable[tName] = { name: tName, buckets: [] }
+    byTable[tName].buckets.push(bucket)
+  })
+
+  return Object.values(byTable).map(tbl => {
+    const sortedBuckets = [...tbl.buckets].sort((a, b) => new Date(a.paidAt) - new Date(b.paidAt))
+    const activatedAt = tbl.buckets.reduce((min, b) =>
+      !min || new Date(b.activatedAt) < new Date(min) ? b.activatedAt : min, null)
+    const paidAt = tbl.buckets.reduce((max, b) =>
+      !max || new Date(b.paidAt) > new Date(max) ? b.paidAt : max, null)
     const duration = diffMinutes(activatedAt, paidAt)
-    const bills = sorted.map((o, idx) => ({
-      billSerial: idx + 1, billId: o.id,
-      payment_type: o.payment_type,
-      split_payment: o.split_payment || null,
-      paid_at: o.paid_at, created_at: o.created_at,
-      subtotal: o.subtotal || 0,
-      service_charge_pct: o.service_charge_pct || 0,
-      service_charge_amt: o.service_charge_amt || 0,
-      discount_amt: o.discount_amt || 0, discount_type: o.discount_type,
-      discount_value: o.discount_value || 0, discount_reason: o.discount_reason || '',
-      final_amount: o.final_amount || 0,
-      items: (o.order_items || []).map(i => ({
-        name: i.food_items?.name || 'Unknown', qty: i.quantity,
-        rate: i.price_at_order, amount: i.price_at_order * i.quantity,
-        dept: getDept(i.food_items?.name),
-      })),
-    }))
+
+    const bills = sortedBuckets.map((bucket, idx) => {
+      // Sum money fields across the (usually single) orders in this bucket.
+      const subtotal = bucket._orders.reduce((s, o) => s + (o.subtotal || 0), 0)
+      const service_charge_amt = bucket._orders.reduce((s, o) => s + (o.service_charge_amt || 0), 0)
+      const discount_amt = bucket._orders.reduce((s, o) => s + (o.discount_amt || 0), 0)
+      const final_amount = bucket._orders.reduce((s, o) => s + (o.final_amount || 0), 0)
+      const first = bucket._orders[0]
+      // Items: concatenate ONLY across orders that share this exact
+      // paid_at bucket — which, per the key above, can only be genuine
+      // same-bill rounds, never an unrelated order.
+      // FIX: exclude items already reduced to quantity 0. Dashboard now
+      // sets quantity to 0 instead of deleting a fully-removed item (a
+      // blocked DELETE from RLS was the original root cause of stale
+      // quantities appearing here) — so 0-qty rows must be filtered out
+      // wherever item lists are built from raw order_items.
+      const items = bucket._orders.flatMap(o => (o.order_items || [])
+        .filter(i => (i.quantity || 0) > 0)
+        .map(i => ({
+          name: i.food_items?.name || 'Unknown', qty: i.quantity,
+          rate: i.price_at_order, amount: i.price_at_order * i.quantity,
+          dept: getDept(i.food_items?.name),
+        })))
+      return {
+        billSerial: idx + 1, billId: first.id,
+        payment_type: first.payment_type,
+        split_payment: first.split_payment || null,
+        paid_at: bucket.paidAt, created_at: bucket.activatedAt,
+        subtotal,
+        service_charge_pct: first.service_charge_pct || 0,
+        service_charge_amt,
+        discount_amt, discount_type: first.discount_type,
+        discount_value: first.discount_value || 0, discount_reason: first.discount_reason || '',
+        final_amount,
+        items,
+      }
+    })
+
     return {
       name: tbl.name, activatedAt, paidAt, duration, bills,
       tableRevenue:  bills.reduce((s, b) => s + b.final_amount, 0),
@@ -198,7 +277,7 @@ export default function Reports() {
   const [settlSort, setSettlSort] = useState('time')
   const [showSettlPrint, setShowSettlPrint] = useState(false)
 
-  // ── fetchToday — split-aware ───────────────────────────
+  // ── fetchToday — split-aware, FIXED grouping (exact paid_at) ────────
   const fetchToday = async () => {
     setTodayLoading(true)
     const { startISO, endISO } = toRange(todayIST(), todayIST())
@@ -212,11 +291,20 @@ export default function Reports() {
 
     const map = {}
     orders?.forEach(o => {
-      const key = `${o.table_name_snapshot}__${o.paid_at?.substring(0, 16)}`
+      // FIX: exact paid_at instead of minute-truncated paid_at.
+      const key = `${o.table_name_snapshot}__${o.paid_at}`
+      // FIX: drop items already reduced to quantity 0 (Dashboard now
+      // zeroes-out instead of deleting removed items — see note above).
+      const liveItems = (o.order_items || []).filter(i => (i.quantity || 0) > 0)
       if (!map[key]) {
-        map[key] = { ...o, order_items: [...(o.order_items || [])], open_items: [...(o.open_items_json || [])] }
+        map[key] = { ...o, order_items: [...liveItems], open_items: [...(o.open_items_json || [])] }
       } else {
-        map[key].order_items = [...map[key].order_items, ...(o.order_items || [])]
+        // Merge items and sum money fields for genuinely same-timestamp bills
+        map[key].order_items = [...map[key].order_items, ...liveItems]
+        map[key].final_amount = (map[key].final_amount || 0) + (o.final_amount || 0)
+        map[key].subtotal = (map[key].subtotal || 0) + (o.subtotal || 0)
+        map[key].service_charge_amt = (map[key].service_charge_amt || 0) + (o.service_charge_amt || 0)
+        map[key].discount_amt = (map[key].discount_amt || 0) + (o.discount_amt || 0)
       }
     })
     const grouped = Object.values(map)
@@ -270,6 +358,7 @@ export default function Reports() {
 
   useEffect(() => { fetchToday() }, [])
 
+  // ── fetchRangePeriod — FIXED grouping (exact paid_at) ────────────────
   const fetchRangePeriod = async (from, to) => {
     const { startISO, endISO } = toRange(from, to)
     const { data: orders } = await supabase
@@ -280,9 +369,15 @@ export default function Reports() {
       .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO)
     const map = {}
     orders?.forEach(o => {
-      const key = `${o.table_name_snapshot}__${o.paid_at?.substring(0, 16)}`
-      if (!map[key]) map[key] = { ...o, order_items: [...(o.order_items || [])] }
-      else map[key].order_items = [...map[key].order_items, ...(o.order_items || [])]
+      const key = `${o.table_name_snapshot}__${o.paid_at}`
+      // FIX: drop items already reduced to quantity 0.
+      const liveItems = (o.order_items || []).filter(i => (i.quantity || 0) > 0)
+      if (!map[key]) {
+        map[key] = { ...o, order_items: [...liveItems] }
+      } else {
+        map[key].order_items = [...map[key].order_items, ...liveItems]
+        map[key].final_amount = (map[key].final_amount || 0) + (o.final_amount || 0)
+      }
     })
     const bills = Object.values(map)
     const totalRevenue = bills.reduce((s, b) => s + (b.final_amount || 0), 0)
@@ -331,6 +426,9 @@ export default function Reports() {
     const catMap = {}; cats?.forEach(c => { catMap[c.id] = c.name })
     const catRevMap = {}; let foodTotal = 0, liquorTotal = 0
     items?.forEach(i => {
+      // FIX: skip items already reduced to quantity 0 — otherwise a
+      // canceled item still counts toward category revenue/top-sellers.
+      if ((i.quantity || 0) <= 0) return
       const name = i.food_items?.name || 'Unknown'; const catId = i.food_items?.category_id
       const catName = catId ? (catMap[catId] || 'Uncategorized') : 'Uncategorized'; const rev = i.price_at_order * i.quantity
       if (!catRevMap[catName]) catRevMap[catName] = { name: catName, qty: 0, revenue: 0, items: {} }
@@ -338,12 +436,13 @@ export default function Reports() {
       catRevMap[catName].items[name] = (catRevMap[catName].items[name] || 0) + i.quantity
       if (isLiquor(name)) liquorTotal += rev; else foodTotal += rev
     })
-    const soldNames = new Set(items?.map(i => i.food_items?.name) || [])
+    const soldNames = new Set(items?.filter(i => (i.quantity || 0) > 0).map(i => i.food_items?.name) || [])
     const zeroItems = allFoodItems?.filter(fi => !soldNames.has(fi.name) && fi.is_available) || []
     const catStats = Object.values(catRevMap).map(c => ({ ...c, topItem: Object.entries(c.items).sort((a, b) => b[1] - a[1])[0] })).sort((a, b) => b.revenue - a.revenue)
     setCatData({ catStats, foodTotal, liquorTotal, zeroItems, totalRevenue: foodTotal + liquorTotal }); setCatLoading(false)
   }
 
+  // ── fetchTablewise — now uses the FIXED buildTableGroups ────────────
   const fetchTablewise = useCallback(async () => {
     setTblLoading(true)
     const { startISO, endISO } = toRange(tblFrom, tblTo)
@@ -365,6 +464,7 @@ export default function Reports() {
     discount: s.discount + t.tableDiscount, bills: s.bills + t.bills.length, tables: s.tables + 1,
   }), { revenue: 0, sc: 0, discount: 0, bills: 0, tables: 0 })
 
+  // ── fetchDiscounts — FIXED grouping (exact paid_at) ──────────────────
   const fetchDiscounts = async () => {
     setDiscLoading(true)
     const { startISO, endISO } = toRange(discFrom, discTo)
@@ -373,7 +473,15 @@ export default function Reports() {
       .eq('is_paid', true).gt('discount_amt', 0).gte('paid_at', startISO).lte('paid_at', endISO).order('paid_at', { ascending: false })
     if (!orders || orders.length === 0) { setDiscData(null); setDiscLoading(false); return }
     const map = {}
-    orders.forEach(o => { const key = `${o.table_name_snapshot}__${o.paid_at?.substring(0, 16)}`; if (!map[key]) map[key] = { ...o } })
+    orders.forEach(o => {
+      const key = `${o.table_name_snapshot}__${o.paid_at}`
+      if (!map[key]) map[key] = { ...o }
+      else {
+        map[key].final_amount = (map[key].final_amount || 0) + (o.final_amount || 0)
+        map[key].subtotal = (map[key].subtotal || 0) + (o.subtotal || 0)
+        map[key].discount_amt = (map[key].discount_amt || 0) + (o.discount_amt || 0)
+      }
+    })
     const bills = Object.values(map)
     const totalDiscount = bills.reduce((s, b) => s + (b.discount_amt || 0), 0)
     const grossRevenue = bills.reduce((s, b) => s + (b.subtotal || 0), 0)
@@ -390,7 +498,7 @@ export default function Reports() {
     setDiscLoading(false)
   }
 
-  // ── FIXED fetchSettlement — split-aware ───────────────
+  // ── fetchSettlement — split-aware, FIXED grouping (exact paid_at) ────
   const fetchSettlement = async () => {
     setSettlLoading(true)
     const { startISO, endISO } = toRange(settlFrom, settlTo)
@@ -399,11 +507,29 @@ export default function Reports() {
       .eq('is_paid', true).gte('paid_at', startISO).lte('paid_at', endISO).order('paid_at', { ascending: false })
     if (!orders || orders.length === 0) { setSettlData(null); setSettlLoading(false); return }
 
-    // Deduplicate bills by table+minute
+    // Deduplicate bills by table + EXACT paid_at (fixes the minute-bucket
+    // bug that could merge unrelated orders together).
     const map = {}
     orders.forEach(o => {
-      const key = `${o.table_name_snapshot}__${o.paid_at?.substring(0, 16)}`
-      if (!map[key]) map[key] = { ...o }
+      const key = `${o.table_name_snapshot}__${o.paid_at}`
+      if (!map[key]) {
+        map[key] = { ...o }
+      } else {
+        map[key].final_amount = (map[key].final_amount || 0) + (o.final_amount || 0)
+        map[key].subtotal = (map[key].subtotal || 0) + (o.subtotal || 0)
+        map[key].service_charge_amt = (map[key].service_charge_amt || 0) + (o.service_charge_amt || 0)
+        map[key].discount_amt = (map[key].discount_amt || 0) + (o.discount_amt || 0)
+        // Split payments: sum matching keys across merged rows.
+        if (o.split_payment) {
+          map[key].split_payment = map[key].split_payment
+            ? {
+                cash: (map[key].split_payment.cash || 0) + (o.split_payment.cash || 0),
+                upi:  (map[key].split_payment.upi  || 0) + (o.split_payment.upi  || 0),
+                card: (map[key].split_payment.card || 0) + (o.split_payment.card || 0),
+              }
+            : { ...o.split_payment }
+        }
+      }
     })
     const bills = Object.values(map)
 
