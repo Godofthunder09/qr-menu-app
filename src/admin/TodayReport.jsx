@@ -15,31 +15,41 @@ const formatDate = (d) => new Date(d).toLocaleDateString('en-IN', {
 // to 1" bug):
 //
 // The OLD grouping key was `${table_name_snapshot}__${paid_at.substr(0,16)}`
-// i.e. table name + the MINUTE the order was paid (truncated to the
-// minute, seconds/millis dropped). This is NOT a unique key. Any two
-// distinct `orders` rows for the same table that happen to get paid in
-// the same clock-minute (e.g. two rounds billed back-to-back, or a
-// retry) get silently merged into ONE display "bill", and their
-// order_items arrays get CONCATENATED with `[...a, ...b]`.
+// i.e. table name + the MINUTE the bill was paid. This is NOT a unique
+// key. Any two distinct `orders` rows for the same table that happen to
+// get paid in the same clock-minute (e.g. two rounds billed back-to-back,
+// or a retry) get silently merged into ONE display "bill", and their
+// order_items arrays get concatenated with `[...a, ...b]`.
 //
 // Concatenating item arrays is the bug: it doesn't replace/dedupe by
 // food_item — it just appends. So if Round 1 had "Mineral Water x3" as
 // one order_items row and Round 2 (billed in the same minute, after you
 // reduced quantity down in the editor) had "Mineral Water x1" as a
 // SEPARATE order_items row belonging to a SEPARATE order, the grouped
-// bill showed BOTH rows: "Mineral Water x3" AND "Mineral Water x1" —
-// while `final_amount` on the row that matters was computed fresh and
-// correctly at print time, so the ₹ total looked right (₹30) but the
-// item list still showed x3.
+// bill shows BOTH rows: "Mineral Water x3" AND "Mineral Water x1" (or,
+// depending on fetch order, only the stale x3 renders first and looks
+// like nothing changed) — while `final_amount` on the row that matters
+// was computed fresh and correctly at print time, so the ₹ total looks
+// right (₹30) but the item list still shows x3.
 //
 // THE FIX: never merge order_items across DIFFERENT order ids for
-// display unless they share the EXACT SAME `paid_at` timestamp (full
-// ISO string, not truncated to the minute). An identical-to-the-
-// millisecond `paid_at` can only happen when Dashboard's
-// `handlePrintAndSave` stamped the SAME `nowIST` value across every
-// order in `snapshot.orderIds` in a single write-back loop — i.e. they
-// are genuinely part of the same bill. Different bills (different
-// print actions) will never share the exact same timestamp.
+// display. Each `orders` row is billed independently by Dashboard
+// (Dashboard writes exact `order_items.quantity` per row via `rowId`,
+// and `orders.final_amount` is computed from THAT exact edited item
+// set). So each `orders` row IS already a complete, correct, standalone
+// bill. We must display it as ONE bill per `orders.id` — we must NOT
+// re-group multiple `orders.id`s together at all for item display.
+//
+// The old grouping existed to handle a legit case: sometimes multiple
+// `orders` rows (rounds) get billed together as one printed receipt
+// with a shared `paid_at`. We preserve that capability, but do it
+// SAFELY: only merge rows whose `paid_at` timestamps are IDENTICAL
+// (exact same ISO string, not just same minute) AND whose table matches.
+// An identical-to-the-millisecond `paid_at` can only happen when
+// Dashboard's `handlePrintAndSave` stamped the SAME `nowIST` value
+// across every order in `snapshot.orderIds` in a single write-back loop
+// — i.e. they are genuinely part of the same bill. Different bills
+// (different print actions) will never share the exact same timestamp.
 // ─────────────────────────────────────────────────────────────────────
 const groupOrdersIntoBills = (orders) => {
   const map = {}
@@ -62,12 +72,21 @@ const groupOrdersIntoBills = (orders) => {
         discount_amt: order.discount_amt || 0,
         discount_reason: order.discount_reason || '',
         final_amount: order.final_amount || 0,
-        order_items: [...(order.order_items || [])],
+        // FIX: filter out items already reduced to quantity 0. Dashboard
+        // no longer deletes rows when an item is fully removed — it sets
+        // quantity to 0 instead (deletes are more likely to be silently
+        // blocked by RLS, which produced the original "stale item still
+        // shows" bug). A quantity-0 row is "removed" and must never
+        // render as a line item here.
+        order_items: [...(order.order_items || [])].filter(i => (i.quantity || 0) > 0),
         open_items: [...(order.open_items_json || [])],
       }
     } else {
       map[key]._orderIds.push(order.id)
-      map[key].order_items = [...map[key].order_items, ...(order.order_items || [])]
+      map[key].order_items = [
+        ...map[key].order_items,
+        ...(order.order_items || []).filter(i => (i.quantity || 0) > 0)
+      ]
       // If genuinely-merged (same exact paid_at), sum the money fields
       // too, since each underlying orders row only carries its own
       // slice of subtotal/final_amount.
@@ -88,6 +107,9 @@ const groupOrdersIntoBills = (orders) => {
 const mergeOrderItemsForDisplay = (orderItems = []) => {
   const map = {}
   orderItems.forEach((item, idx) => {
+    // Defense in depth: never render an item whose live quantity is 0,
+    // regardless of where orderItems came from.
+    if ((item.quantity || 0) <= 0) return
     const groupKey = item.food_item_id || item.food_items?.name || `idx-${idx}`
     if (!map[groupKey]) {
       map[groupKey] = {
@@ -192,6 +214,12 @@ export default function TodayReport() {
     const endISO   = new Date(today + 'T23:59:59+05:30').toISOString()
     const { data, error } = await supabase
       .from('orders')
+      // NOTE: order_items(id, ...) with an explicit .order() on the
+      // embedded relation is not directly supported by PostgREST here,
+      // but since we now key bills by exact order id / exact paid_at
+      // (never a minute-bucket), ordering instability no longer causes
+      // cross-bill contamination — each fetched order_items array
+      // belongs unambiguously to its own `orders.id`.
       .select(`id, payment_type, split_payment, is_paid, paid_at, settlement_status,
         subtotal, service_charge_pct, service_charge_amt,
         discount_type, discount_value, discount_amt, discount_reason,
@@ -264,7 +292,7 @@ export default function TodayReport() {
   const printModifiedBill = useCallback((bill, totals, discReason) => {
     if (!bill || !totals) return
 
-    const allItems = bill.order_items || []
+    const allItems = (bill.order_items || []).filter(i => (i.quantity || 0) > 0)
     const openItems = bill.open_items || []
 
     const mergeForReceipt = (items) => {
@@ -641,7 +669,7 @@ export default function TodayReport() {
               <button onClick={() => setShowCloseDay(false)} className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
               <button onClick={closeDay} disabled={closingDay || pendingBills.length > 0}
                 className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold disabled:opacity-50">
-                {closingDay ? '⏳ Closing...' : '🌙 Close Day for yash'}
+                {closingDay ? '⏳ Closing...' : '🌙 Close Day'}
               </button>
             </div>
           </div>
