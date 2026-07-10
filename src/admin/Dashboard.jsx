@@ -80,6 +80,7 @@ export default function Dashboard() {
   const [showClearAllConfirm, setShowClearAllConfirm] = useState(false)
   const [soundReady, setSoundReady] = useState(false)
   const [sessionStart] = useState(() => new Date().toISOString())
+  const [saving, setSaving] = useState(false)
 
   const [restaurant, setRestaurant] = useState({
     name: 'My Restaurant', address: '', phone: '',
@@ -99,24 +100,6 @@ export default function Dashboard() {
   const [menuSearch, setMenuSearch] = useState('')
 
   // ── itemQtyOverrides — keyed by the REAL order_items row id ─────────
-  // Map of `row:<order_items.id>` → effective qty to bill.
-  // If key not in map → use original quantity.
-  // If value is 0 → item completely removed from bill.
-  //
-  // WHY NOT array index ("orderId:idx"): Supabase/PostgREST gives no
-  // ordering guarantee for a nested `order_items(...)` select unless you
-  // add an explicit `.order()`. Dashboard polls `fetchAll()` every 4s and
-  // also on every realtime INSERT/DELETE on `orders`. If a poll lands
-  // between the moment you click "−" on an item and the moment you click
-  // "Print & Save Bill", the freshly fetched `orders` array can hand back
-  // `order_items` in a different position. An index-based key silently
-  // stops matching, the write-back loop's `continue` fires for every row,
-  // and ZERO order_items rows get updated — while `orders.final_amount`
-  // still gets written (since that part never depended on index matching).
-  // That mismatch is exactly what produced ₹980 (orders row) sitting next
-  // to "Veg Kolhapuri × 2 = ₹630" (untouched order_items row) on every
-  // downstream screen. Keying by real row id makes the override immune to
-  // re-fetches, re-ordering, or polling entirely.
   const [itemQtyOverrides, setItemQtyOverrides] = useState({})
 
   const [manualItems, setManualItems] = useState([])
@@ -127,14 +110,6 @@ export default function Dashboard() {
   const [openQty, setOpenQty] = useState(1)
 
   // ── Frozen billing snapshot ──────────────────────────────────────────
-  // The moment you select a table OR open the bill preview, we snapshot
-  // that table's current order_items (with their real row ids) into this
-  // ref. All editing, total computation, and the final write-back read
-  // from THIS snapshot — never from the live `orders` state directly.
-  // This means a background poll tick can refresh `orders` for other
-  // tables / the sidebar counts without ever touching the data you're
-  // actively billing. The snapshot is only replaced when you select a
-  // table fresh or after a successful save.
   const billingSnapshotRef = useRef({ tableId: null, items: [] })
 
   const prevOrderIds = useRef(new Set())
@@ -183,19 +158,11 @@ export default function Dashboard() {
     } catch (e) {}
   }, [])
 
-  // ── fetchAll — now orders order_items explicitly by id ───────────────
-  // Adding `.order('id')` on the embedded order_items select doesn't
-  // remove the need for row-id keys (a poll mid-edit could still in
-  // theory race with a fresh insert), but it does make the array stable
-  // across repeated fetches when nothing changed, which is good hygiene.
-  // The real safety net is the frozen snapshot + row-id keys above.
   const fetchAll = useCallback(async () => {
     const { data: tablesData } = await supabase.from('tables').select('*').order('created_at')
     setTables(tablesData || [])
     const { data: ordersData } = await supabase
       .from('orders')
-      // NOTE: order_items(id, ...) — the row `id` is required so we can
-      // update/delete the exact row when committing quantity overrides.
       .select(`*, tables(table_name), order_items(id, food_item_id, quantity, price_at_order, note, food_items(name))`)
       .eq('is_paid', false).order('created_at', { ascending: false })
     if (ordersData) {
@@ -227,16 +194,18 @@ export default function Dashboard() {
   }, [fetchAll])
 
   // ── Build a frozen, row-id-keyed snapshot for a table ────────────────
-  // Flattens every order_items row across every order/round for this
-  // table into one list, each entry carrying its real DB id. This is
-  // computed once (on table select, or on opening the preview if it
-  // hasn't been built yet) and then frozen — later polls of `orders`
-  // do not mutate it.
+  // FIX: rows whose current DB quantity is already 0 are skipped. A row
+  // can legitimately sit at quantity 0 now (see handlePrintAndSave below
+  // — we update quantity to 0 instead of deleting, so a failed delete
+  // can never leave a "ghost" row with stale quantity behind). A 0-qty
+  // row is effectively already removed and shouldn't reappear in the
+  // item editor as if it still had stock to reduce.
   const buildSnapshot = (tableId) => {
     const tOrders = orders.filter(o => o.table_id === tableId)
     const rows = []
     tOrders.forEach(order => {
       ;(order.order_items || []).forEach(item => {
+        if ((item.quantity || 0) <= 0) return
         rows.push({
           rowId: item.id,
           orderId: order.id,
@@ -257,7 +226,6 @@ export default function Dashboard() {
     setManualItems([])
     setShowItemEditor(false); setShowOpenForm(false)
     setMenuSearch('')
-    // Freeze a fresh snapshot the moment a table is opened.
     billingSnapshotRef.current = buildSnapshot(table.id)
     if (window.innerWidth < 768) setSidebarOpen(false)
   }
@@ -270,11 +238,10 @@ export default function Dashboard() {
     _isManual: true
   }))
 
-  // ── getEffectiveItems — reads from the FROZEN snapshot, not `orders` ──
   const getEffectiveItems = useCallback((tableId) => {
     const snapshot = billingSnapshotRef.current.tableId === tableId
       ? billingSnapshotRef.current
-      : buildSnapshot(tableId) // fallback safety net; should rarely trigger
+      : buildSnapshot(tableId)
     const result = []
     snapshot.items.forEach(row => {
       const key = `row:${row.rowId}`
@@ -320,10 +287,6 @@ export default function Dashboard() {
   }, [getEffectiveItems, serviceChargePct, discountType, discountValue])
 
   const openPreview = (tableId) => {
-    // If, for any reason, there's no live snapshot for this table yet
-    // (e.g. preview opened in a way that bypassed selectTable), freeze
-    // one now — but otherwise NEVER rebuild it here, so we don't discard
-    // overrides already set against the existing snapshot.
     if (billingSnapshotRef.current.tableId !== tableId) {
       billingSnapshotRef.current = buildSnapshot(tableId)
     }
@@ -333,7 +296,6 @@ export default function Dashboard() {
     setShowPreview(true)
   }
 
-  // ── setItemQty — keyed by real row id, immune to re-fetch reordering ─
   const setItemQty = (rowId, originalQty, delta) => {
     const key = `row:${rowId}`
     setItemQtyOverrides(prev => {
@@ -374,6 +336,35 @@ export default function Dashboard() {
     setOpenName(''); setOpenPrice(''); setOpenQty(1); setShowOpenForm(false)
   }
 
+  // ── handlePrintAndSave — FIXED write-back verification ───────────────
+  // ROOT CAUSE of "Veg Spring Roll × 5" still showing after reducing to
+  // 3: the previous version wrote item-quantity changes to `order_items`
+  // and, separately and UNCONDITIONALLY, wrote the computed subtotal /
+  // final_amount to `orders` — regardless of whether the order_items
+  // write actually succeeded. Supabase does NOT throw an error when an
+  // UPDATE or DELETE matches 0 rows (e.g. because an RLS policy quietly
+  // filtered it out) — it just reports success with no rows affected.
+  // So a blocked write could silently no-op while the rest of the
+  // function carried on, printing/saving a receipt whose money (built
+  // from the client's itemQtyOverrides state) no longer matched what
+  // was actually sitting in the order_items table.
+  //
+  // FIX:
+  //   1. Every order_items write now uses `.select('id')` so we can see
+  //      exactly how many rows were actually affected.
+  //   2. We NEVER delete a row to remove it — we UPDATE its quantity to
+  //      0 instead. Deletes are more likely to be blocked by an RLS
+  //      policy that was only set up for UPDATE/SELECT, and (per point
+  //      1) a blocked delete is otherwise undetectable. Downstream
+  //      display code (Dashboard's own snapshot builder, TodayReport,
+  //      Reports) now treats quantity <= 0 as "not shown" instead of
+  //      relying on the row being physically gone.
+  //   3. If ANY item write fails to affect a row, we STOP — no receipt
+  //      is printed, no order is marked paid, and the admin sees exactly
+  //      which item(s) failed to update. This guarantees money and item
+  //      details can never again drift apart from a partially-failed
+  //      save: either the whole bill saves consistently, or none of it
+  //      does.
   const handlePrintAndSave = async () => {
     const dv = parseFloat(discountValue) || 0
     if (dv > 0 && !discountReason.trim()) { setDiscountReasonError(true); return }
@@ -385,6 +376,50 @@ export default function Dashboard() {
       subtotal, serviceChargeAmt, discountAmt, finalAmount
     } = computeTotals(payTableId)
 
+    const snapshot = billingSnapshotRef.current.tableId === payTableId
+      ? billingSnapshotRef.current
+      : buildSnapshot(payTableId)
+
+    setSaving(true)
+
+    // ── STEP 1: Persist itemQtyOverrides into real order_items rows ────
+    // This must succeed BEFORE we print anything or touch `orders`, so
+    // that a partial failure never results in a printed/saved bill whose
+    // totals don't match its item rows.
+    if (Object.keys(itemQtyOverrides).length > 0) {
+      const failedItems = []
+      for (const row of snapshot.items) {
+        const key = `row:${row.rowId}`
+        if (!itemQtyOverrides.hasOwnProperty(key)) continue
+        const newQty = itemQtyOverrides[key]
+        if (!row.rowId) continue
+
+        // Always UPDATE — never DELETE — so a blocked write can't leave
+        // an invisible "should have been removed" row with stale qty.
+        const { data: updatedRows, error } = await supabase
+          .from('order_items')
+          .update({ quantity: newQty })
+          .eq('id', row.rowId)
+          .select('id')
+
+        if (error || !updatedRows || updatedRows.length === 0) {
+          failedItems.push(row.food_items?.name || 'Unknown item')
+        }
+      }
+
+      if (failedItems.length > 0) {
+        setSaving(false)
+        alert(
+          `⚠️ Could not update quantity for: ${failedItems.join(', ')}.\n\n` +
+          `Nothing was printed or saved, so your totals and item list stay ` +
+          `in sync. Please try again, or check with support if this repeats.`
+        )
+        return
+      }
+    }
+
+    // ── STEP 2: Now that item quantities are confirmed persisted, build
+    // and print the receipt, and write the order totals. ───────────────
     const now = new Date()
     const lines = {
       restaurantName: restaurant.name, address: restaurant.address,
@@ -402,45 +437,7 @@ export default function Dashboard() {
     w.document.write(buildHtmlReceipt(lines))
     w.document.close(); w.focus(); w.print(); w.close()
 
-    // ── Use the FROZEN snapshot for write-back, never live `orders` ────
-    // This guarantees the rowIds we update/delete are exactly the rows
-    // the override keys were built against — no index, no re-fetch race.
-    const snapshot = billingSnapshotRef.current.tableId === payTableId
-      ? billingSnapshotRef.current
-      : buildSnapshot(payTableId)
     const nowIST = now.toISOString()
-
-    // ── CRITICAL: Persist itemQtyOverrides into real order_items rows ──
-    // This is what keeps Dashboard, TodayReport, and Reports in sync.
-    // Every override is applied by the row's real DB id, taken from the
-    // frozen snapshot — so it is correct regardless of how many times
-    // `orders` has been re-fetched/reordered since the snapshot was taken.
-    //
-    // This is exactly the "3 Water Bottles ordered, customer only drank
-    // 2, reduce qty before printing" scenario: the order_items row for
-    // Water Bottle is updated from quantity=3 to quantity=2 (or deleted
-    // outright if reduced to 0) BEFORE the order is marked is_paid=true.
-    // TodayReport.jsx and Reports.jsx both query order_items fresh on
-    // every load — they never cache the customer's original order — so
-    // once this write completes, every downstream screen sees quantity=2
-    // and ₹30, matching exactly what was printed. There is no separate
-    // "what the customer sent" record that could drift out of sync.
-    if (Object.keys(itemQtyOverrides).length > 0) {
-      for (const row of snapshot.items) {
-        const key = `row:${row.rowId}`
-        if (!itemQtyOverrides.hasOwnProperty(key)) continue
-        const newQty = itemQtyOverrides[key]
-        if (!row.rowId) continue
-        if (newQty === 0) {
-          // Fully removed — delete the row entirely
-          await supabase.from('order_items').delete().eq('id', row.rowId)
-        } else {
-          // Partially reduced — update the quantity in place
-          await supabase.from('order_items').update({ quantity: newQty }).eq('id', row.rowId)
-        }
-      }
-    }
-    // ─────────────────────────────────────────────────────────────────
 
     // Insert any newly added menu items
     const menuOnlyItems = manualItems.filter(mi => mi.foodItemId)
@@ -474,48 +471,21 @@ export default function Dashboard() {
       }).eq('id', orderId)
     }
 
-    // ── FIX: only clear the orders we just billed (snapshot.orderIds) ──
-    // never delete unpaid orders blindly by re-querying is_paid=false.
-    // See nukeClearTable below for why this matters.
     await nukeClearTable(payTableId, snapshot.orderIds)
     setNewOrderIds(prev => { const n = new Set(prev); snapshot.orderIds.forEach(id => n.delete(id)); return n })
     setItemQtyOverrides({}); setManualItems([])
     setShowItemEditor(false); setShowPreview(false)
     billingSnapshotRef.current = { tableId: null, items: [] }
     if (selectedTable?.id === payTableId) setSelectedTable(null)
+    setSaving(false)
     fetchAll()
   }
 
-  // ── nukeClearTable — FIXED to avoid deleting orders placed mid-billing ─
-  // BEFORE: this re-queried `orders where table_id=X and is_paid=false`
-  // and deleted everything found. Dashboard polls every 4s, so if a
-  // customer placed a NEW order on this table in the gap between you
-  // opening the bill preview and clicking "Print & Save", that brand-new
-  // unpaid order (which was never part of the bill you just printed)
-  // would get silently deleted along with its order_items — with no
-  // error, no trace, and no way to recover it. The customer's new order
-  // simply vanished.
-  //
-  // AFTER: we accept the list of order IDs that were ACTUALLY just
-  // billed (settledOrderIds, taken from the frozen snapshot used to
-  // print/save). We only ever delete orders for this table that are
-  // is_paid=false AND not in that already-billed set. Any order that
-  // snuck in after the snapshot was frozen (and is therefore still
-  // is_paid=false and NOT in settledOrderIds) survives and stays visible
-  // on the dashboard for the next round.
-  //
-  // We only reset the table's session_version/PIN when there is nothing
-  // left unpaid on the table — i.e. the table is genuinely empty after
-  // clearing. If a new order survived, we leave the session alive so the
-  // customer doesn't lose their table session mid-order.
   const nukeClearTable = async (tableId, settledOrderIds = []) => {
     try {
       const { data: ords } = await supabase
         .from('orders').select('id').eq('table_id', tableId).eq('is_paid', false)
       const allUnpaidIds = (ords || []).map(o => o.id)
-      // Only delete unpaid orders that are NOT part of what we just billed
-      // and were NOT already paid by this print — i.e. genuinely stale/
-      // leftover unpaid rows for this table.
       const toDelete = allUnpaidIds.filter(id => !settledOrderIds.includes(id))
 
       if (toDelete.length > 0) {
@@ -523,9 +493,6 @@ export default function Dashboard() {
         await supabase.from('orders').delete().in('id', toDelete)
       }
 
-      // If nothing unpaid remains for this table after clearing stale
-      // rows (i.e. no new order snuck in during billing), it's safe to
-      // fully reset the session and rotate the PIN.
       const remainingUnpaid = allUnpaidIds.length - toDelete.length
       if (remainingUnpaid === 0) {
         await supabase.from('table_sessions').delete().eq('table_id', tableId)
@@ -544,9 +511,6 @@ export default function Dashboard() {
   const clearAllTables = async () => {
     setShowClearAllConfirm(false); setClearing(true)
     const active = tables.filter(t => orders.some(o => o.table_id === t.id))
-    // Manual "Clear All" is an explicit admin action with no in-flight
-    // bill being printed, so there is no settledOrderIds set to protect —
-    // everything currently unpaid on these tables is intentionally wiped.
     for (const table of active) await nukeClearTable(table.id, [])
     setNewOrderIds(new Set()); setNewOrderTables(new Set())
     setSelectedTable(null); setClearing(false); fetchAll()
@@ -554,21 +518,14 @@ export default function Dashboard() {
 
   const handleLogout = async () => { await supabase.auth.signOut(); navigate('/') }
 
-  // ── Display data now reads from the FROZEN snapshot when a table is
-  // selected, so the round-by-round list on screen always matches exactly
-  // what computeTotals/getEffectiveItems will bill — no possibility of
-  // the visible item list and the subtotal drifting apart mid-edit.
   const liveSnapshot = selectedTable && billingSnapshotRef.current.tableId === selectedTable.id
     ? billingSnapshotRef.current
     : (selectedTable ? buildSnapshot(selectedTable.id) : { tableId: null, items: [], orderIds: [] })
 
   const tableOrders = selectedTable ? orders.filter(o => o.table_id === selectedTable.id) : []
-  const allOrderItems = liveSnapshot.items // flat list with stable rowId, used by the qty editor
+  const allOrderItems = liveSnapshot.items
   const editorTotals = selectedTable ? computeTotals(selectedTable.id) : null
   const displaySubtotal = editorTotals ? editorTotals.subtotal : 0
-  // Group the frozen snapshot rows back by their originating order id, so
-  // the "Round N" cards still render per-round, but every item carries its
-  // real rowId for override matching (instead of a render-time index).
   const groupedByOrder = tableOrders.map(o => ({
     ...o,
     items: liveSnapshot.items.filter(row => row.orderId === o.id),
@@ -718,12 +675,12 @@ export default function Dashboard() {
             </div>
 
             <div className="p-4 border-t space-y-2">
-              <button onClick={handlePrintAndSave} disabled={clearing}
+              <button onClick={handlePrintAndSave} disabled={clearing || saving}
                 className="w-full bg-green-500 text-white py-3 rounded-xl font-bold hover:bg-green-600 disabled:opacity-50">
-                🖨️ Print & Save Bill
+                {saving ? '⏳ Saving…' : '🖨️ Print & Save Bill'}
               </button>
-              <button onClick={() => setShowPreview(false)}
-                className="w-full bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium">
+              <button onClick={() => setShowPreview(false)} disabled={saving}
+                className="w-full bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium disabled:opacity-50">
                 ← Back to Edit
               </button>
             </div>
@@ -871,8 +828,6 @@ export default function Dashboard() {
                 {showItemEditor && (
                   <div className="border-t">
 
-                    {/* Quantity-level remove controls — driven by the frozen
-                        snapshot (allOrderItems), each row keyed by its real id */}
                     {allOrderItems.length > 0 && (
                       <div className="px-5 py-4 border-b">
                         <div className="flex items-center justify-between mb-3">
@@ -1090,7 +1045,7 @@ export default function Dashboard() {
                 )}
               </div>
 
-              {/* ── Order rounds display — sourced from the frozen snapshot ── */}
+              {/* ── Order rounds display ── */}
               <div className="space-y-4 mb-4">
                 {groupedByOrder.map((order, index) => {
                   const isNewOrder = newOrderIds.has(order.id)
