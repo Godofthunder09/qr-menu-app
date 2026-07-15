@@ -427,25 +427,46 @@ export default function Dashboard() {
           .select('id, quantity')
 
         const itemName = row.food_items?.name || 'Unknown item'
+        let auditStatus = 'success'
+        let auditReason = ''
 
         if (error) {
           // Reason A
-          failedItems.push({
-            name: itemName,
-            reason: `Database rejected the change (${error.message || 'unknown error'})`,
-          })
+          auditStatus = 'failed'
+          auditReason = `Database rejected the change (${error.message || 'unknown error'})`
         } else if (!updatedRows || updatedRows.length === 0) {
           // Reason B
-          failedItems.push({
-            name: itemName,
-            reason: `This item's record could not be found — it may have been changed in another tab/session. Please refresh and try again.`,
-          })
+          auditStatus = 'failed'
+          auditReason = `This item's record could not be found — it may have been changed in another tab/session. Please refresh and try again.`
         } else if (updatedRows[0].quantity !== newQty) {
           // Reason C
-          failedItems.push({
-            name: itemName,
-            reason: `Change was sent but did not save correctly (tried to set ${newQty}, database still shows ${updatedRows[0].quantity}). Something else may be editing this bill at the same time.`,
+          auditStatus = 'failed'
+          auditReason = `Change was sent but did not save correctly (tried to set ${newQty}, database still shows ${updatedRows[0].quantity}). Something else may be editing this bill at the same time.`
+        }
+
+        // ── NEW: log this attempt to item_quantity_audit ──────────────
+        // One row per attempt, success or failure, with table name,
+        // item name, before/after quantity, and an exact timestamp.
+        // Never blocks the billing flow — if the audit write itself
+        // fails, we swallow that error (it's a diagnostic aid, not a
+        // correctness requirement) and continue with the normal logic.
+        try {
+          await supabase.from('item_quantity_audit').insert({
+            table_name: tblData?.table_name || 'Unknown',
+            order_id: row.orderId,
+            order_item_id: row.rowId,
+            item_name: itemName,
+            original_qty: row.originalQty,
+            new_qty: newQty,
+            status: auditStatus,
+            fail_reason: auditReason,
           })
+        } catch (auditErr) {
+          // Diagnostic logging must never break the actual billing flow.
+        }
+
+        if (auditStatus === 'failed') {
+          failedItems.push({ name: itemName, reason: auditReason })
         } else {
           writtenRowIds.push({ id: row.rowId, expectedQty: newQty, name: itemName })
         }
@@ -496,6 +517,27 @@ export default function Dashboard() {
 
         if (mismatches.length > 0) {
           setSaving(false)
+
+          // ── NEW: log the read-back mismatch too, so this 4th outcome
+          // ("looked fine right after saving, but wasn't a moment later")
+          // shows up in item_quantity_audit exactly like the other 3.
+          for (const m of mismatches) {
+            try {
+              await supabase.from('item_quantity_audit').insert({
+                table_name: tblData?.table_name || 'Unknown',
+                order_id: snapshot.items.find(i => i.rowId === m.id)?.orderId || null,
+                order_item_id: m.id,
+                item_name: m.name,
+                original_qty: snapshot.items.find(i => i.rowId === m.id)?.originalQty ?? null,
+                new_qty: m.expectedQty,
+                status: 'failed',
+                fail_reason: `Read-back mismatch: saved as ${verifyMap[m.id]}, expected ${m.expectedQty}. Likely another tab/session changed this bill at the same moment.`,
+              })
+            } catch (auditErr) {
+              // Diagnostic logging must never break the actual billing flow.
+            }
+          }
+
           const detail = mismatches
             .map(m => `• ${m.name}\n   → Saved as ${verifyMap[m.id]}, but expected ${m.expectedQty}. Likely another tab/session changed this bill at the same moment.`)
             .join('\n\n')
