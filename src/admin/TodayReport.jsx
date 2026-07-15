@@ -78,14 +78,22 @@ const groupOrdersIntoBills = (orders) => {
         // blocked by RLS, which produced the original "stale item still
         // shows" bug). A quantity-0 row is "removed" and must never
         // render as a line item here.
-        order_items: [...(order.order_items || [])].filter(i => (i.quantity || 0) > 0),
+        // NEW: each item also carries the order_id it belongs to. Needed
+        // so the quantity-editing feature below can write back to the
+        // correct `orders` row and log the correct order_id in the audit
+        // table, even when a bill merges multiple orders.
+        order_items: (order.order_items || [])
+          .filter(i => (i.quantity || 0) > 0)
+          .map(i => ({ ...i, order_id: order.id })),
         open_items: [...(order.open_items_json || [])],
       }
     } else {
       map[key]._orderIds.push(order.id)
       map[key].order_items = [
         ...map[key].order_items,
-        ...(order.order_items || []).filter(i => (i.quantity || 0) > 0)
+        ...(order.order_items || [])
+          .filter(i => (i.quantity || 0) > 0)
+          .map(i => ({ ...i, order_id: order.id }))
       ]
       // If genuinely-merged (same exact paid_at), sum the money fields
       // too, since each underlying orders row only carries its own
@@ -190,6 +198,11 @@ export default function TodayReport() {
   const [modDiscountReason, setModDiscountReason] = useState('')
   const [modDiscountReasonError, setModDiscountReasonError] = useState(false)
   const [modSaving, setModSaving] = useState(false)
+  // NEW: quantity-editing state for the Modify panel, keyed by
+  // `item:<order_item.id>`. Mirrors Dashboard.jsx's itemQtyOverrides
+  // pattern so item mistakes can be corrected even after printing,
+  // using the same verified-write + audit-log safety net.
+  const [modQtyOverrides, setModQtyOverrides] = useState({})
 
   useEffect(() => { fetchTodayBills() }, [])
 
@@ -251,22 +264,44 @@ export default function TodayReport() {
     setLoading(false)
   }
 
-  // ── Compute discount preview for the Modify panel ───────────────────
-  const computeModifyTotals = (bill, discType, discVal) => {
+  // ── Compute discount + item-quantity preview for the Modify panel ───
+  // UPDATED: now accepts an optional 4th arg, qtyOverrides — a map of
+  // `item:<order_item.id>` → new quantity. When present, subtotal is
+  // recomputed live from the (possibly edited) item quantities instead
+  // of trusting the bill's stored `subtotal`, so the preview — and the
+  // eventual save — always reflects exactly what's about to be printed.
+  // Open items (open_items_json) are NOT editable here — they aren't
+  // real order_items rows, so their total is always included as-is.
+  const computeModifyTotals = (bill, discType, discVal, qtyOverrides = {}) => {
     if (!bill) return null
-    const subtotal = bill.subtotal || 0
-    const serviceChargeAmt = bill.service_charge_amt || 0
+
+    const effectiveItems = (bill.order_items || [])
+      .filter(i => (i.quantity || 0) > 0) // only currently-live rows
+      .map(i => {
+        const key = `item:${i.id}`
+        const effectiveQty = qtyOverrides.hasOwnProperty(key) ? qtyOverrides[key] : i.quantity
+        return { ...i, originalQty: i.quantity, effectiveQty }
+      })
+
+    const orderItemsTotal = effectiveItems
+      .filter(i => i.effectiveQty > 0)
+      .reduce((s, i) => s + i.price_at_order * i.effectiveQty, 0)
+    const openItemsTotal = (bill.open_items || [])
+      .reduce((s, oi) => s + (oi.price || 0) * (oi.qty || 0), 0)
+
+    const subtotal = orderItemsTotal + openItemsTotal
+    const serviceChargeAmt = Math.round(subtotal * (bill.service_charge_pct || 0) / 100)
     const afterService = subtotal + serviceChargeAmt
     const dv = parseFloat(discVal) || 0
     const discountAmt = discType === 'percent'
       ? Math.round(afterService * dv / 100)
       : Math.min(dv, afterService)
     const finalAmount = afterService - discountAmt
-    return { subtotal, serviceChargeAmt, discountAmt, finalAmount }
+    return { subtotal, serviceChargeAmt, discountAmt, finalAmount, effectiveItems }
   }
 
   const modTotals = modifyingBill
-    ? computeModifyTotals(modifyingBill, modDiscountType, modDiscountValue)
+    ? computeModifyTotals(modifyingBill, modDiscountType, modDiscountValue, modQtyOverrides)
     : null
 
   // ── Open Modify panel ───────────────────────────────────────────────
@@ -277,6 +312,7 @@ export default function TodayReport() {
     setModDiscountValue(bill.discount_value ? bill.discount_value.toString() : '')
     setModDiscountReason(bill.discount_reason || '')
     setModDiscountReasonError(false)
+    setModQtyOverrides({})
   }
 
   const closeModify = () => {
@@ -286,6 +322,25 @@ export default function TodayReport() {
     setModDiscountValue('')
     setModDiscountReason('')
     setModDiscountReasonError(false)
+    setModQtyOverrides({})
+  }
+
+  // NEW: adjust a single item's quantity in the Modify panel — same
+  // bounded delta logic as Dashboard.jsx's setItemQty (0..originalQty,
+  // never higher than what was actually billed).
+  const setModItemQty = (rowId, originalQty, delta) => {
+    const key = `item:${rowId}`
+    setModQtyOverrides(prev => {
+      const currentQty = prev.hasOwnProperty(key) ? prev[key] : originalQty
+      const newQty = Math.max(0, Math.min(originalQty, currentQty + delta))
+      const updated = { ...prev }
+      if (newQty === originalQty) {
+        delete updated[key]
+      } else {
+        updated[key] = newQty
+      }
+      return updated
+    })
   }
 
   // ── Print the modified bill receipt ────────────────────────────────
@@ -364,7 +419,22 @@ export default function TodayReport() {
     w.close()
   }, [restaurant])
 
-  // ── Save discount changes + print receipt ───────────────────────────
+  // ── Save item-quantity changes + discount changes + print receipt ───
+  // UPDATED: quantity edits are now allowed here too (previously
+  // discount-only). Item quantity changes are persisted FIRST, using
+  // the exact same 4-layer safety net as Dashboard.jsx's
+  // handlePrintAndSave, before anything else is touched:
+  //   1. UPDATE order_items.quantity, checking the RETURNED value
+  //      (not just that a row matched).
+  //   2. Log every attempt — success or failure — to item_quantity_audit
+  //      with table name, item name, before/after qty, and a timestamp.
+  //   3. If any item fails, STOP entirely — no discount saved, nothing
+  //      printed, so totals and item list can never drift apart.
+  //   4. Independent read-back verification of everything that
+  //      "succeeded", to catch a write that looked fine a moment ago
+  //      but wasn't (e.g. a concurrent edit from another tab).
+  // Only once all of that is confirmed do we recompute totals from the
+  // now-persisted quantities, save the discount, and print.
   const handleSaveModify = async () => {
     const dv = parseFloat(modDiscountValue) || 0
     if (dv > 0 && !modDiscountReason.trim()) {
@@ -375,7 +445,129 @@ export default function TodayReport() {
     if (!modifyingBill || !modTotals) return
     setModSaving(true)
     try {
-      const newFinalAmount = modTotals.finalAmount
+      // ── STEP A: persist item quantity changes, if any ────────────────
+      const qtyKeys = Object.keys(modQtyOverrides)
+      if (qtyKeys.length > 0) {
+        const failedItems = []
+        const writtenRowIds = []
+
+        for (const item of modifyingBill.order_items || []) {
+          const key = `item:${item.id}`
+          if (!modQtyOverrides.hasOwnProperty(key)) continue
+          const newQty = modQtyOverrides[key]
+          const itemName = item.food_items?.name || 'Unknown item'
+
+          const { data: updatedRows, error } = await supabase
+            .from('order_items')
+            .update({ quantity: newQty })
+            .eq('id', item.id)
+            .select('id, quantity')
+
+          let auditStatus = 'success'
+          let auditReason = ''
+          if (error) {
+            auditStatus = 'failed'
+            auditReason = `Database rejected the change (${error.message || 'unknown error'})`
+          } else if (!updatedRows || updatedRows.length === 0) {
+            auditStatus = 'failed'
+            auditReason = `This item's record could not be found — it may have been changed in another tab/session. Please refresh and try again.`
+          } else if (updatedRows[0].quantity !== newQty) {
+            auditStatus = 'failed'
+            auditReason = `Change was sent but did not save correctly (tried to set ${newQty}, database still shows ${updatedRows[0].quantity}). Something else may be editing this bill at the same time.`
+          }
+
+          // Log this attempt — success or failure — with table name,
+          // item name, before/after quantity, and a timestamp.
+          try {
+            await supabase.from('item_quantity_audit').insert({
+              table_name: modifyingBill.table_name_snapshot || 'Unknown',
+              order_id: item.order_id || null,
+              order_item_id: item.id,
+              item_name: itemName,
+              original_qty: item.quantity,
+              new_qty: newQty,
+              status: auditStatus,
+              fail_reason: auditReason,
+            })
+          } catch (auditErr) {
+            // Diagnostic logging must never break the actual save flow.
+          }
+
+          if (auditStatus === 'failed') {
+            failedItems.push({ name: itemName, reason: auditReason })
+          } else {
+            writtenRowIds.push({ id: item.id, expectedQty: newQty, name: itemName })
+          }
+        }
+
+        if (failedItems.length > 0) {
+          setModSaving(false)
+          const detail = failedItems.map(f => `• ${f.name}\n   → ${f.reason}`).join('\n\n')
+          alert(
+            `⚠️ Could not save the following item(s):\n\n${detail}\n\n` +
+            `Nothing was changed or printed, so your totals and item list stay in sync.`
+          )
+          return
+        }
+
+        // ── Independent read-back verification ──────────────────────
+        if (writtenRowIds.length > 0) {
+          const { data: verifyRows, error: verifyError } = await supabase
+            .from('order_items')
+            .select('id, quantity')
+            .in('id', writtenRowIds.map(r => r.id))
+
+          if (verifyError) {
+            setModSaving(false)
+            alert(
+              `⚠️ Could not double-check the saved quantities.\n\n` +
+              `Reason: ${verifyError.message}\n\n` +
+              `Nothing was printed or saved. Please try again.`
+            )
+            return
+          }
+
+          const verifyMap = {}
+          ;(verifyRows || []).forEach(r => { verifyMap[r.id] = r.quantity })
+
+          const mismatches = writtenRowIds.filter(r => verifyMap[r.id] !== r.expectedQty)
+
+          if (mismatches.length > 0) {
+            setModSaving(false)
+            for (const m of mismatches) {
+              const original = (modifyingBill.order_items || []).find(i => i.id === m.id)
+              try {
+                await supabase.from('item_quantity_audit').insert({
+                  table_name: modifyingBill.table_name_snapshot || 'Unknown',
+                  order_id: original?.order_id || null,
+                  order_item_id: m.id,
+                  item_name: m.name,
+                  original_qty: original?.quantity ?? null,
+                  new_qty: m.expectedQty,
+                  status: 'failed',
+                  fail_reason: `Read-back mismatch: saved as ${verifyMap[m.id]}, expected ${m.expectedQty}. Likely another tab/session changed this bill at the same moment.`,
+                })
+              } catch (auditErr) {
+                // Diagnostic logging must never break the actual save flow.
+              }
+            }
+            const detail = mismatches
+              .map(m => `• ${m.name}\n   → Saved as ${verifyMap[m.id]}, but expected ${m.expectedQty}. Likely another tab/session changed this bill at the same moment.`)
+              .join('\n\n')
+            alert(
+              `⚠️ Double-check found a mismatch for:\n\n${detail}\n\n` +
+              `Nothing was printed or saved, so your totals and item list stay in sync.`
+            )
+            return
+          }
+        }
+      }
+
+      // ── STEP B: recompute totals from the now-persisted item
+      // quantities + discount inputs, then save + print. ───────────────
+      const finalTotals = computeModifyTotals(modifyingBill, modDiscountType, modDiscountValue, modQtyOverrides)
+      const newFinalAmount = finalTotals.finalAmount
+      const newSubtotal = finalTotals.subtotal
       const oldFinalAmount = modifyingBill.final_amount || 0
       const amtDelta = newFinalAmount - oldFinalAmount
 
@@ -383,12 +575,16 @@ export default function TodayReport() {
       // NOTE: when this bill is a genuine multi-order merge (identical
       // paid_at across _orderIds), the discount is intentionally applied
       // uniformly across each underlying order row's own discount fields
-      // — matching prior behavior.
+      // — matching prior behavior. `subtotal` is now included in this
+      // write too — previously it never changed here (discount-only), so
+      // it wasn't part of the update; now that item quantities can
+      // change it, it must be persisted alongside final_amount.
       for (const orderId of modifyingBill._orderIds) {
         await supabase.from('orders').update({
+          subtotal:        newSubtotal,
           discount_type:   modDiscountType,
           discount_value:  dv,
-          discount_amt:    modTotals.discountAmt,
+          discount_amt:    finalTotals.discountAmt,
           discount_reason: modDiscountReason.trim(),
           final_amount:    newFinalAmount,
         }).eq('id', orderId)
@@ -416,7 +612,16 @@ export default function TodayReport() {
         }
       }
 
-      printModifiedBill(modifyingBill, modTotals, modDiscountReason.trim())
+      // Print using the EDITED quantities, not the stale ones captured
+      // when the panel was opened — otherwise the receipt would still
+      // show the old amounts even though the DB now has the new ones.
+      const printableBill = {
+        ...modifyingBill,
+        order_items: finalTotals.effectiveItems
+          .filter(i => i.effectiveQty > 0)
+          .map(i => ({ ...i, quantity: i.effectiveQty })),
+      }
+      printModifiedBill(printableBill, finalTotals, modDiscountReason.trim())
 
       closeModify()
       await fetchTodayBills()
