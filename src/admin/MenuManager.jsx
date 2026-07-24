@@ -1,804 +1,710 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 
 export default function MenuManager() {
-  const [categories, setCategories] = useState([])
-  const [subcategories, setSubcategories] = useState([])
-  const [foodItems, setFoodItems] = useState([])
-
-  const [newCategory, setNewCategory] = useState('')
-  const [newSubcategory, setNewSubcategory] = useState('')
-  const [newSubcategoryParent, setNewSubcategoryParent] = useState('')
-
-  const [itemName, setItemName] = useState('')
-  const [itemPrice, setItemPrice] = useState('')
-  const [itemDescription, setItemDescription] = useState('')
-  const [itemImage, setItemImage] = useState(null)
-  const [itemCategory, setItemCategory] = useState('')
-  const [itemSubcategory, setItemSubcategory] = useState('')
-
-  const [editItem, setEditItem] = useState(null)
-  const [editName, setEditName] = useState('')
-  const [editPrice, setEditPrice] = useState('')
-  const [editDescription, setEditDescription] = useState('')
-  const [editImage, setEditImage] = useState(null)
-  const [editCategory, setEditCategory] = useState('')
-  const [editSubcategory, setEditSubcategory] = useState('')
-
-  const [filterCategory, setFilterCategory] = useState('')
-  const [filterSubcategory, setFilterSubcategory] = useState('')
-  const [searchQuery, setSearchQuery] = useState('')
-
-  // CSV Import
-  const [showCsvModal, setShowCsvModal] = useState(false)
-  const [csvText, setCsvText] = useState('')
-  const [csvPreview, setCsvPreview] = useState([])
-  const [csvErrors, setCsvErrors] = useState([])
-  const [csvImporting, setCsvImporting] = useState(false)
-  const [csvDone, setCsvDone] = useState(false)
-  const csvFileRef = useRef(null)
-
-  const [loading, setLoading] = useState(false)
-  const [saving, setSaving] = useState(false)
-  const [activeTab, setActiveTab] = useState('items')
-  const [message, setMessage] = useState('')
   const navigate = useNavigate()
 
-  const fetchAll = async () => {
-    const { data: cats } = await supabase
-      .from('categories').select('*').eq('is_subcategory', false).order('created_at')
-    setCategories(cats || [])
-
-    const { data: subs } = await supabase
-      .from('categories').select('*').eq('is_subcategory', true).order('created_at')
-    setSubcategories(subs || [])
-
-    const { data: items } = await supabase
-      .from('food_items')
-      .select('*, categories!food_items_category_id_fkey(name), subcategory:categories!food_items_subcategory_id_fkey(name)')
-      .order('created_at')
-    setFoodItems(items || [])
-  }
-
-  useEffect(() => { fetchAll() }, [])
-
-  const showMsg = (msg) => {
-    setMessage(msg)
-    setTimeout(() => setMessage(''), 2500)
-  }
-
   // ── Categories ────────────────────────────────────────────
-  const addCategory = async () => {
-    if (!newCategory.trim()) return
-    await supabase.from('categories').insert({ name: newCategory.trim(), is_subcategory: false })
-    setNewCategory('')
-    fetchAll()
-    showMsg('Category added! ✅')
-  }
+  const [categories, setCategories] = useState([])
+  const [subcategories, setSubcategories] = useState([])
+  const [newCatName, setNewCatName] = useState('')
+  const [newSubName, setNewSubName] = useState('')
+  const [newSubParent, setNewSubParent] = useState('')
+  const [editCatId, setEditCatId] = useState(null)
+  const [editCatName, setEditCatName] = useState('')
+  const [editSubId, setEditSubId] = useState(null)
+  const [editSubName, setEditSubName] = useState('')
+  const [editSubParent, setEditSubParent] = useState('')
 
-  const addSubcategory = async () => {
-    if (!newSubcategory.trim()) { alert('Enter subcategory name'); return }
-    if (!newSubcategoryParent) { alert('Select a parent category'); return }
-    await supabase.from('categories').insert({
-      name: newSubcategory.trim(), is_subcategory: true, parent_id: newSubcategoryParent
-    })
-    setNewSubcategory('')
-    setNewSubcategoryParent('')
-    fetchAll()
-    showMsg('Subcategory added! ✅')
-  }
+  // ── Food Items ────────────────────────────────────────────
+  const [foodItems, setFoodItems] = useState([])
+  const [filterCat, setFilterCat] = useState('all')
 
-  const deleteCategory = async (id) => {
-    if (!window.confirm('Delete this category? Items in it will lose their category.')) return
-    await supabase.from('categories').delete().eq('id', id)
-    fetchAll()
-  }
-
-  // ── Image upload ──────────────────────────────────────────
-  const uploadImage = async (file) => {
-    const ext = file.name.split('.').pop()
-    const fileName = `${Date.now()}.${ext}`
-    const { error } = await supabase.storage.from('food-images').upload(fileName, file)
-    if (error) return null
-    const { data } = supabase.storage.from('food-images').getPublicUrl(fileName)
-    return data.publicUrl
-  }
-
-  // ── Add food item ─────────────────────────────────────────
-  const addFoodItem = async () => {
-    if (!itemName.trim()) { alert('Enter food name!'); return }
-    if (!itemPrice) { alert('Enter price!'); return }
-    if (!itemCategory) { alert('Select a category!'); return }
-    setLoading(true)
-
-    let imageUrl = null
-    if (itemImage) imageUrl = await uploadImage(itemImage)
-
-    await supabase.from('food_items').insert({
-      name: itemName.trim(),
-      price: parseFloat(itemPrice),
-      description: itemDescription.trim(),
-      image_url: imageUrl,
-      category_id: itemCategory,
-      subcategory_id: itemSubcategory || null,
-      is_available: true
-    })
-
-    setItemName(''); setItemPrice(''); setItemDescription('')
-    setItemImage(null); setItemCategory(''); setItemSubcategory('')
-    setLoading(false)
-    fetchAll()
-    showMsg('Food item added! ✅')
-  }
-
-  // ── Edit food item ────────────────────────────────────────
-  const openEdit = (item) => {
-    setEditItem(item)
-    setEditName(item.name)
-    setEditPrice(item.price)
-    setEditDescription(item.description || '')
-    setEditImage(null)
-    setEditCategory(item.category_id || '')
-    setEditSubcategory(item.subcategory_id || '')
-  }
-
-  const saveEdit = async () => {
-    if (!editName.trim()) { alert('Enter food name!'); return }
-    if (!editPrice) { alert('Enter price!'); return }
-    setSaving(true)
-
-    let imageUrl = editItem.image_url
-    if (editImage) imageUrl = await uploadImage(editImage)
-
-    await supabase.from('food_items').update({
-      name: editName.trim(),
-      price: parseFloat(editPrice),
-      description: editDescription.trim(),
-      image_url: imageUrl,
-      category_id: editCategory || null,
-      subcategory_id: editSubcategory || null
-    }).eq('id', editItem.id)
-
-    setEditItem(null)
-    setSaving(false)
-    fetchAll()
-    showMsg('Food item updated! ✅')
-  }
-
-  const toggleAvailable = async (id, current) => {
-    await supabase.from('food_items').update({ is_available: !current }).eq('id', id)
-    fetchAll()
-  }
-
-  const deleteFoodItem = async (id) => {
-    if (!window.confirm('Delete this item?')) return
-    await supabase.from('food_items').delete().eq('id', id)
-    fetchAll()
-  }
-
-  // ── CSV Import ────────────────────────────────────────────
-  const handleCsvFile = (e) => {
-    const file = e.target.files[0]
-    if (!file) return
-    const reader = new FileReader()
-    reader.onload = (ev) => {
-      setCsvText(ev.target.result)
-      parseCsv(ev.target.result)
-    }
-    reader.readAsText(file)
-  }
-
-  const parseCsv = (text) => {
-    const lines = text.trim().split('\n').map(l => l.trim()).filter(Boolean)
-    if (lines.length < 2) {
-      setCsvErrors(['CSV must have a header row and at least one data row.'])
-      setCsvPreview([])
-      return
-    }
-
-    const header = lines[0].toLowerCase().split(',').map(h => h.trim().replace(/"/g, ''))
-    const requiredCols = ['name', 'price']
-    const missing = requiredCols.filter(c => !header.includes(c))
-    if (missing.length > 0) {
-      setCsvErrors([`Missing required columns: ${missing.join(', ')}`])
-      setCsvPreview([])
-      return
-    }
-
-    const nameIdx = header.indexOf('name')
-    const priceIdx = header.indexOf('price')
-    const descIdx = header.indexOf('description')
-    const catIdx = header.indexOf('category')
-    const subIdx = header.indexOf('subcategory')
-
-    const errors = []
-    const rows = []
-
-    lines.slice(1).forEach((line, i) => {
-      // Handle quoted commas
-      const cols = line.match(/(".*?"|[^,]+)(?=,|$)/g)?.map(c => c.replace(/"/g, '').trim()) || line.split(',').map(c => c.trim())
-
-      const name = cols[nameIdx] || ''
-      const priceRaw = cols[priceIdx] || ''
-      const description = descIdx >= 0 ? (cols[descIdx] || '') : ''
-      const category = catIdx >= 0 ? (cols[catIdx] || '') : ''
-      const subcategory = subIdx >= 0 ? (cols[subIdx] || '') : ''
-
-      if (!name) { errors.push(`Row ${i + 2}: Name is empty`); return }
-
-      const price = parseFloat(priceRaw)
-      if (isNaN(price) || price <= 0) {
-        errors.push(`Row ${i + 2}: Invalid price "${priceRaw}" for "${name}"`)
-        return
-      }
-
-      rows.push({ name, price, description, category, subcategory })
-    })
-
-    setCsvErrors(errors)
-    setCsvPreview(rows)
-  }
-
-  const importCsv = async () => {
-    if (csvPreview.length === 0) return
-    setCsvImporting(true)
-
-    let imported = 0
-    let skipped = 0
-
-    for (const row of csvPreview) {
-      // Find category by name
-      let categoryId = null
-      let subcategoryId = null
-
-      if (row.category) {
-        const cat = categories.find(c =>
-          c.name.toLowerCase() === row.category.toLowerCase()
-        )
-        categoryId = cat?.id || null
-      }
-
-      if (row.subcategory && categoryId) {
-        const sub = subcategories.find(s =>
-          s.name.toLowerCase() === row.subcategory.toLowerCase() &&
-          s.parent_id === categoryId
-        )
-        subcategoryId = sub?.id || null
-      }
-
-      const { error } = await supabase.from('food_items').insert({
-        name: row.name,
-        price: row.price,
-        description: row.description || '',
-        category_id: categoryId,
-        subcategory_id: subcategoryId,
-        is_available: true,
-        image_url: null
-      })
-
-      if (error) skipped++
-      else imported++
-    }
-
-    setCsvImporting(false)
-    setCsvDone(true)
-    fetchAll()
-    showMsg(`✅ Imported ${imported} items! ${skipped > 0 ? `${skipped} skipped.` : ''}`)
-  }
-
-  const closeCsvModal = () => {
-    setShowCsvModal(false)
-    setCsvText('')
-    setCsvPreview([])
-    setCsvErrors([])
-    setCsvDone(false)
-    if (csvFileRef.current) csvFileRef.current.value = ''
-  }
-
-  // ── Filter logic ──────────────────────────────────────────
-  const filteredSubcategories = filterCategory
-    ? subcategories.filter(s => s.parent_id === filterCategory)
-    : subcategories
-
-  const editFilteredSubcategories = editCategory
-    ? subcategories.filter(s => s.parent_id === editCategory)
-    : subcategories
-
-  const addFilteredSubcategories = itemCategory
-    ? subcategories.filter(s => s.parent_id === itemCategory)
-    : subcategories
-
-  const filteredItems = foodItems.filter(item => {
-    const matchCat = filterCategory ? item.category_id === filterCategory : true
-    const matchSub = filterSubcategory ? item.subcategory_id === filterSubcategory : true
-    const matchSearch = searchQuery.trim()
-      ? item.name.toLowerCase().includes(searchQuery.toLowerCase())
-      : true
-    return matchCat && matchSub && matchSearch
+  // Add item form
+  const [newItem, setNewItem] = useState({
+    name: '', price: '', category_id: '', subcategory_id: '',
+    description: '', is_available: true, image_url: ''
   })
 
-  return (
-    <div className="min-h-screen bg-orange-50">
+  // Edit item form
+  const [editItem, setEditItem] = useState(null)
 
-      {/* Edit Modal */}
+  // ── UI state ──────────────────────────────────────────────
+  const [activeTab, setActiveTab] = useState('items')
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+
+  // Message system — shows success/error with colour
+  const [msg, setMsg] = useState(null) // { text, type: 'success'|'error' }
+  const showMsg = (text, type = 'success') => {
+    setMsg({ text, type })
+    setTimeout(() => setMsg(null), 4000)
+  }
+
+  // ── Fetch ─────────────────────────────────────────────────
+  useEffect(() => { fetchAll() }, [])
+
+  const fetchAll = async () => {
+    setLoading(true)
+    const [{ data: cats }, { data: items }] = await Promise.all([
+      supabase.from('categories').select('*').order('created_at'),
+      supabase.from('food_items')
+        .select(`*, category:categories!food_items_category_id_fkey(id,name),
+                     subcategory:categories!food_items_subcategory_id_fkey(id,name)`)
+        .order('created_at'),
+    ])
+    const mainCats = (cats || []).filter(c => !c.is_subcategory)
+    const subCats  = (cats || []).filter(c =>  c.is_subcategory)
+    setCategories(mainCats)
+    setSubcategories(subCats)
+    setFoodItems(items || [])
+    setLoading(false)
+  }
+
+  // ── Category CRUD ─────────────────────────────────────────
+  const addCategory = async () => {
+    const name = newCatName.trim()
+    if (!name) { showMsg('Enter category name', 'error'); return }
+    setSaving(true)
+    const { error } = await supabase.from('categories').insert({ name, is_subcategory: false })
+    setSaving(false)
+    if (error) { showMsg('Error adding category: ' + error.message, 'error'); return }
+    setNewCatName('')
+    showMsg('Category added ✅')
+    fetchAll()
+  }
+
+  const saveEditCategory = async () => {
+    const name = editCatName.trim()
+    if (!name) { showMsg('Enter category name', 'error'); return }
+    setSaving(true)
+    const { error } = await supabase.from('categories').update({ name }).eq('id', editCatId)
+    setSaving(false)
+    if (error) { showMsg('Error updating category: ' + error.message, 'error'); return }
+    setEditCatId(null); setEditCatName('')
+    showMsg('Category updated ✅')
+    fetchAll()
+  }
+
+  // FIX: check if any food items use this category before deleting
+  const deleteCategory = async (cat) => {
+    // Count items using this category
+    const { count, error: countErr } = await supabase
+      .from('food_items')
+      .select('id', { count: 'exact', head: true })
+      .eq('category_id', cat.id)
+    if (countErr) { showMsg('Error checking items: ' + countErr.message, 'error'); return }
+    if (count > 0) {
+      showMsg(
+        `❌ Cannot delete "${cat.name}" — ${count} item(s) still use this category. Remove or reassign those items first.`,
+        'error'
+      )
+      return
+    }
+    // Also check subcategories referencing this parent
+    const usedBySubs = subcategories.filter(s => s.parent_category_id === cat.id)
+    if (usedBySubs.length > 0) {
+      showMsg(
+        `❌ Cannot delete "${cat.name}" — ${usedBySubs.length} subcategory/ies belong to it. Delete them first.`,
+        'error'
+      )
+      return
+    }
+    if (!window.confirm(`Delete category "${cat.name}"?`)) return
+    setSaving(true)
+    const { error } = await supabase.from('categories').delete().eq('id', cat.id)
+    setSaving(false)
+    if (error) { showMsg('Error deleting category: ' + error.message, 'error'); return }
+    showMsg('Category deleted ✅')
+    fetchAll()
+  }
+
+  // ── Subcategory CRUD ──────────────────────────────────────
+  const addSubcategory = async () => {
+    const name = newSubName.trim()
+    if (!name) { showMsg('Enter subcategory name', 'error'); return }
+    if (!newSubParent) { showMsg('Select a parent category', 'error'); return }
+    setSaving(true)
+    const { error } = await supabase.from('categories').insert({
+      name, is_subcategory: true, parent_category_id: newSubParent
+    })
+    setSaving(false)
+    if (error) { showMsg('Error adding subcategory: ' + error.message, 'error'); return }
+    setNewSubName(''); setNewSubParent('')
+    showMsg('Subcategory added ✅')
+    fetchAll()
+  }
+
+  const saveEditSubcategory = async () => {
+    const name = editSubName.trim()
+    if (!name) { showMsg('Enter subcategory name', 'error'); return }
+    if (!editSubParent) { showMsg('Select a parent category', 'error'); return }
+    setSaving(true)
+    const { error } = await supabase.from('categories')
+      .update({ name, parent_category_id: editSubParent }).eq('id', editSubId)
+    setSaving(false)
+    if (error) { showMsg('Error updating subcategory: ' + error.message, 'error'); return }
+    setEditSubId(null); setEditSubName(''); setEditSubParent('')
+    showMsg('Subcategory updated ✅')
+    fetchAll()
+  }
+
+  // FIX: check if any food items use this subcategory before deleting
+  const deleteSubcategory = async (sub) => {
+    const { count, error: countErr } = await supabase
+      .from('food_items')
+      .select('id', { count: 'exact', head: true })
+      .eq('subcategory_id', sub.id)
+    if (countErr) { showMsg('Error checking items: ' + countErr.message, 'error'); return }
+    if (count > 0) {
+      showMsg(
+        `❌ Cannot delete "${sub.name}" — ${count} item(s) still use this subcategory. Remove or reassign those items first.`,
+        'error'
+      )
+      return
+    }
+    if (!window.confirm(`Delete subcategory "${sub.name}"?`)) return
+    setSaving(true)
+    const { error } = await supabase.from('categories').delete().eq('id', sub.id)
+    setSaving(false)
+    if (error) { showMsg('Error deleting subcategory: ' + error.message, 'error'); return }
+    showMsg('Subcategory deleted ✅')
+    fetchAll()
+  }
+
+  // ── Food Item CRUD ────────────────────────────────────────
+  const addFoodItem = async () => {
+    const name = newItem.name.trim()
+    const price = parseFloat(newItem.price)
+    if (!name) { showMsg('Enter item name', 'error'); return }
+    if (!price || price <= 0) { showMsg('Enter valid price', 'error'); return }
+    if (!newItem.category_id) { showMsg('Select a category', 'error'); return }
+
+    setSaving(true)
+    const payload = {
+      name,
+      price,
+      category_id: newItem.category_id,
+      // FIX: send null not empty string — empty string fails UUID FK constraint
+      subcategory_id: newItem.subcategory_id || null,
+      description: newItem.description.trim() || null,
+      is_available: newItem.is_available,
+      image_url: newItem.image_url.trim() || null,
+    }
+    const { error } = await supabase.from('food_items').insert(payload)
+    setSaving(false)
+    if (error) { showMsg('Error adding item: ' + error.message, 'error'); return }
+    setNewItem({ name: '', price: '', category_id: '', subcategory_id: '', description: '', is_available: true, image_url: '' })
+    showMsg(`"${name}" added ✅`)
+    fetchAll()
+  }
+
+  const openEditItem = (item) => {
+    setEditItem({
+      id: item.id, name: item.name, price: item.price,
+      category_id: item.category_id || '',
+      subcategory_id: item.subcategory_id || '',
+      description: item.description || '',
+      is_available: item.is_available,
+      image_url: item.image_url || '',
+    })
+  }
+
+  const saveEditItem = async () => {
+    const name = editItem.name.trim()
+    const price = parseFloat(editItem.price)
+    if (!name) { showMsg('Enter item name', 'error'); return }
+    if (!price || price <= 0) { showMsg('Enter valid price', 'error'); return }
+    if (!editItem.category_id) { showMsg('Select a category', 'error'); return }
+
+    setSaving(true)
+    const payload = {
+      name,
+      price,
+      category_id: editItem.category_id,
+      // FIX: send null not empty string
+      subcategory_id: editItem.subcategory_id || null,
+      description: editItem.description.trim() || null,
+      is_available: editItem.is_available,
+      image_url: editItem.image_url.trim() || null,
+    }
+    const { error } = await supabase.from('food_items').update(payload).eq('id', editItem.id)
+    setSaving(false)
+    if (error) { showMsg('Error updating item: ' + error.message, 'error'); return }
+    setEditItem(null)
+    showMsg(`"${name}" updated ✅`)
+    fetchAll()
+  }
+
+  const toggleAvailability = async (item) => {
+    const { error } = await supabase.from('food_items')
+      .update({ is_available: !item.is_available }).eq('id', item.id)
+    if (error) { showMsg('Error updating availability: ' + error.message, 'error'); return }
+    showMsg(`"${item.name}" ${!item.is_available ? 'enabled' : 'disabled'} ✅`)
+    fetchAll()
+  }
+
+  const deleteFoodItem = async (item) => {
+    if (!window.confirm(`Delete "${item.name}"? This cannot be undone.`)) return
+    setSaving(true)
+    const { error } = await supabase.from('food_items').delete().eq('id', item.id)
+    setSaving(false)
+    if (error) { showMsg('Error deleting item: ' + error.message, 'error'); return }
+    showMsg(`"${item.name}" deleted ✅`)
+    fetchAll()
+  }
+
+  // ── Derived ───────────────────────────────────────────────
+  const filteredItems = filterCat === 'all'
+    ? foodItems
+    : foodItems.filter(i => i.category_id === filterCat)
+
+  const subsForCategory = (catId) => subcategories.filter(s => s.parent_category_id === catId)
+  const subsForNewItem  = newItem.category_id ? subsForCategory(newItem.category_id) : []
+  const subsForEditItem = editItem?.category_id ? subsForCategory(editItem.category_id) : []
+
+  // ── Render ────────────────────────────────────────────────
+  return (
+    <div className="min-h-screen bg-gray-50">
+
+      {/* Message Toast */}
+      {msg && (
+        <div className={`fixed top-4 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-2xl shadow-xl text-sm font-medium max-w-sm text-center transition-all
+          ${msg.type === 'error' ? 'bg-red-500 text-white' : 'bg-green-500 text-white'}`}>
+          {msg.text}
+        </div>
+      )}
+
+      {/* Edit Item Modal */}
       {editItem && (
-        <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-xl max-h-[90vh] overflow-y-auto">
-            <h2 className="font-bold text-gray-800 text-lg mb-4">✏️ Edit Food Item</h2>
-            <div className="space-y-3">
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl max-h-[92vh] overflow-y-auto">
+            <div className="p-5 border-b flex justify-between items-center">
+              <h2 className="font-bold text-gray-800">✏️ Edit Item</h2>
+              <button onClick={() => setEditItem(null)} className="text-gray-400 text-2xl font-bold">×</button>
+            </div>
+            <div className="p-5 space-y-3">
               <div>
-                <label className="text-xs text-gray-500 mb-1 block">Name</label>
-                <input type="text" value={editName} onChange={e => setEditName(e.target.value)}
-                  className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                <label className="text-xs text-gray-500 block mb-1">Item Name *</label>
+                <input type="text" value={editItem.name} onChange={e => setEditItem(p => ({ ...p, name: e.target.value }))}
+                  className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
               </div>
               <div>
-                <label className="text-xs text-gray-500 mb-1 block">Price (₹)</label>
-                <input type="number" value={editPrice} onChange={e => setEditPrice(e.target.value)}
-                  className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                <label className="text-xs text-gray-500 block mb-1">Price (₹) *</label>
+                <input type="number" min="0" value={editItem.price} onChange={e => setEditItem(p => ({ ...p, price: e.target.value }))}
+                  className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
               </div>
               <div>
-                <label className="text-xs text-gray-500 mb-1 block">Description</label>
-                <textarea value={editDescription} onChange={e => setEditDescription(e.target.value)}
-                  rows={2}
-                  className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-              </div>
-              <div>
-                <label className="text-xs text-gray-500 mb-1 block">Category</label>
-                <select value={editCategory}
-                  onChange={e => { setEditCategory(e.target.value); setEditSubcategory('') }}
-                  className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                  <option value="">Select Category</option>
+                <label className="text-xs text-gray-500 block mb-1">Category *</label>
+                <select value={editItem.category_id}
+                  onChange={e => setEditItem(p => ({ ...p, category_id: e.target.value, subcategory_id: '' }))}
+                  className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
+                  <option value="">Select category</option>
                   {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </select>
               </div>
-              {editFilteredSubcategories.length > 0 && (
+              {subsForEditItem.length > 0 && (
                 <div>
-                  <label className="text-xs text-gray-500 mb-1 block">Subcategory (optional)</label>
-                  <select value={editSubcategory} onChange={e => setEditSubcategory(e.target.value)}
-                    className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                    <option value="">No Subcategory</option>
-                    {editFilteredSubcategories.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                  <label className="text-xs text-gray-500 block mb-1">Subcategory</label>
+                  <select value={editItem.subcategory_id}
+                    onChange={e => setEditItem(p => ({ ...p, subcategory_id: e.target.value }))}
+                    className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
+                    <option value="">None</option>
+                    {subsForEditItem.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
                   </select>
                 </div>
               )}
               <div>
-                <label className="text-xs text-gray-500 mb-1 block">Change Image (optional)</label>
-                {editItem.image_url && (
-                  <img src={editItem.image_url} alt="current"
-                    className="w-20 h-20 rounded-xl object-cover mb-2" />
-                )}
-                <div className="border-2 border-dashed border-orange-200 rounded-lg p-3 text-center">
-                  <label className="cursor-pointer">
-                    <p className="text-xs text-gray-500">{editImage ? editImage.name : 'Click to change image'}</p>
-                    <input type="file" accept="image/*" className="hidden"
-                      onChange={e => setEditImage(e.target.files[0])} />
-                    <span className="text-xs text-orange-400 underline">Browse</span>
-                  </label>
-                </div>
+                <label className="text-xs text-gray-500 block mb-1">Description</label>
+                <textarea value={editItem.description} onChange={e => setEditItem(p => ({ ...p, description: e.target.value }))}
+                  rows={2} className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
               </div>
-            </div>
-            <div className="flex gap-3 mt-5">
-              <button onClick={() => setEditItem(null)}
-                className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium">Cancel</button>
-              <button onClick={saveEdit} disabled={saving}
-                className="flex-1 bg-orange-500 text-white py-2 rounded-xl font-medium disabled:opacity-50">
-                {saving ? 'Saving...' : '💾 Save'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* CSV Import Modal */}
-      {showCsvModal && (
-        <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl w-full max-w-lg shadow-xl max-h-[90vh] flex flex-col">
-
-            <div className="p-5 border-b">
-              <h2 className="font-bold text-gray-800 text-lg">📥 Import Items from CSV</h2>
-              <p className="text-xs text-gray-400 mt-1">
-                Upload a CSV file to add multiple items at once
-              </p>
-            </div>
-
-            <div className="flex-1 overflow-y-auto p-5 space-y-4">
-
-              {/* Format Guide */}
-              <div className="bg-orange-50 border border-orange-200 rounded-xl p-4">
-                <p className="text-xs font-bold text-orange-600 mb-2">📋 Required CSV Format:</p>
-                <code className="text-xs text-gray-700 bg-white px-2 py-1 rounded block">
-                  name,price,description,category,subcategory
-                </code>
-                <div className="mt-2 space-y-1 text-xs text-gray-500">
-                  <p>• <strong>name</strong> and <strong>price</strong> are required</p>
-                  <p>• <strong>description</strong>, <strong>category</strong>, <strong>subcategory</strong> are optional</p>
-                  <p>• Category names must exactly match your existing categories</p>
-                  <p>• Images can be added later by editing each item</p>
-                </div>
-
-                {/* Sample Download */}
-                <button
-                  onClick={() => {
-                    const sample = `name,price,description,category,subcategory\nChicken Tikka,350,Grilled chicken with spices,Non-veg,Chicken\nPaneer Butter Masala,280,Rich creamy curry,Veg,\nDal Makhani,220,Slow cooked black lentils,Veg,\nNaan,40,Soft tandoor bread,Breads,\nKingfisher Beer,180,330ml chilled beer,Liquor,Beer`
-                    const blob = new Blob([sample], { type: 'text/csv' })
-                    const url = URL.createObjectURL(blob)
-                    const a = document.createElement('a')
-                    a.href = url
-                    a.download = 'menu_sample.csv'
-                    a.click()
-                    URL.revokeObjectURL(url)
-                  }}
-                  className="mt-2 text-xs bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg font-medium hover:bg-orange-200">
-                  ⬇️ Download Sample CSV
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Image URL</label>
+                <input type="text" value={editItem.image_url} onChange={e => setEditItem(p => ({ ...p, image_url: e.target.value }))}
+                  placeholder="https://..."
+                  className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+              </div>
+              <div className="flex items-center gap-3">
+                <label className="text-sm text-gray-700 font-medium">Available</label>
+                <button onClick={() => setEditItem(p => ({ ...p, is_available: !p.is_available }))}
+                  className={`w-12 h-6 rounded-full transition ${editItem.is_available ? 'bg-green-500' : 'bg-gray-300'} relative`}>
+                  <div className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-all ${editItem.is_available ? 'left-6' : 'left-0.5'}`} />
                 </button>
               </div>
-
-              {/* File Upload */}
-              {!csvDone && (
-                <div
-                  className="border-2 border-dashed border-orange-300 rounded-xl p-6 text-center cursor-pointer hover:bg-orange-50 transition"
-                  onClick={() => csvFileRef.current?.click()}>
-                  <div className="text-4xl mb-2">📄</div>
-                  <p className="text-sm text-gray-600 font-medium">Click to upload CSV file</p>
-                  <p className="text-xs text-gray-400 mt-1">
-                    {csvText ? '✅ File loaded — see preview below' : 'Supports .csv files'}
-                  </p>
-                  <input
-                    ref={csvFileRef}
-                    type="file"
-                    accept=".csv"
-                    className="hidden"
-                    onChange={handleCsvFile}
-                  />
-                </div>
-              )}
-
-              {/* Errors */}
-              {csvErrors.length > 0 && (
-                <div className="bg-red-50 border border-red-200 rounded-xl p-4">
-                  <p className="text-xs font-bold text-red-600 mb-2">
-                    ⚠️ {csvErrors.length} issue(s) found:
-                  </p>
-                  <div className="space-y-1">
-                    {csvErrors.map((err, i) => (
-                      <p key={i} className="text-xs text-red-500">{err}</p>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Preview Table */}
-              {csvPreview.length > 0 && !csvDone && (
-                <div>
-                  <p className="text-sm font-bold text-gray-700 mb-2">
-                    Preview — {csvPreview.length} items ready to import
-                  </p>
-                  <div className="overflow-x-auto rounded-xl border border-gray-200">
-                    <table className="w-full text-xs">
-                      <thead className="bg-orange-50">
-                        <tr>
-                          <th className="text-left py-2 px-3 text-gray-500">Name</th>
-                          <th className="text-left py-2 px-3 text-gray-500">Price</th>
-                          <th className="text-left py-2 px-3 text-gray-500">Category</th>
-                          <th className="text-left py-2 px-3 text-gray-500">Description</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {csvPreview.map((row, i) => {
-                          const catFound = row.category
-                            ? categories.some(c => c.name.toLowerCase() === row.category.toLowerCase())
-                            : true
-                          return (
-                            <tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
-                              <td className="py-2 px-3 font-medium text-gray-700">{row.name}</td>
-                              <td className="py-2 px-3 text-orange-600 font-bold">₹{row.price}</td>
-                              <td className="py-2 px-3">
-                                {row.category ? (
-                                  <span className={`px-2 py-0.5 rounded-full text-xs font-medium
-                                    ${catFound ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-500'}`}>
-                                    {catFound ? '✓' : '✗'} {row.category}
-                                    {row.subcategory ? ` › ${row.subcategory}` : ''}
-                                  </span>
-                                ) : (
-                                  <span className="text-gray-300">—</span>
-                                )}
-                              </td>
-                              <td className="py-2 px-3 text-gray-400 truncate max-w-32">
-                                {row.description || '—'}
-                              </td>
-                            </tr>
-                          )
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                  <p className="text-xs text-gray-400 mt-2">
-                    ✅ Green = category found &nbsp; ❌ Red = category not found (item will be added without category)
-                  </p>
-                </div>
-              )}
-
-              {/* Done state */}
-              {csvDone && (
-                <div className="text-center py-8">
-                  <div className="text-5xl mb-3">🎉</div>
-                  <p className="text-lg font-bold text-green-600">Import Complete!</p>
-                  <p className="text-sm text-gray-500 mt-1">
-                    {csvPreview.length} items added. Go to Food Items to add images.
-                  </p>
-                </div>
-              )}
-            </div>
-
-            <div className="p-4 border-t flex gap-3">
-              <button onClick={closeCsvModal}
-                className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">
-                {csvDone ? '✅ Done' : 'Cancel'}
-              </button>
-              {csvPreview.length > 0 && !csvDone && (
-                <button
-                  onClick={importCsv}
-                  disabled={csvImporting}
-                  className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold hover:bg-orange-600 disabled:opacity-50">
-                  {csvImporting
-                    ? `⏳ Importing...`
-                    : `📥 Import ${csvPreview.length} Items`}
+              <div className="flex gap-3 pt-2">
+                <button onClick={() => setEditItem(null)} className="flex-1 bg-gray-100 text-gray-700 py-2.5 rounded-xl font-medium text-sm">Cancel</button>
+                <button onClick={saveEditItem} disabled={saving}
+                  className="flex-1 bg-orange-500 text-white py-2.5 rounded-xl font-bold text-sm hover:bg-orange-600 disabled:opacity-50">
+                  {saving ? 'Saving...' : '💾 Save'}
                 </button>
-              )}
+              </div>
             </div>
           </div>
         </div>
       )}
 
       {/* Navbar */}
-      <div className="bg-white shadow px-6 py-4 flex justify-between items-center">
-        <div className="flex items-center gap-2">
-          <span className="text-2xl">🍽️</span>
-          <h1 className="text-xl font-bold text-orange-500">Menu Manager</h1>
+      <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30">
+        <div className="flex items-center gap-3">
+          <span className="text-xl">🍽️</span>
+          <h1 className="text-lg font-bold text-orange-500">Menu Manager</h1>
         </div>
         <button onClick={() => navigate('/admin/dashboard')}
-          className="bg-orange-100 text-orange-600 px-4 py-2 rounded-lg text-sm font-medium hover:bg-orange-200">
+          className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">
           ← Dashboard
         </button>
       </div>
 
-      <div className="p-6 max-w-4xl mx-auto">
-
-        {message && (
-          <div className="bg-green-100 text-green-700 px-4 py-3 rounded-lg mb-4 text-sm font-medium">
-            {message}
-          </div>
-        )}
+      <div className="p-4 max-w-3xl mx-auto">
 
         {/* Tabs */}
-        <div className="flex gap-2 mb-6 flex-wrap">
-          {['items', 'categories', 'subcategories'].map(tab => (
-            <button key={tab} onClick={() => setActiveTab(tab)}
-              className={`px-5 py-2 rounded-full font-medium text-sm transition capitalize
-                ${activeTab === tab ? 'bg-orange-500 text-white' : 'bg-white text-gray-500 border'}`}>
-              {tab === 'items' ? 'Food Items' : tab === 'categories' ? 'Categories' : 'Sub-Categories'}
+        <div className="flex gap-0 rounded-xl overflow-hidden border border-gray-200 mb-5">
+          {[
+            { id: 'items',      label: `🍴 Items (${foodItems.length})` },
+            { id: 'categories', label: `📂 Categories (${categories.length})` },
+          ].map(tab => (
+            <button key={tab.id} onClick={() => setActiveTab(tab.id)}
+              className={`flex-1 py-2.5 text-sm font-semibold transition
+                ${activeTab === tab.id ? 'bg-orange-500 text-white' : 'bg-white text-gray-500 hover:bg-orange-50'}`}>
+              {tab.label}
             </button>
           ))}
         </div>
 
-        {/* ── Categories Tab ── */}
-        {activeTab === 'categories' && (
-          <div className="bg-white rounded-2xl shadow p-6">
-            <h2 className="font-bold text-gray-700 mb-4">Add Category</h2>
-            <div className="flex gap-3 mb-6">
-              <input type="text" value={newCategory}
-                onChange={e => setNewCategory(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && addCategory()}
-                placeholder="e.g. Starters, Main Course, Drinks"
-                className="flex-1 border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-              <button onClick={addCategory}
-                className="bg-orange-500 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-orange-600">
-                Add
-              </button>
-            </div>
-            <h2 className="font-bold text-gray-700 mb-3">All Categories ({categories.length})</h2>
-            {categories.length === 0 && <p className="text-gray-400 text-sm">No categories yet.</p>}
-            <div className="space-y-2">
-              {categories.map(cat => (
-                <div key={cat.id} className="flex justify-between items-center bg-orange-50 px-4 py-3 rounded-lg">
+        {loading && <div className="text-center py-12 text-gray-400">Loading...</div>}
+
+        {/* ════════════════════════════════════════════════ */}
+        {/* TAB: FOOD ITEMS                                  */}
+        {/* ════════════════════════════════════════════════ */}
+        {!loading && activeTab === 'items' && (
+          <div>
+            {/* Add Item Form */}
+            <div className="bg-white rounded-2xl shadow p-5 mb-5">
+              <h2 className="font-bold text-gray-700 mb-4">➕ Add New Item</h2>
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <span className="text-gray-700 font-medium">{cat.name}</span>
-                    <span className="text-xs text-gray-400 ml-2">
-                      ({subcategories.filter(s => s.parent_id === cat.id).length} subcategories)
-                    </span>
+                    <label className="text-xs text-gray-500 block mb-1">Item Name *</label>
+                    <input type="text" value={newItem.name}
+                      onChange={e => setNewItem(p => ({ ...p, name: e.target.value }))}
+                      placeholder="e.g. Paneer Butter Masala"
+                      className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
                   </div>
-                  <button onClick={() => deleteCategory(cat.id)}
-                    className="text-red-400 hover:text-red-600 text-sm">Delete</button>
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">Price (₹) *</label>
+                    <input type="number" min="0" value={newItem.price}
+                      onChange={e => setNewItem(p => ({ ...p, price: e.target.value }))}
+                      placeholder="0"
+                      className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">Category *</label>
+                    <select value={newItem.category_id}
+                      onChange={e => setNewItem(p => ({ ...p, category_id: e.target.value, subcategory_id: '' }))}
+                      className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
+                      <option value="">Select category</option>
+                      {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">Subcategory</label>
+                    <select value={newItem.subcategory_id}
+                      onChange={e => setNewItem(p => ({ ...p, subcategory_id: e.target.value }))}
+                      disabled={subsForNewItem.length === 0}
+                      className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 disabled:bg-gray-50 disabled:text-gray-400">
+                      <option value="">None</option>
+                      {subsForNewItem.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Description</label>
+                  <textarea value={newItem.description}
+                    onChange={e => setNewItem(p => ({ ...p, description: e.target.value }))}
+                    rows={2} placeholder="Optional description..."
+                    className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Image URL</label>
+                  <input type="text" value={newItem.image_url}
+                    onChange={e => setNewItem(p => ({ ...p, image_url: e.target.value }))}
+                    placeholder="https://..."
+                    className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                </div>
+                <div className="flex items-center gap-3">
+                  <label className="text-sm text-gray-700 font-medium">Available on menu</label>
+                  <button onClick={() => setNewItem(p => ({ ...p, is_available: !p.is_available }))}
+                    className={`w-12 h-6 rounded-full transition ${newItem.is_available ? 'bg-green-500' : 'bg-gray-300'} relative`}>
+                    <div className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-all ${newItem.is_available ? 'left-6' : 'left-0.5'}`} />
+                  </button>
+                </div>
+                <button onClick={addFoodItem} disabled={saving}
+                  className="w-full bg-orange-500 text-white py-3 rounded-xl font-bold hover:bg-orange-600 disabled:opacity-50">
+                  {saving ? 'Adding...' : '➕ Add Item'}
+                </button>
+              </div>
+            </div>
+
+            {/* Filter bar */}
+            <div className="flex gap-2 overflow-x-auto pb-2 mb-4">
+              <button onClick={() => setFilterCat('all')}
+                className={`px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap ${filterCat === 'all' ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
+                All ({foodItems.length})
+              </button>
+              {categories.map(c => {
+                const count = foodItems.filter(i => i.category_id === c.id).length
+                return (
+                  <button key={c.id} onClick={() => setFilterCat(c.id)}
+                    className={`px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap ${filterCat === c.id ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
+                    {c.name} ({count})
+                  </button>
+                )
+              })}
+            </div>
+
+            {/* Item list */}
+            {filteredItems.length === 0 && (
+              <div className="text-center py-12 text-gray-400">
+                <div className="text-4xl mb-2">🍴</div>
+                <p>No items {filterCat !== 'all' ? 'in this category' : 'yet'}</p>
+              </div>
+            )}
+            <div className="space-y-3">
+              {filteredItems.map(item => (
+                <div key={item.id}
+                  className={`bg-white rounded-2xl shadow p-4 flex gap-4 items-start border-l-4 transition
+                    ${item.is_available ? 'border-green-400' : 'border-gray-300 opacity-60'}`}>
+                  {item.image_url
+                    ? <img src={item.image_url} alt={item.name} className="w-16 h-16 rounded-xl object-cover flex-shrink-0" />
+                    : <div className="w-16 h-16 bg-orange-100 rounded-xl flex items-center justify-center text-2xl flex-shrink-0">🍴</div>
+                  }
+                  <div className="flex-1 min-w-0">
+                    <div className="flex justify-between items-start gap-2">
+                      <div>
+                        <p className="font-bold text-gray-800">{item.name}</p>
+                        <div className="flex items-center gap-2 flex-wrap mt-0.5">
+                          <span className="text-xs bg-orange-100 text-orange-600 px-2 py-0.5 rounded-full">
+                            {item.category?.name || 'No category'}
+                          </span>
+                          {item.subcategory?.name && (
+                            <span className="text-xs bg-blue-100 text-blue-600 px-2 py-0.5 rounded-full">
+                              {item.subcategory.name}
+                            </span>
+                          )}
+                          <span className={`text-xs px-2 py-0.5 rounded-full ${item.is_available ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-500'}`}>
+                            {item.is_available ? '✅ Available' : '⛔ Hidden'}
+                          </span>
+                        </div>
+                        {item.description && <p className="text-xs text-gray-400 mt-1 line-clamp-1">{item.description}</p>}
+                      </div>
+                      <p className="font-bold text-orange-500 text-lg flex-shrink-0">₹{item.price}</p>
+                    </div>
+                    <div className="flex gap-2 mt-3 flex-wrap">
+                      <button onClick={() => openEditItem(item)}
+                        className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">
+                        ✏️ Edit
+                      </button>
+                      <button onClick={() => toggleAvailability(item)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium ${item.is_available ? 'bg-yellow-100 text-yellow-700 hover:bg-yellow-200' : 'bg-green-100 text-green-600 hover:bg-green-200'}`}>
+                        {item.is_available ? '⛔ Hide' : '✅ Show'}
+                      </button>
+                      <button onClick={() => deleteFoodItem(item)}
+                        className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200">
+                        🗑️ Delete
+                      </button>
+                    </div>
+                  </div>
                 </div>
               ))}
             </div>
           </div>
         )}
 
-        {/* ── Subcategories Tab ── */}
-        {activeTab === 'subcategories' && (
-          <div className="bg-white rounded-2xl shadow p-6">
-            <h2 className="font-bold text-gray-700 mb-4">Add Sub-Category</h2>
-            <div className="space-y-3 mb-6">
-              <select value={newSubcategoryParent}
-                onChange={e => setNewSubcategoryParent(e.target.value)}
-                className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                <option value="">Select Parent Category</option>
-                {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-              <div className="flex gap-3">
-                <input type="text" value={newSubcategory}
-                  onChange={e => setNewSubcategory(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && addSubcategory()}
-                  placeholder="e.g. Chicken, Veg, Sea Food"
-                  className="flex-1 border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-                <button onClick={addSubcategory}
-                  className="bg-orange-500 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-orange-600">
-                  Add
-                </button>
-              </div>
-            </div>
-            <h2 className="font-bold text-gray-700 mb-3">All Sub-Categories ({subcategories.length})</h2>
-            {categories.map(cat => {
-              const subs = subcategories.filter(s => s.parent_id === cat.id)
-              if (subs.length === 0) return null
-              return (
-                <div key={cat.id} className="mb-4">
-                  <p className="text-xs font-bold text-orange-500 uppercase mb-2">{cat.name}</p>
-                  <div className="space-y-2">
-                    {subs.map(sub => (
-                      <div key={sub.id} className="flex justify-between items-center bg-orange-50 px-4 py-2 rounded-lg">
-                        <span className="text-gray-700 text-sm">{sub.name}</span>
-                        <button onClick={() => deleteCategory(sub.id)}
-                          className="text-red-400 hover:text-red-600 text-xs">Delete</button>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        )}
+        {/* ════════════════════════════════════════════════ */}
+        {/* TAB: CATEGORIES                                  */}
+        {/* ════════════════════════════════════════════════ */}
+        {!loading && activeTab === 'categories' && (
+          <div className="space-y-5">
 
-        {/* ── Food Items Tab ── */}
-        {activeTab === 'items' && (
-          <div className="space-y-6">
-
-            {/* Add Form */}
-            <div className="bg-white rounded-2xl shadow p-6">
-              <div className="flex justify-between items-center mb-4">
-                <h2 className="font-bold text-gray-700">Add Food Item</h2>
-                <button
-                  onClick={() => { setShowCsvModal(true); setCsvDone(false) }}
-                  className="bg-orange-100 text-orange-600 px-4 py-2 rounded-xl text-sm font-medium hover:bg-orange-200 flex items-center gap-2">
-                  📥 Import CSV
-                </button>
-              </div>
-              <div className="space-y-3">
-                <input type="text" value={itemName}
-                  onChange={e => setItemName(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && addFoodItem()}
-                  placeholder="Food name e.g. Paneer Butter Masala"
-                  className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-                <input type="number" value={itemPrice}
-                  onChange={e => setItemPrice(e.target.value)}
-                  placeholder="Price in ₹"
-                  className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-                <textarea value={itemDescription}
-                  onChange={e => setItemDescription(e.target.value)}
-                  placeholder="Short description (optional)"
-                  rows={2}
-                  className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-                <select value={itemCategory}
-                  onChange={e => { setItemCategory(e.target.value); setItemSubcategory('') }}
-                  className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                  <option value="">Select Category</option>
-                  {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                </select>
-                {addFilteredSubcategories.length > 0 && (
-                  <select value={itemSubcategory} onChange={e => setItemSubcategory(e.target.value)}
-                    className="w-full border border-gray-300 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                    <option value="">No Subcategory (optional)</option>
-                    {addFilteredSubcategories.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                  </select>
-                )}
-                <div className="border-2 border-dashed border-orange-200 rounded-lg p-4 text-center">
-                  <label className="cursor-pointer">
-                    <div className="text-3xl mb-1">📷</div>
-                    <p className="text-sm text-gray-500 mb-2">
-                      {itemImage ? itemImage.name : 'Click to upload food image (optional)'}
-                    </p>
-                    <input type="file" accept="image/*" className="hidden"
-                      onChange={e => setItemImage(e.target.files[0])} />
-                    <span className="text-xs text-orange-400 underline">Browse file</span>
-                  </label>
-                </div>
-                <button onClick={addFoodItem} disabled={loading}
-                  className="w-full bg-orange-500 text-white py-3 rounded-lg font-semibold hover:bg-orange-600 transition disabled:opacity-50">
-                  {loading ? 'Adding...' : '+ Add Food Item'}
-                </button>
-              </div>
-            </div>
-
-            {/* Search & Filter */}
+            {/* ── Main Categories ─────────────────────── */}
             <div className="bg-white rounded-2xl shadow p-5">
-              <h2 className="font-bold text-gray-700 mb-3">🔍 Search & Filter</h2>
-              <div className="space-y-3">
-                <input type="text" value={searchQuery}
-                  onChange={e => setSearchQuery(e.target.value)}
-                  placeholder="Search by item name..."
-                  className="w-full border border-gray-200 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50" />
-                <div className="flex gap-3 flex-wrap">
-                  <select value={filterCategory}
-                    onChange={e => { setFilterCategory(e.target.value); setFilterSubcategory('') }}
-                    className="flex-1 border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                    <option value="">All Categories</option>
-                    {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                  </select>
-                  {filteredSubcategories.length > 0 && (
-                    <select value={filterSubcategory}
-                      onChange={e => setFilterSubcategory(e.target.value)}
-                      className="flex-1 border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                      <option value="">All Subcategories</option>
-                      {filteredSubcategories.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                    </select>
-                  )}
-                  {(filterCategory || filterSubcategory || searchQuery) && (
-                    <button
-                      onClick={() => { setFilterCategory(''); setFilterSubcategory(''); setSearchQuery('') }}
-                      className="bg-gray-100 text-gray-500 px-4 py-2 rounded-lg text-sm hover:bg-gray-200">
-                      ✕ Clear
-                    </button>
-                  )}
-                </div>
-                <p className="text-xs text-gray-400">
-                  Showing {filteredItems.length} of {foodItems.length} items
-                </p>
-              </div>
-            </div>
+              <h2 className="font-bold text-gray-700 mb-4">📂 Main Categories</h2>
 
-            {/* Items List */}
-            <div className="bg-white rounded-2xl shadow p-6">
-              <h2 className="font-bold text-gray-700 mb-4">All Food Items ({filteredItems.length})</h2>
-              {filteredItems.length === 0 && <p className="text-gray-400 text-sm">No items found.</p>}
-              <div className="space-y-3">
-                {filteredItems.map(item => (
-                  <div key={item.id} className="flex items-center gap-4 border border-gray-100 rounded-xl p-3">
-                    {item.image_url ? (
-                      <img src={item.image_url} alt={item.name}
-                        className="w-14 h-14 rounded-lg object-cover flex-shrink-0" />
-                    ) : (
-                      <div className="w-14 h-14 bg-orange-100 rounded-lg flex items-center justify-center text-2xl flex-shrink-0">🍴</div>
-                    )}
-                    <div className="flex-1 min-w-0">
-                      <p className="font-semibold text-gray-700">{item.name}</p>
-                      <p className="text-sm text-gray-400">
-                        {item.categories?.name}
-                        {item.subcategory?.name && ` › ${item.subcategory.name}`}
-                        {' • '}₹{item.price}
-                      </p>
-                      {item.description && (
-                        <p className="text-xs text-gray-400 mt-0.5 truncate">{item.description}</p>
+              {/* Add */}
+              <div className="flex gap-2 mb-5">
+                <input type="text" value={newCatName} onChange={e => setNewCatName(e.target.value)}
+                  placeholder="New category name..."
+                  onKeyDown={e => e.key === 'Enter' && addCategory()}
+                  className="flex-1 border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                <button onClick={addCategory} disabled={saving}
+                  className="bg-orange-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-orange-600 disabled:opacity-50">
+                  {saving ? '...' : '+ Add'}
+                </button>
+              </div>
+
+              {categories.length === 0 && (
+                <div className="text-center py-6 text-gray-400 text-sm">No categories yet</div>
+              )}
+
+              <div className="space-y-2">
+                {categories.map(cat => {
+                  const itemCount = foodItems.filter(i => i.category_id === cat.id).length
+                  const subCount  = subcategories.filter(s => s.parent_category_id === cat.id).length
+                  const isEditing = editCatId === cat.id
+                  return (
+                    <div key={cat.id} className="border border-gray-100 rounded-xl overflow-hidden">
+                      {isEditing ? (
+                        <div className="p-3 bg-orange-50 flex gap-2">
+                          <input type="text" value={editCatName} onChange={e => setEditCatName(e.target.value)}
+                            onKeyDown={e => e.key === 'Enter' && saveEditCategory()}
+                            className="flex-1 border border-orange-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                          <button onClick={saveEditCategory} disabled={saving} className="bg-orange-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold disabled:opacity-50">Save</button>
+                          <button onClick={() => { setEditCatId(null); setEditCatName('') }} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-xs">Cancel</button>
+                        </div>
+                      ) : (
+                        <div className="p-3 flex justify-between items-center">
+                          <div>
+                            <p className="font-semibold text-gray-800">{cat.name}</p>
+                            <p className="text-xs text-gray-400 mt-0.5">
+                              {itemCount} item{itemCount !== 1 ? 's' : ''}
+                              {subCount > 0 ? ` · ${subCount} subcategory/ies` : ''}
+                            </p>
+                          </div>
+                          <div className="flex gap-2">
+                            <button onClick={() => { setEditCatId(cat.id); setEditCatName(cat.name) }}
+                              className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">
+                              ✏️
+                            </button>
+                            <button onClick={() => deleteCategory(cat)}
+                              disabled={saving}
+                              className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200 disabled:opacity-50">
+                              🗑️
+                            </button>
+                          </div>
+                        </div>
                       )}
                     </div>
-                    <div className="flex flex-col items-end gap-2 flex-shrink-0">
-                      <button onClick={() => toggleAvailable(item.id, item.is_available)}
-                        className={`text-xs px-3 py-1 rounded-full font-medium
-                          ${item.is_available ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-400'}`}>
-                        {item.is_available ? '✅ Listed' : '❌ Delisted'}
-                      </button>
-                      <button onClick={() => openEdit(item)}
-                        className="text-xs bg-orange-100 text-orange-600 px-3 py-1 rounded-full font-medium hover:bg-orange-200">
-                        ✏️ Edit
-                      </button>
-                      <button onClick={() => deleteFoodItem(item.id)}
-                        className="text-red-400 hover:text-red-600 text-xs">Delete</button>
-                    </div>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             </div>
+
+            {/* ── Subcategories ────────────────────────── */}
+            <div className="bg-white rounded-2xl shadow p-5">
+              <h2 className="font-bold text-gray-700 mb-4">📁 Subcategories</h2>
+
+              {categories.length === 0 && (
+                <div className="bg-yellow-50 border border-yellow-200 rounded-xl px-4 py-3 mb-4">
+                  <p className="text-xs text-yellow-700">⚠️ Add at least one main category first before adding subcategories.</p>
+                </div>
+              )}
+
+              {/* Add */}
+              {categories.length > 0 && (
+                <div className="space-y-2 mb-5">
+                  <input type="text" value={newSubName} onChange={e => setNewSubName(e.target.value)}
+                    placeholder="New subcategory name..."
+                    className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
+                  <div className="flex gap-2">
+                    <select value={newSubParent} onChange={e => setNewSubParent(e.target.value)}
+                      className="flex-1 border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
+                      <option value="">Select parent category</option>
+                      {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                    </select>
+                    <button onClick={addSubcategory} disabled={saving}
+                      className="bg-orange-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-orange-600 disabled:opacity-50">
+                      {saving ? '...' : '+ Add'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {subcategories.length === 0 && (
+                <div className="text-center py-6 text-gray-400 text-sm">No subcategories yet</div>
+              )}
+
+              {/* Group by parent */}
+              {categories.map(cat => {
+                const subs = subcategories.filter(s => s.parent_category_id === cat.id)
+                if (subs.length === 0) return null
+                return (
+                  <div key={cat.id} className="mb-4">
+                    <p className="text-xs font-bold text-gray-500 uppercase mb-2 px-1">📂 {cat.name}</p>
+                    <div className="space-y-2">
+                      {subs.map(sub => {
+                        const itemCount = foodItems.filter(i => i.subcategory_id === sub.id).length
+                        const isEditing = editSubId === sub.id
+                        return (
+                          <div key={sub.id} className="border border-gray-100 rounded-xl overflow-hidden ml-3">
+                            {isEditing ? (
+                              <div className="p-3 bg-blue-50 space-y-2">
+                                <input type="text" value={editSubName} onChange={e => setEditSubName(e.target.value)}
+                                  className="w-full border border-blue-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
+                                <div className="flex gap-2">
+                                  <select value={editSubParent} onChange={e => setEditSubParent(e.target.value)}
+                                    className="flex-1 border border-blue-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none">
+                                    {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                                  </select>
+                                  <button onClick={saveEditSubcategory} disabled={saving} className="bg-blue-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold disabled:opacity-50">Save</button>
+                                  <button onClick={() => { setEditSubId(null); setEditSubName(''); setEditSubParent('') }} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-xs">Cancel</button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="p-3 flex justify-between items-center">
+                                <div>
+                                  <p className="font-medium text-gray-700 text-sm">↳ {sub.name}</p>
+                                  <p className="text-xs text-gray-400 mt-0.5">{itemCount} item{itemCount !== 1 ? 's' : ''}</p>
+                                </div>
+                                <div className="flex gap-2">
+                                  <button onClick={() => { setEditSubId(sub.id); setEditSubName(sub.name); setEditSubParent(sub.parent_category_id) }}
+                                    className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">✏️</button>
+                                  <button onClick={() => deleteSubcategory(sub)} disabled={saving}
+                                    className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200 disabled:opacity-50">🗑️</button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )
+              })}
+
+              {/* Orphaned subcategories (no parent match) */}
+              {(() => {
+                const orphans = subcategories.filter(s => !categories.find(c => c.id === s.parent_category_id))
+                if (!orphans.length) return null
+                return (
+                  <div className="mt-4">
+                    <p className="text-xs font-bold text-red-500 uppercase mb-2 px-1">⚠️ Orphaned (parent deleted)</p>
+                    <div className="space-y-2">
+                      {orphans.map(sub => (
+                        <div key={sub.id} className="border border-red-100 rounded-xl p-3 flex justify-between items-center bg-red-50 ml-3">
+                          <p className="text-sm text-red-600">{sub.name}</p>
+                          <button onClick={() => deleteSubcategory(sub)} disabled={saving}
+                            className="bg-red-200 text-red-700 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-300 disabled:opacity-50">🗑️ Delete</button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )
+              })()}
+            </div>
+
+            {/* Info box */}
+            <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4">
+              <p className="text-xs text-blue-700 font-medium mb-1">ℹ️ Why can't I delete a category?</p>
+              <p className="text-xs text-blue-600">
+                A category or subcategory cannot be deleted if any menu items are still assigned to it.
+                Go to the <strong>Items</strong> tab, filter by that category, and either delete or reassign those items first.
+              </p>
+            </div>
+
           </div>
         )}
       </div>
