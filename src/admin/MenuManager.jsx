@@ -3,6 +3,9 @@ import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 import * as XLSX from 'xlsx'
 
+// Allowed kitchen/production departments (matches DB column `department` on food_items)
+const DEPARTMENTS = ['Kitchen', 'Beverage', 'Liquor', 'Tandoor']
+
 export default function MenuManager() {
   const navigate = useNavigate()
 
@@ -11,6 +14,7 @@ export default function MenuManager() {
   const [subcategories, setSubcategories] = useState([])
   const [foodItems, setFoodItems] = useState([])
   const [filterCat, setFilterCat] = useState('all')
+  const [filterDept, setFilterDept] = useState('all')
   const [activeTab, setActiveTab] = useState('items')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -29,7 +33,7 @@ export default function MenuManager() {
   // Item forms
   const [newItem, setNewItem] = useState({
     name: '', price: '', category_id: '', subcategory_id: '',
-    description: '', is_available: true, image_url: ''
+    description: '', is_available: true, image_url: '', department: ''
   })
   const [editItem, setEditItem] = useState(null)
 
@@ -169,10 +173,11 @@ export default function MenuManager() {
       description: newItem.description.trim() || null,
       is_available: newItem.is_available,
       image_url: newItem.image_url.trim() || null,
+      department: newItem.department || null,
     })
     setSaving(false)
     if (error) { showMsg('Error adding item: ' + error.message, 'error'); return }
-    setNewItem({ name: '', price: '', category_id: '', subcategory_id: '', description: '', is_available: true, image_url: '' })
+    setNewItem({ name: '', price: '', category_id: '', subcategory_id: '', description: '', is_available: true, image_url: '', department: '' })
     showMsg(`"${name}" added ✅`); fetchAll()
   }
 
@@ -183,6 +188,7 @@ export default function MenuManager() {
     description: item.description || '',
     is_available: item.is_available,
     image_url: item.image_url || '',
+    department: item.department || '',
   })
 
   const saveEditItem = async () => {
@@ -199,6 +205,7 @@ export default function MenuManager() {
       description: editItem.description.trim() || null,
       is_available: editItem.is_available,
       image_url: editItem.image_url.trim() || null,
+      department: editItem.department || null,
     }).eq('id', editItem.id)
     setSaving(false)
     if (error) { showMsg('Error updating item: ' + error.message, 'error'); return }
@@ -226,7 +233,10 @@ export default function MenuManager() {
   }
 
   // ── Bulk operations ───────────────────────────────────────
-  const filteredItems = filterCat === 'all' ? foodItems : foodItems.filter(i => i.category_id === filterCat)
+  const filteredItems = foodItems.filter(i =>
+    (filterCat === 'all' || i.category_id === filterCat) &&
+    (filterDept === 'all' || i.department === filterDept)
+  )
   const allFilteredIds = filteredItems.map(i => i.id)
   const allSelected = allFilteredIds.length > 0 && allFilteredIds.every(id => selectedIds.has(id))
   const someSelected = selectedIds.size > 0
@@ -259,6 +269,18 @@ export default function MenuManager() {
     fetchAll()
   }
 
+  const bulkSetDepartment = async (department) => {
+    if (selectedIds.size === 0) return
+    setBulkLoading(true)
+    const ids = [...selectedIds]
+    const { error } = await supabase.from('food_items')
+      .update({ department }).in('id', ids)
+    setBulkLoading(false)
+    if (error) { showMsg('Bulk update error: ' + error.message, 'error'); return }
+    showMsg(`${ids.length} item(s) set to ${department} ✅`)
+    fetchAll()
+  }
+
   const bulkDelete = async () => {
     if (selectedIds.size === 0) return
     const ids = [...selectedIds]
@@ -276,11 +298,18 @@ export default function MenuManager() {
   }
 
   // ── Excel Upload ──────────────────────────────────────────
-  // Required format (columns A–E):
-  //   A: Category   B: Subcategory   C: Item Name   D: Description   E: Price
+  // Required format (columns A–E), Department (F) is optional:
+  //   A: Category   B: Subcategory   C: Item Name   D: Description   E: Price   F: Department
   // Row 1 must be the header row with exactly these labels.
 
   const REQUIRED_HEADERS = ['category', 'subcategory', 'item name', 'description', 'price']
+
+  const normalizeDepartment = (raw) => {
+    const val = String(raw || '').trim()
+    if (!val) return null
+    const match = DEPARTMENTS.find(d => d.toLowerCase() === val.toLowerCase())
+    return match || null
+  }
 
   const handleExcelFile = (e) => {
     const file = e.target.files[0]
@@ -311,6 +340,7 @@ export default function MenuManager() {
             '  C: Item Name',
             '  D: Description',
             '  E: Price',
+            '  F: Department (optional — Kitchen / Beverage / Liquor / Tandoor)',
           ]); return
         }
 
@@ -321,6 +351,7 @@ export default function MenuManager() {
         const nameIdx = ci('item name')
         const descIdx = ci('description')
         const priceIdx = ci('price')
+        const deptIdx = ci('department') // -1 if column not present — that's fine, it's optional
 
         const errors = []
         const parsed = []
@@ -332,6 +363,8 @@ export default function MenuManager() {
           const name  = String(row[nameIdx] || '').trim()
           const desc  = String(row[descIdx] || '').trim()
           const price = parseFloat(row[priceIdx])
+          const deptRaw = deptIdx >= 0 ? row[deptIdx] : ''
+          const department = normalizeDepartment(deptRaw)
 
           if (!cat && !name && !price) return // skip fully empty rows
 
@@ -339,9 +372,11 @@ export default function MenuManager() {
           if (!name) errors.push(`Row ${rowNum}: Item Name is required`)
           if (!price || isNaN(price) || price <= 0)
             errors.push(`Row ${rowNum}: Price must be a positive number (got "${row[priceIdx]}")`)
+          if (deptRaw && !department)
+            errors.push(`Row ${rowNum}: Department "${deptRaw}" is invalid — must be one of ${DEPARTMENTS.join(', ')}`)
 
           if (cat && name && price > 0) {
-            parsed.push({ rowNum, category: cat, subcategory: sub, name, description: desc, price })
+            parsed.push({ rowNum, category: cat, subcategory: sub, name, description: desc, price, department })
           }
         })
 
@@ -409,6 +444,7 @@ export default function MenuManager() {
           subcategory_id: subId,
           description: row.description || null,
           is_available: true,
+          department: row.department || null,
         })
         if (itemErr) { rowErrors.push(`Row ${row.rowNum} "${row.name}": ${itemErr.message}`); skipped++; continue }
         added++
@@ -431,14 +467,14 @@ export default function MenuManager() {
   // Download sample Excel template
   const downloadTemplate = () => {
     const ws = XLSX.utils.aoa_to_sheet([
-      ['Category', 'Subcategory', 'Item Name', 'Description', 'Price'],
-      ['Beverages', 'Cold Drinks', 'Cold Coffee', 'Chilled cold coffee with milk', 150],
-      ['Beverages', 'Cold Drinks', 'Frappe Mocha', 'Mocha frappe with cream', 190],
-      ['Beverages', 'Fresh Juices', 'Fresh Pineapple Juice', 'Freshly squeezed pineapple', 150],
-      ['Starters', '', 'Paneer Tikka', 'Grilled paneer with spices', 220],
-      ['Main Course', 'Veg', 'Paneer Butter Masala', 'Rich paneer curry', 280],
+      ['Category', 'Subcategory', 'Item Name', 'Description', 'Price', 'Department'],
+      ['Beverages', 'Cold Drinks', 'Cold Coffee', 'Chilled cold coffee with milk', 150, 'Beverage'],
+      ['Beverages', 'Cold Drinks', 'Frappe Mocha', 'Mocha frappe with cream', 190, 'Beverage'],
+      ['Beverages', 'Fresh Juices', 'Fresh Pineapple Juice', 'Freshly squeezed pineapple', 150, 'Beverage'],
+      ['Starters', '', 'Paneer Tikka', 'Grilled paneer with spices', 220, 'Tandoor'],
+      ['Main Course', 'Veg', 'Paneer Butter Masala', 'Rich paneer curry', 280, 'Kitchen'],
     ])
-    ws['!cols'] = [{ wch: 18 }, { wch: 18 }, { wch: 22 }, { wch: 35 }, { wch: 10 }]
+    ws['!cols'] = [{ wch: 18 }, { wch: 18 }, { wch: 22 }, { wch: 35 }, { wch: 10 }, { wch: 12 }]
     const wb = XLSX.utils.book_new()
     XLSX.utils.book_append_sheet(wb, ws, 'Menu')
     XLSX.writeFile(wb, 'menu_template.xlsx')
@@ -448,6 +484,17 @@ export default function MenuManager() {
   const subsForCatId = (catId) => subcategories.filter(s => s.parent_id === catId)
   const subsForNewItem  = newItem.category_id  ? subsForCatId(newItem.category_id)  : []
   const subsForEditItem = editItem?.category_id ? subsForCatId(editItem.category_id) : []
+
+  // Small helper to color-code department badges
+  const deptBadgeClass = (dept) => {
+    switch (dept) {
+      case 'Kitchen':  return 'bg-orange-100 text-orange-700'
+      case 'Beverage': return 'bg-cyan-100 text-cyan-700'
+      case 'Liquor':   return 'bg-purple-100 text-purple-700'
+      case 'Tandoor':  return 'bg-red-100 text-red-700'
+      default:         return 'bg-gray-100 text-gray-400'
+    }
+  }
 
   // ── Render ────────────────────────────────────────────────
   return (
@@ -498,6 +545,14 @@ export default function MenuManager() {
                   </select>
                 </div>
               )}
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Department (kitchen station)</label>
+                <select value={editItem.department} onChange={e => setEditItem(p => ({ ...p, department: e.target.value }))}
+                  className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
+                  <option value="">None</option>
+                  {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+                </select>
+              </div>
               <div>
                 <label className="text-xs text-gray-500 block mb-1">Description</label>
                 <textarea value={editItem.description} onChange={e => setEditItem(p => ({ ...p, description: e.target.value }))}
@@ -550,16 +605,16 @@ export default function MenuManager() {
                     <table className="text-xs w-full border-collapse">
                       <thead>
                         <tr className="bg-blue-100">
-                          {['A: Category *', 'B: Subcategory', 'C: Item Name *', 'D: Description', 'E: Price *'].map(h => (
+                          {['A: Category *', 'B: Subcategory', 'C: Item Name *', 'D: Description', 'E: Price *', 'F: Department'].map(h => (
                             <th key={h} className="border border-blue-200 px-2 py-1 text-blue-700 text-left whitespace-nowrap">{h}</th>
                           ))}
                         </tr>
                       </thead>
                       <tbody>
                         {[
-                          ['Beverages', 'Cold Drinks', 'Cold Coffee', 'Chilled with milk', '150'],
-                          ['Beverages', 'Fresh Juices', 'Pineapple Juice', 'Freshly squeezed', '150'],
-                          ['Starters', '', 'Paneer Tikka', 'Grilled paneer', '220'],
+                          ['Beverages', 'Cold Drinks', 'Cold Coffee', 'Chilled with milk', '150', 'Beverage'],
+                          ['Beverages', 'Fresh Juices', 'Pineapple Juice', 'Freshly squeezed', '150', 'Beverage'],
+                          ['Starters', '', 'Paneer Tikka', 'Grilled paneer', '220', 'Tandoor'],
                         ].map((row, i) => (
                           <tr key={i} className="bg-white">
                             {row.map((cell, j) => (
@@ -570,10 +625,12 @@ export default function MenuManager() {
                       </tbody>
                     </table>
                   </div>
-                  <div className="flex items-center gap-2 mt-3">
+                  <div className="flex items-center gap-2 mt-3 flex-wrap">
                     <span className="text-xs text-blue-600">* = required column</span>
                     <span className="text-blue-300">·</span>
                     <span className="text-xs text-blue-600">Subcategory can be blank</span>
+                    <span className="text-blue-300">·</span>
+                    <span className="text-xs text-blue-600">Department is optional: {DEPARTMENTS.join(', ')}</span>
                     <span className="text-blue-300">·</span>
                     <span className="text-xs text-blue-600">Duplicate items are skipped</span>
                   </div>
@@ -621,7 +678,7 @@ export default function MenuManager() {
                     <table className="w-full text-xs">
                       <thead className="bg-gray-50">
                         <tr>
-                          {['Row', 'Category', 'Subcategory', 'Item Name', 'Description', 'Price'].map(h => (
+                          {['Row', 'Category', 'Subcategory', 'Item Name', 'Description', 'Price', 'Department'].map(h => (
                             <th key={h} className="px-3 py-2 text-left text-gray-500 font-semibold whitespace-nowrap">{h}</th>
                           ))}
                         </tr>
@@ -635,6 +692,7 @@ export default function MenuManager() {
                             <td className="px-3 py-2 font-medium text-gray-800">{row.name}</td>
                             <td className="px-3 py-2 text-gray-500 max-w-[160px] truncate">{row.description || <span className="text-gray-300">—</span>}</td>
                             <td className="px-3 py-2 font-bold text-green-600">₹{row.price}</td>
+                            <td className="px-3 py-2 text-purple-600">{row.department || <span className="text-gray-300">—</span>}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -770,6 +828,15 @@ export default function MenuManager() {
                   </div>
                 </div>
                 <div>
+                  <label className="text-xs text-gray-500 block mb-1">Department (kitchen station)</label>
+                  <select value={newItem.department}
+                    onChange={e => setNewItem(p => ({ ...p, department: e.target.value }))}
+                    className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
+                    <option value="">None</option>
+                    {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+                  </select>
+                </div>
+                <div>
                   <label className="text-xs text-gray-500 block mb-1">Description</label>
                   <textarea value={newItem.description}
                     onChange={e => setNewItem(p => ({ ...p, description: e.target.value }))}
@@ -797,8 +864,8 @@ export default function MenuManager() {
               </div>
             </div>
 
-            {/* Filter bar */}
-            <div className="flex gap-2 overflow-x-auto pb-2 mb-3">
+            {/* Filter bar — category */}
+            <div className="flex gap-2 overflow-x-auto pb-2 mb-2">
               <button onClick={() => setFilterCat('all')}
                 className={`px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap flex-shrink-0 ${filterCat === 'all' ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
                 All ({foodItems.length})
@@ -809,6 +876,23 @@ export default function MenuManager() {
                   <button key={c.id} onClick={() => setFilterCat(c.id)}
                     className={`px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap flex-shrink-0 ${filterCat === c.id ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
                     {c.name} ({count})
+                  </button>
+                )
+              })}
+            </div>
+
+            {/* Filter bar — department */}
+            <div className="flex gap-2 overflow-x-auto pb-2 mb-3">
+              <button onClick={() => setFilterDept('all')}
+                className={`px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap flex-shrink-0 ${filterDept === 'all' ? 'bg-purple-500 text-white' : 'bg-purple-100 text-purple-600'}`}>
+                All Departments
+              </button>
+              {DEPARTMENTS.map(d => {
+                const count = foodItems.filter(i => i.department === d).length
+                return (
+                  <button key={d} onClick={() => setFilterDept(d)}
+                    className={`px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap flex-shrink-0 ${filterDept === d ? 'bg-purple-500 text-white' : 'bg-purple-100 text-purple-600'}`}>
+                    {d} ({count})
                   </button>
                 )
               })}
@@ -838,6 +922,12 @@ export default function MenuManager() {
                     className="bg-yellow-100 text-yellow-700 px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-yellow-200 disabled:opacity-50">
                     ⛔ Hide All
                   </button>
+                  <select onChange={e => { if (e.target.value) { bulkSetDepartment(e.target.value); e.target.value = '' } }}
+                    disabled={bulkLoading} defaultValue=""
+                    className="bg-purple-100 text-purple-700 px-3 py-1.5 rounded-lg text-xs font-semibold border-none focus:outline-none disabled:opacity-50">
+                    <option value="" disabled>🏷️ Set Department...</option>
+                    {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+                  </select>
                   <button onClick={bulkDelete} disabled={bulkLoading}
                     className="bg-red-100 text-red-600 px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-red-200 disabled:opacity-50">
                     🗑️ Delete All
@@ -855,7 +945,7 @@ export default function MenuManager() {
             {filteredItems.length === 0 && (
               <div className="text-center py-12 text-gray-400">
                 <div className="text-4xl mb-2">🍴</div>
-                <p>No items {filterCat !== 'all' ? 'in this category' : 'yet'}</p>
+                <p>No items {filterCat !== 'all' || filterDept !== 'all' ? 'match this filter' : 'yet'}</p>
               </div>
             )}
             <div className="space-y-2">
@@ -889,6 +979,11 @@ export default function MenuManager() {
                             {item.subcategory?.name && (
                               <span className="text-xs bg-blue-100 text-blue-600 px-2 py-0.5 rounded-full">
                                 {item.subcategory.name}
+                              </span>
+                            )}
+                            {item.department && (
+                              <span className={`text-xs px-2 py-0.5 rounded-full ${deptBadgeClass(item.department)}`}>
+                                {item.department}
                               </span>
                             )}
                             <span className={`text-xs px-2 py-0.5 rounded-full ${item.is_available ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-500'}`}>
