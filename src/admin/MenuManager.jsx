@@ -15,7 +15,7 @@ const DEPARTMENTS = ['Kitchen', 'Beverage', 'Liquor', 'Tandoor']
 // Name: menu-images   |   Public bucket: ON
 const IMAGE_BUCKET = 'menu-images'
 
-export default function MenuManager() {
+{
   const navigate = useNavigate()
 
   // ── State ─────────────────────────────────────────────────
