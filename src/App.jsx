@@ -17,15 +17,15 @@ function App() {
       <Routes>
         <Route path="/" element={<Login />} />
         <Route path="/admin" element={<Login />} />
-        <Route path="/admin/dashboard" element={<Dashboard />} />
-        <Route path="/admin/menu" element={<MenuManager />} />
-        <Route path="/admin/tables" element={<TableManager />} />
-        <Route path="/admin/today-report" element={<TodayReport />} />
-        <Route path="/admin/reports" element={<Reports />} />
-        <Route path="/admin/settings" element={<Settings />} />
+        <Route path="/admin/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
+        <Route path="/admin/menu" element={<ProtectedRoute><MenuManager /></ProtectedRoute>} />
+        <Route path="/admin/tables" element={<ProtectedRoute><TableManager /></ProtectedRoute>} />
+        <Route path="/admin/today-report" element={<ProtectedRoute><TodayReport /></ProtectedRoute>} />
+        <Route path="/admin/reports" element={<ProtectedRoute><Reports /></ProtectedRoute>} />
+        <Route path="/admin/settings" element={<ProtectedRoute><Settings /></ProtectedRoute>} />
         <Route path="/menu" element={<MenuPage />} />
         <Route path="/order-confirmation" element={<OrderConfirmation />} />
-        <Route path="/admin/admin-code" element={<AdminCode />} />
+        <Route path="/admin/admin-code" element={<ProtectedRoute><AdminCode /></ProtectedRoute>} />
       </Routes>
     </BrowserRouter>
   )
