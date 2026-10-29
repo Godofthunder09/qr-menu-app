@@ -758,7 +758,7 @@ export default function Reports() {
       <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30 print:hidden">
         <div className="flex items-center gap-3">
           <span className="text-xl">📊</span>
-          <button onClick={() => navigate('/admin/AdminCode')}
+          <button onClick={() => navigate('src/admin/AdminCode.jsx')}
           <h1 className="text-lg font-bold text-orange-500">Reports</h1></button>
         </div>
         <button onClick={() => navigate('/admin/dashboard')}
