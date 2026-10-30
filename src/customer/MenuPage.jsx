@@ -2,7 +2,7 @@
 // Replace your existing MenuPage.jsx with this file.
 // "My Orders" tab removed — replaced with 📋 Orders button in header.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 import { useOrderSummary } from './useOrderSummary'
@@ -12,7 +12,7 @@ export default function MenuPage() {
   const tableId = searchParams.get('table')
 
   const [tableName, setTableName]           = useState('')
-  const [sessionVersion, setSessionVersion] = useState(null)
+  const [, setSessionVersion]               = useState(null)
   const [categories, setCategories]         = useState([])
   const [foodItems, setFoodItems]           = useState([])
   const [activeCategory, setActiveCategory] = useState('all')
@@ -32,6 +32,7 @@ export default function MenuPage() {
   const [pinError, setPinError]             = useState('')
   const [pinVerified, setPinVerified]       = useState(false)
   const navigate = useNavigate()
+  const placingRef = useRef(false) // blocks double taps instantly (state updates are too slow)
 
   const { orderSummary, loadOrderSummary, saveCartToSummary, clearSummary } = useOrderSummary()
 
@@ -154,45 +155,67 @@ export default function MenuPage() {
 
   // ── Place order ────────────────────────────────────────────
   const placeOrder = async () => {
+    if (placingRef.current) return            // OR_09: ignore taps while an order is in progress
     if (!cart.length) { alert('Add items first!'); return }
+    placingRef.current = true
     setPlacing(true)
 
-    const { data: tbl } = await supabase
-      .from('tables').select('session_version').eq('id', tableId).single()
-    const ver = tbl?.session_version || sessionVersion
-    if (!ver) { alert('Session error. Please refresh.'); setPlacing(false); return }
-    setSessionVersion(ver)
+    try {
+      const { data: tbl } = await supabase
+        .from('tables').select('session_version').eq('id', tableId).single()
+      if (!tbl) { alert('Table not found. Please scan the QR code again.'); return }
 
-    // 1. Create order
-    const { data: order, error: orderErr } = await supabase
-      .from('orders')
-      .insert({ table_id: tableId, status: 'pending', session_id: `${tableId}_${ver}` })
-      .select().single()
+      // OC_05: the customer's OWN session must match the table's current session.
+      // If the admin cleared the table (or changed the PIN) in the meantime, stop here.
+      let myVersion = null
+      try { myVersion = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null')?.version ?? null } catch { /* ignore */ }
+      if (myVersion === null || myVersion !== tbl.session_version) {
+        clearLocalData()
+        setPinVerified(false); setPinInput(''); setPinError(''); setPinPhase(true)
+        alert('This table was reset. Please enter the new PIN to order.')
+        return
+      }
+      const ver = tbl.session_version
+      setSessionVersion(ver)
 
-    if (orderErr) { alert('Error placing order: ' + orderErr.message); setPlacing(false); return }
+      // 1. Create order
+      const { data: order, error: orderErr } = await supabase
+        .from('orders')
+        .insert({ table_id: tableId, status: 'pending', session_id: `${tableId}_${ver}` })
+        .select().single()
+      if (orderErr) { alert('Error placing order: ' + orderErr.message); return }
 
-    // 2. Insert order_items
-    const { error: itemsErr } = await supabase.from('order_items').insert(
-      cart.map(i => ({
-        order_id:       order.id,
-        food_item_id:   i.id,
-        quantity:       i.quantity,
-        price_at_order: i.price,
-        note:           i.note || ''
-      }))
-    )
-    if (itemsErr) { alert('Error saving items: ' + itemsErr.message); setPlacing(false); return }
+      // 2. Insert order_items
+      const { error: itemsErr } = await supabase.from('order_items').insert(
+        cart.map(i => ({
+          order_id:       order.id,
+          food_item_id:   i.id,
+          quantity:       i.quantity,
+          price_at_order: i.price,
+          note:           i.note || ''
+        }))
+      )
+      if (itemsErr) {
+        // OR_09: don't leave an empty order behind on the admin dashboard
+        const { error: rollbackErr } = await supabase.from('orders').delete().eq('id', order.id)
+        if (rollbackErr) console.error('Could not remove incomplete order:', rollbackErr.message)
+        alert('Error saving items: ' + itemsErr.message + '\nYour order was not placed. Please try again.')
+        return
+      }
 
-    // 3. Save to table_order_summary (powers the Orders drawer)
-    await saveCartToSummary(tableId, ver, cart)
+      // 3. Save to table_order_summary (powers the Orders drawer)
+      await saveCartToSummary(tableId, ver, cart)
 
-    // 4. Reload summary so badges update
-    await loadOrderSummary(tableId, ver)
+      // 4. Reload summary so badges update
+      await loadOrderSummary(tableId, ver)
 
-    setCart([])
-    setShowCart(false)
-    setPlacing(false)
-    navigate(`/order-confirmation?table=${tableId}&name=${tableName}`)
+      setCart([])
+      setShowCart(false)
+      navigate(`/order-confirmation?table=${tableId}&name=${tableName}`)
+    } finally {
+      placingRef.current = false
+      setPlacing(false)
+    }
   }
 
   // ── Cart helpers ───────────────────────────────────────────
