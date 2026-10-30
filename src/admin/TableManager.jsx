@@ -44,8 +44,24 @@ export default function TableManager() {
   }
 
   const regeneratePin = async (tableId) => {
+    if (!window.confirm(
+      'Generate a new PIN?\n\nCustomers currently using this table will be logged out and must enter the new PIN. Their unpaid orders stay on the bill.'
+    )) return
+
     const newPin = generatePin()
-    await supabase.from('tables').update({ pin: newPin }).eq('id', tableId)
+
+    // Bump session_version too, so devices that already entered the OLD PIN
+    // are sent back to the PIN screen (the customer page checks this every 5s).
+    const { data: tbl, error: readErr } = await supabase
+      .from('tables').select('session_version').eq('id', tableId).single()
+    if (readErr) { alert('Error: ' + readErr.message); return }
+
+    const { error } = await supabase
+      .from('tables')
+      .update({ pin: newPin, session_version: (tbl?.session_version || 1) + 1 })
+      .eq('id', tableId)
+    if (error) { alert('Error: ' + error.message); return }
+
     setMessage('New PIN generated! ✅')
     setTimeout(() => setMessage(''), 2000)
     fetchTables()
