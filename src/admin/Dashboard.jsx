@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
+import { sanitizeDiscountValue, calcDiscountAmount, clampDiscountInput } from '../utils/billing'
 
 const toIST = (d) => new Date(d).toLocaleTimeString('en-IN', {
   timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true
@@ -99,7 +100,7 @@ export default function Dashboard() {
   const [allFoodItems, setAllFoodItems] = useState([])
   const [menuSearch, setMenuSearch] = useState('')
 
-  // ── itemQtyOverrides — keyed by the REAL order_items row id ─────────
+  // â”€â”€ itemQtyOverrides â€” keyed by the REAL order_items row id â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const [itemQtyOverrides, setItemQtyOverrides] = useState({})
 
   const [manualItems, setManualItems] = useState([])
@@ -109,7 +110,7 @@ export default function Dashboard() {
   const [openPrice, setOpenPrice] = useState('')
   const [openQty, setOpenQty] = useState(1)
 
-  // ── Frozen billing snapshot ──────────────────────────────────────────
+  // â”€â”€ Frozen billing snapshot â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const billingSnapshotRef = useRef({ tableId: null, items: [] })
 
   const prevOrderIds = useRef(new Set())
@@ -193,10 +194,10 @@ export default function Dashboard() {
     return () => { clearInterval(poll); supabase.removeChannel(sub) }
   }, [fetchAll])
 
-  // ── Build a frozen, row-id-keyed snapshot for a table ────────────────
+  // â”€â”€ Build a frozen, row-id-keyed snapshot for a table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // FIX: rows whose current DB quantity is already 0 are skipped. A row
   // can legitimately sit at quantity 0 now (see handlePrintAndSave below
-  // — we update quantity to 0 instead of deleting, so a failed delete
+  // â€” we update quantity to 0 instead of deleting, so a failed delete
   // can never leave a "ghost" row with stale quantity behind). A 0-qty
   // row is effectively already removed and shouldn't reappear in the
   // item editor as if it still had stock to reduce.
@@ -276,9 +277,7 @@ export default function Dashboard() {
     const subtotal = foodSubtotal + liquorSubtotal
     const serviceChargeAmt = Math.round(subtotal * serviceChargePct / 100)
     const afterService = subtotal + serviceChargeAmt
-    const dv = parseFloat(discountValue) || 0
-    const discountAmt = discountType === 'percent'
-      ? Math.round(afterService * dv / 100) : Math.min(dv, afterService)
+    const discountAmt = calcDiscountAmount(discountType, discountValue, afterService)
     const finalAmount = afterService - discountAmt
     return {
       items, rawFoodItems, rawLiquorItems, foodItems, liquorItems,
@@ -336,8 +335,8 @@ export default function Dashboard() {
     setOpenName(''); setOpenPrice(''); setOpenQty(1); setShowOpenForm(false)
   }
 
-  // ── handlePrintAndSave — FIXED write-back verification ───────────────
-  // ROOT CAUSE of "Classic LIIT × 4" still showing in DB reads (Reports /
+  // â”€â”€ handlePrintAndSave â€” FIXED write-back verification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ROOT CAUSE of "Classic LIIT Ã— 4" still showing in DB reads (Reports /
   // Today's Report) after reducing to 2 in the editor, while the money
   // fields (subtotal/final_amount) were correct:
   //
@@ -347,15 +346,15 @@ export default function Dashboard() {
   // quantity. Supabase/PostgREST can return success with a matched row
   // whose value didn't change the way you expect in edge cases (e.g. a
   // stale closure value, a trigger normalizing/rejecting the value, a
-  // concurrent write racing it) — and none of those show up as a thrown
+  // concurrent write racing it) â€” and none of those show up as a thrown
   // error or an empty result set. So the function sailed past STEP 1,
   // printed the receipt, and wrote the (correct) computed totals to
-  // `orders` in STEP 2 — leaving `order_items.quantity` permanently out
+  // `orders` in STEP 2 â€” leaving `order_items.quantity` permanently out
   // of sync with `orders.subtotal` / `orders.final_amount`.
   //
   // FIX:
   //   1. Every order_items write now checks the RETURNED quantity value,
-  //      not just row presence — `updatedRows[0].quantity !== newQty` is
+  //      not just row presence â€” `updatedRows[0].quantity !== newQty` is
   //      now itself a failure condition.
   //   2. As a second, independent safety net, we re-SELECT every touched
   //      row after the update loop completes and confirm the persisted
@@ -363,12 +362,12 @@ export default function Dashboard() {
   //      print or save. This guards against any write that reports
   //      "success" with the right shape but wrong value, or gets quietly
   //      reverted between the UPDATE and here.
-  //   3. If ANY item fails either check, we STOP — no receipt is printed,
-  //      no order is marked paid — exactly as before, just with a
+  //   3. If ANY item fails either check, we STOP â€” no receipt is printed,
+  //      no order is marked paid â€” exactly as before, just with a
   //      verification step that can no longer be fooled by a partially
   //      "successful-looking" write.
   const handlePrintAndSave = async () => {
-    const dv = parseFloat(discountValue) || 0
+    const dv = sanitizeDiscountValue(discountType, discountValue)
     if (dv > 0 && !discountReason.trim()) { setDiscountReasonError(true); return }
     setDiscountReasonError(false)
 
@@ -384,27 +383,27 @@ export default function Dashboard() {
 
     setSaving(true)
 
-    // ── STEP 1: Persist itemQtyOverrides into real order_items rows ────
+    // â”€â”€ STEP 1: Persist itemQtyOverrides into real order_items rows â”€â”€â”€â”€
     // This must succeed BEFORE we print anything or touch `orders`, so
     // that a partial failure never results in a printed/saved bill whose
     // totals don't match its item rows.
     //
     // DIAGNOSTIC UPGRADE: every failure is now classified into ONE of
     // exactly 3 plain-language reasons, and that reason is shown right
-    // inside the popup — no browser console needed:
+    // inside the popup â€” no browser console needed:
     //
-    //   Reason A — "Database rejected the change"
+    //   Reason A â€” "Database rejected the change"
     //     Supabase itself returned an error (network drop, permissions,
     //     server-side rule). The `error.message` is included verbatim.
     //
-    //   Reason B — "This item's record could not be found"
-    //     The UPDATE ran but matched ZERO rows — the row id this screen
+    //   Reason B â€” "This item's record could not be found"
+    //     The UPDATE ran but matched ZERO rows â€” the row id this screen
     //     was holding no longer exists in the database. Usually means
     //     this bill was already modified/printed elsewhere (a second
     //     browser tab, or the table was cleared) while this screen was
     //     still open with old data.
     //
-    //   Reason C — "Change was sent but did not save correctly"
+    //   Reason C â€” "Change was sent but did not save correctly"
     //     The UPDATE matched the row, but when we immediately re-checked
     //     it, the value wasn't what we asked for. Something else wrote
     //     to this row at nearly the same time.
@@ -418,7 +417,7 @@ export default function Dashboard() {
         const newQty = itemQtyOverrides[key]
         if (!row.rowId) continue
 
-        // Always UPDATE — never DELETE — so a blocked write can't leave
+        // Always UPDATE â€” never DELETE â€” so a blocked write can't leave
         // an invisible "should have been removed" row with stale qty.
         const { data: updatedRows, error } = await supabase
           .from('order_items')
@@ -437,17 +436,17 @@ export default function Dashboard() {
         } else if (!updatedRows || updatedRows.length === 0) {
           // Reason B
           auditStatus = 'failed'
-          auditReason = `This item's record could not be found — it may have been changed in another tab/session. Please refresh and try again.`
+          auditReason = `This item's record could not be found â€” it may have been changed in another tab/session. Please refresh and try again.`
         } else if (updatedRows[0].quantity !== newQty) {
           // Reason C
           auditStatus = 'failed'
           auditReason = `Change was sent but did not save correctly (tried to set ${newQty}, database still shows ${updatedRows[0].quantity}). Something else may be editing this bill at the same time.`
         }
 
-        // ── NEW: log this attempt to item_quantity_audit ──────────────
+        // â”€â”€ NEW: log this attempt to item_quantity_audit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // One row per attempt, success or failure, with table name,
         // item name, before/after quantity, and an exact timestamp.
-        // Never blocks the billing flow — if the audit write itself
+        // Never blocks the billing flow â€” if the audit write itself
         // fails, we swallow that error (it's a diagnostic aid, not a
         // correctness requirement) and continue with the normal logic.
         try {
@@ -475,22 +474,22 @@ export default function Dashboard() {
       if (failedItems.length > 0) {
         setSaving(false)
         const detail = failedItems
-          .map(f => `• ${f.name}\n   → ${f.reason}`)
+          .map(f => `â€¢ ${f.name}\n   â†’ ${f.reason}`)
           .join('\n\n')
         alert(
-          `⚠️ Could not save the following item(s):\n\n${detail}\n\n` +
+          `âš ï¸ Could not save the following item(s):\n\n${detail}\n\n` +
           `Nothing was printed or saved, so your totals and item list stay in sync.`
         )
         return
       }
 
-      // ── STEP 1b: Independent read-back verification ──────────────────
+      // â”€â”€ STEP 1b: Independent read-back verification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       // Second safety net: re-fetch every row we just wrote and confirm
       // what's actually persisted in the DB matches what we intended.
       // This catches any write that reported "success" with the right
       // shape but the wrong value, or got reverted between the UPDATE
-      // and now (e.g. by a concurrent process). This is a 4th check —
-      // "looked fine a moment ago, but isn't anymore" — reported with
+      // and now (e.g. by a concurrent process). This is a 4th check â€”
+      // "looked fine a moment ago, but isn't anymore" â€” reported with
       // its own plain-language reason (Reason D).
       if (writtenRowIds.length > 0) {
         const { data: verifyRows, error: verifyError } = await supabase
@@ -501,7 +500,7 @@ export default function Dashboard() {
         if (verifyError) {
           setSaving(false)
           alert(
-            `⚠️ Could not double-check the saved quantities.\n\n` +
+            `âš ï¸ Could not double-check the saved quantities.\n\n` +
             `Reason: ${verifyError.message}\n\n` +
             `Nothing was printed or saved. Please try again.`
           )
@@ -518,7 +517,7 @@ export default function Dashboard() {
         if (mismatches.length > 0) {
           setSaving(false)
 
-          // ── NEW: log the read-back mismatch too, so this 4th outcome
+          // â”€â”€ NEW: log the read-back mismatch too, so this 4th outcome
           // ("looked fine right after saving, but wasn't a moment later")
           // shows up in item_quantity_audit exactly like the other 3.
           for (const m of mismatches) {
@@ -539,10 +538,10 @@ export default function Dashboard() {
           }
 
           const detail = mismatches
-            .map(m => `• ${m.name}\n   → Saved as ${verifyMap[m.id]}, but expected ${m.expectedQty}. Likely another tab/session changed this bill at the same moment.`)
+            .map(m => `â€¢ ${m.name}\n   â†’ Saved as ${verifyMap[m.id]}, but expected ${m.expectedQty}. Likely another tab/session changed this bill at the same moment.`)
             .join('\n\n')
           alert(
-            `⚠️ Double-check found a mismatch for:\n\n${detail}\n\n` +
+            `âš ï¸ Double-check found a mismatch for:\n\n${detail}\n\n` +
             `Nothing was printed or saved, so your totals and item list stay in sync.`
           )
           return
@@ -550,8 +549,8 @@ export default function Dashboard() {
       }
     }
 
-    // ── STEP 2: Now that item quantities are confirmed persisted, build
-    // and print the receipt, and write the order totals. ───────────────
+    // â”€â”€ STEP 2: Now that item quantities are confirmed persisted, build
+    // and print the receipt, and write the order totals. â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const now = new Date()
     const lines = {
       restaurantName: restaurant.name, address: restaurant.address,
@@ -667,7 +666,7 @@ export default function Dashboard() {
   const currentPin = selectedTableData?.pin || '----'
   const previewTotals = payTableId ? computeTotals(payTableId) : null
   const previewTableName = tables.find(t => t.id === payTableId)?.table_name || ''
-  const dv = parseFloat(discountValue) || 0
+  const dv = sanitizeDiscountValue(discountType, discountValue)
   const filteredMenuItems = allFoodItems.filter(f => f.name.toLowerCase().includes(menuSearch.toLowerCase()))
   const modifiedCount = Object.keys(itemQtyOverrides).length
 
@@ -676,11 +675,11 @@ export default function Dashboard() {
 
       {!soundReady && (
         <div className="bg-orange-500 text-white text-center text-xs py-1.5 cursor-pointer font-medium">
-          🔔 Tap anywhere to enable order notification sounds
+          ðŸ”” Tap anywhere to enable order notification sounds
         </div>
       )}
 
-      {/* ── Bill Preview Modal ───────────────────────────── */}
+      {/* â”€â”€ Bill Preview Modal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
       {showPreview && previewTotals && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl max-h-[92vh] flex flex-col">
@@ -697,7 +696,7 @@ export default function Dashboard() {
               </div>
               {modifiedCount > 0 && (
                 <div className="mt-2 bg-yellow-50 border border-yellow-200 rounded-lg px-3 py-1.5">
-                  <p className="text-xs text-yellow-700 text-center">⚠️ {modifiedCount} item(s) quantity adjusted</p>
+                  <p className="text-xs text-yellow-700 text-center">âš ï¸ {modifiedCount} item(s) quantity adjusted</p>
                 </div>
               )}
             </div>
@@ -706,20 +705,20 @@ export default function Dashboard() {
               {previewTotals.foodItems.length > 0 && (
                 <div>
                   <div className="flex items-center gap-2 mb-2">
-                    <span className="text-xs font-bold text-gray-500 uppercase">🍽 Food</span>
+                    <span className="text-xs font-bold text-gray-500 uppercase">ðŸ½ Food</span>
                     <div className="flex-1 border-t border-dashed border-gray-200" />
                   </div>
                   {previewTotals.foodItems.map((item, i) => (
                     <div key={i} className="flex justify-between items-center text-sm py-1">
                       <div className="flex items-center gap-2">
                         <span className="text-gray-700">{item.food_items?.name || item.name}</span>
-                        <span className="bg-orange-100 text-orange-600 text-xs font-bold px-1.5 py-0.5 rounded-full">×{item.quantity}</span>
+                        <span className="bg-orange-100 text-orange-600 text-xs font-bold px-1.5 py-0.5 rounded-full">Ã—{item.quantity}</span>
                       </div>
-                      <span className="text-gray-700 font-medium">₹{item.total}</span>
+                      <span className="text-gray-700 font-medium">â‚¹{item.total}</span>
                     </div>
                   ))}
                   <div className="flex justify-between text-xs font-semibold text-gray-500 mt-2 pt-1 border-t border-dashed">
-                    <span>Food Subtotal</span><span>₹{previewTotals.foodSubtotal}</span>
+                    <span>Food Subtotal</span><span>â‚¹{previewTotals.foodSubtotal}</span>
                   </div>
                 </div>
               )}
@@ -727,20 +726,20 @@ export default function Dashboard() {
               {previewTotals.liquorItems.length > 0 && (
                 <div>
                   <div className="flex items-center gap-2 mb-2">
-                    <span className="text-xs font-bold text-gray-500 uppercase">🍺 Liquor</span>
+                    <span className="text-xs font-bold text-gray-500 uppercase">ðŸº Liquor</span>
                     <div className="flex-1 border-t border-dashed border-gray-200" />
                   </div>
                   {previewTotals.liquorItems.map((item, i) => (
                     <div key={i} className="flex justify-between items-center text-sm py-1">
                       <div className="flex items-center gap-2">
                         <span className="text-gray-700">{item.food_items?.name || item.name}</span>
-                        <span className="bg-blue-100 text-blue-600 text-xs font-bold px-1.5 py-0.5 rounded-full">×{item.quantity}</span>
+                        <span className="bg-blue-100 text-blue-600 text-xs font-bold px-1.5 py-0.5 rounded-full">Ã—{item.quantity}</span>
                       </div>
-                      <span className="text-gray-700 font-medium">₹{item.total}</span>
+                      <span className="text-gray-700 font-medium">â‚¹{item.total}</span>
                     </div>
                   ))}
                   <div className="flex justify-between text-xs font-semibold text-gray-500 mt-2 pt-1 border-t border-dashed">
-                    <span>Liquor Subtotal</span><span>₹{previewTotals.liquorSubtotal}</span>
+                    <span>Liquor Subtotal</span><span>â‚¹{previewTotals.liquorSubtotal}</span>
                   </div>
                 </div>
               )}
@@ -755,7 +754,7 @@ export default function Dashboard() {
                       <option value={0}>0%</option><option value={5}>5%</option>
                       <option value={10}>10%</option><option value={12}>12%</option><option value={18}>18%</option>
                     </select>
-                    {previewTotals.serviceChargeAmt > 0 && <span className="text-xs font-medium text-gray-700">+₹{previewTotals.serviceChargeAmt}</span>}
+                    {previewTotals.serviceChargeAmt > 0 && <span className="text-xs font-medium text-gray-700">+â‚¹{previewTotals.serviceChargeAmt}</span>}
                   </div>
                 </div>
                 <div className="flex justify-between items-center text-sm text-gray-600">
@@ -763,12 +762,12 @@ export default function Dashboard() {
                   <div className="flex items-center gap-2">
                     <select value={discountType} onChange={e => { setDiscountType(e.target.value); setDiscountValue(''); setDiscountReason('') }}
                       className="border rounded px-2 py-0.5 text-xs">
-                      <option value="percent">%</option><option value="flat">₹ flat</option>
+                      <option value="percent">%</option><option value="flat">â‚¹ flat</option>
                     </select>
-                    <input type="number" min="0" value={discountValue}
-                      onChange={e => { setDiscountValue(e.target.value); setDiscountReasonError(false) }}
+                    <input type="number" min="0" max={discountType === 'percent' ? 100 : undefined} value={discountValue}
+                      onChange={e => { setDiscountValue(clampDiscountInput(discountType, e.target.value)); setDiscountReasonError(false) }}
                       placeholder="0" className="border rounded px-2 py-0.5 text-xs w-16 text-right" />
-                    {previewTotals.discountAmt > 0 && <span className="text-green-600 text-xs font-medium">-₹{previewTotals.discountAmt}</span>}
+                    {previewTotals.discountAmt > 0 && <span className="text-green-600 text-xs font-medium">-â‚¹{previewTotals.discountAmt}</span>}
                   </div>
                 </div>
                 {dv > 0 && (
@@ -778,29 +777,29 @@ export default function Dashboard() {
                       onChange={e => { setDiscountReason(e.target.value); setDiscountReasonError(false) }}
                       placeholder="e.g. Regular customer..."
                       className={`w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-orange-400 ${discountReasonError ? 'border-red-500 bg-red-50' : 'border-gray-300'}`} />
-                    {discountReasonError && <p className="text-red-500 text-xs mt-1">⚠️ Reason required</p>}
+                    {discountReasonError && <p className="text-red-500 text-xs mt-1">âš ï¸ Reason required</p>}
                   </div>
                 )}
               </div>
 
               <div className="bg-gray-50 rounded-xl p-3">
                 <div className="flex justify-between text-xs text-gray-500 mb-1">
-                  <span>Subtotal</span><span>₹{previewTotals.subtotal}</span>
+                  <span>Subtotal</span><span>â‚¹{previewTotals.subtotal}</span>
                 </div>
                 {previewTotals.serviceChargeAmt > 0 && (
                   <div className="flex justify-between text-xs text-gray-500 mb-1">
-                    <span>Service ({serviceChargePct}%)</span><span>+₹{previewTotals.serviceChargeAmt}</span>
+                    <span>Service ({serviceChargePct}%)</span><span>+â‚¹{previewTotals.serviceChargeAmt}</span>
                   </div>
                 )}
                 {previewTotals.discountAmt > 0 && (
                   <div className="flex justify-between text-xs text-green-600 mb-1">
-                    <span>Discount {discountReason ? `(${discountReason})` : ''}</span><span>-₹{previewTotals.discountAmt}</span>
+                    <span>Discount {discountReason ? `(${discountReason})` : ''}</span><span>-â‚¹{previewTotals.discountAmt}</span>
                   </div>
                 )}
                 <div className="border-t border-dashed border-gray-200 my-1" />
                 <div className="flex justify-between font-bold text-gray-800 text-base">
                   <span>Final Total</span>
-                  <span className="text-orange-500 text-xl">₹{previewTotals.finalAmount}</span>
+                  <span className="text-orange-500 text-xl">â‚¹{previewTotals.finalAmount}</span>
                 </div>
                 <p className="text-xs text-gray-400 mt-1 text-center">Payment method settled in Today's Report</p>
               </div>
@@ -809,11 +808,11 @@ export default function Dashboard() {
             <div className="p-4 border-t space-y-2">
               <button onClick={handlePrintAndSave} disabled={clearing || saving}
                 className="w-full bg-green-500 text-white py-3 rounded-xl font-bold hover:bg-green-600 disabled:opacity-50">
-                {saving ? '⏳ Saving…' : '🖨️ Print & Save Bill'}
+                {saving ? 'â³ Savingâ€¦' : 'ðŸ–¨ï¸ Print & Save Bill'}
               </button>
               <button onClick={() => setShowPreview(false)} disabled={saving}
                 className="w-full bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium disabled:opacity-50">
-                ← Back to Edit
+                â† Back to Edit
               </button>
             </div>
           </div>
@@ -823,7 +822,7 @@ export default function Dashboard() {
       {showClearAllConfirm && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl">
-            <h2 className="text-xl font-bold text-red-500 mb-2">⚠️ Clear All Active Tables?</h2>
+            <h2 className="text-xl font-bold text-red-500 mb-2">âš ï¸ Clear All Active Tables?</h2>
             <p className="text-gray-600 text-sm mb-4">This will clear all {activeTables.length} active tables.</p>
             <div className="flex gap-3">
               <button onClick={() => setShowClearAllConfirm(false)} className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium">Cancel</button>
@@ -836,22 +835,22 @@ export default function Dashboard() {
       {/* Navbar */}
       <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30">
         <div className="flex items-center gap-3">
-          <button onClick={() => setSidebarOpen(!sidebarOpen)} className="text-gray-500 hover:text-orange-500 text-2xl font-bold">☰</button>
-          <span className="text-xl">🍽️</span>
+          <button onClick={() => setSidebarOpen(!sidebarOpen)} className="text-gray-500 hover:text-orange-500 text-2xl font-bold">â˜°</button>
+          <span className="text-xl">ðŸ½ï¸</span>
           <h1 className="text-lg font-bold text-orange-500 hidden sm:block">QR Menu Dashboard</h1>
         </div>
         <div className="flex gap-2 flex-wrap justify-end">
           {activeTables.length > 0 && (
             <button onClick={() => setShowClearAllConfirm(true)} disabled={clearing}
               className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200 disabled:opacity-50">
-              🧹 Clear All
+              ðŸ§¹ Clear All
             </button>
           )}
-          <button onClick={() => navigate('/admin/today-report')} className="bg-green-100 text-green-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-green-200">📋 Today's Report</button>
-          <button onClick={() => navigate('/admin/reports')} className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">📊 Reports</button>
+          <button onClick={() => navigate('/admin/today-report')} className="bg-green-100 text-green-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-green-200">ðŸ“‹ Today's Report</button>
+          <button onClick={() => navigate('/admin/reports')} className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">ðŸ“Š Reports</button>
           <button onClick={() => navigate('/admin/menu')} className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Menu</button>
           <button onClick={() => navigate('/admin/tables')} className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Tables</button>
-          <button onClick={() => navigate('/admin/settings')} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-gray-200">⚙️ Settings</button>
+          <button onClick={() => navigate('/admin/settings')} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-gray-200">âš™ï¸ Settings</button>
           <button onClick={handleLogout} className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200">Logout</button>
         </div>
       </div>
@@ -861,14 +860,14 @@ export default function Dashboard() {
         <div className={`${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} transition-all duration-300 bg-white shadow-lg flex-shrink-0 fixed md:relative h-[calc(100vh-56px)] w-64 z-20 top-14 md:top-0 overflow-hidden`}>
           <div className="w-64 h-full flex flex-col">
             <div className="p-4 border-b bg-orange-50">
-              <h2 className="font-bold text-gray-700 text-sm uppercase tracking-wide">🪑 Active Tables</h2>
+              <h2 className="font-bold text-gray-700 text-sm uppercase tracking-wide">ðŸª‘ Active Tables</h2>
               <p className="text-xs text-gray-400 mt-1">{activeTables.length} table(s) with orders</p>
             </div>
             <div className="flex-1 overflow-y-auto p-3 space-y-2">
               {loading && <p className="text-xs text-gray-400 text-center py-4">Loading...</p>}
               {!loading && activeTables.length === 0 && (
                 <div className="text-center py-8 text-gray-400">
-                  <div className="text-3xl mb-2">🪑</div><p className="text-xs">No active orders yet</p>
+                  <div className="text-3xl mb-2">ðŸª‘</div><p className="text-xs">No active orders yet</p>
                 </div>
               )}
               {activeTables.map(table => {
@@ -906,7 +905,7 @@ export default function Dashboard() {
         <div className="flex-1 overflow-y-auto p-4 md:p-6">
           {!selectedTable && (
             <div className="flex flex-col items-center justify-center h-full min-h-64 text-gray-400">
-              <div className="text-6xl mb-4">🍽️</div>
+              <div className="text-6xl mb-4">ðŸ½ï¸</div>
               <h2 className="text-xl font-semibold text-gray-500 mb-2">
                 {activeTables.length > 0 ? 'Select a table' : 'No active orders'}
               </h2>
@@ -924,7 +923,7 @@ export default function Dashboard() {
                   <div>
                     <h2 className="text-2xl font-bold text-orange-500">{selectedTable.table_name}</h2>
                     <p className="text-sm text-gray-400 mt-1">
-                      {tableOrders.length} round(s) •{' '}
+                      {tableOrders.length} round(s) â€¢{' '}
                       {tableOrders.length > 0 && toISTDate(tableOrders[tableOrders.length - 1].created_at)}
                     </p>
                     <div className="mt-3 flex items-center gap-2">
@@ -935,26 +934,26 @@ export default function Dashboard() {
                   <button onClick={() => openPreview(selectedTable.id)}
                     disabled={clearing || tableOrders.length === 0}
                     className="bg-green-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-green-600 transition disabled:opacity-50">
-                    🖨️ Print Bill & Clear
+                    ðŸ–¨ï¸ Print Bill & Clear
                   </button>
                 </div>
               </div>
 
-              {/* ── Item Editor Panel ──────────────────────── */}
+              {/* â”€â”€ Item Editor Panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
               <div className="bg-white rounded-2xl shadow mb-4 overflow-hidden">
                 <button onClick={() => setShowItemEditor(!showItemEditor)}
                   className="w-full flex items-center justify-between px-5 py-4 hover:bg-gray-50 transition">
                   <div className="flex items-center gap-3">
-                    <span className="text-lg">✏️</span>
+                    <span className="text-lg">âœï¸</span>
                     <div className="text-left">
                       <p className="font-bold text-gray-700 text-sm">Add / Remove Items</p>
                       <p className="text-xs text-gray-400">
                         {manualItems.length > 0 ? `${manualItems.length} item(s) added` : 'Modify bill before printing'}
-                        {modifiedCount > 0 ? ` · ${modifiedCount} qty adjusted` : ''}
+                        {modifiedCount > 0 ? ` Â· ${modifiedCount} qty adjusted` : ''}
                       </p>
                     </div>
                   </div>
-                  <span className={`text-gray-400 transition-transform ${showItemEditor ? 'rotate-180' : ''}`}>▼</span>
+                  <span className={`text-gray-400 transition-transform ${showItemEditor ? 'rotate-180' : ''}`}>â–¼</span>
                 </button>
 
                 {showItemEditor && (
@@ -963,7 +962,7 @@ export default function Dashboard() {
                     {allOrderItems.length > 0 && (
                       <div className="px-5 py-4 border-b">
                         <div className="flex items-center justify-between mb-3">
-                          <p className="text-xs font-bold text-gray-500 uppercase">🗑 Adjust Item Quantities</p>
+                          <p className="text-xs font-bold text-gray-500 uppercase">ðŸ—‘ Adjust Item Quantities</p>
                           {modifiedCount > 0 && (
                             <button
                               onClick={() => setItemQtyOverrides({})}
@@ -973,7 +972,7 @@ export default function Dashboard() {
                           )}
                         </div>
                         <p className="text-xs text-gray-400 mb-3">
-                          Use − to reduce quantity. Set to 0 to remove from bill completely.
+                          Use âˆ’ to reduce quantity. Set to 0 to remove from bill completely.
                         </p>
                         <div className="space-y-2">
                           {allOrderItems.map((row) => {
@@ -1003,15 +1002,15 @@ export default function Dashboard() {
                                     )}
                                     {isReduced && (
                                       <span className="text-xs bg-yellow-100 text-yellow-600 px-2 py-0.5 rounded-full font-medium">
-                                        {originalQty} → {effectiveQty}
+                                        {originalQty} â†’ {effectiveQty}
                                       </span>
                                     )}
                                   </div>
                                   <p className="text-xs text-gray-400 mt-0.5">
-                                    ₹{row.price_at_order} × {effectiveQty} = ₹{row.price_at_order * effectiveQty}
+                                    â‚¹{row.price_at_order} Ã— {effectiveQty} = â‚¹{row.price_at_order * effectiveQty}
                                     {isReduced && (
                                       <span className="ml-1 text-red-400 line-through">
-                                        (was ₹{row.price_at_order * originalQty})
+                                        (was â‚¹{row.price_at_order * originalQty})
                                       </span>
                                     )}
                                   </p>
@@ -1021,7 +1020,7 @@ export default function Dashboard() {
                                     onClick={() => setItemQty(row.rowId, originalQty, -1)}
                                     disabled={effectiveQty === 0}
                                     className="w-8 h-8 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center hover:bg-red-200 disabled:opacity-30 disabled:cursor-not-allowed text-lg">
-                                    −
+                                    âˆ’
                                   </button>
                                   <span className={`font-bold w-6 text-center text-sm ${isFullyRemoved ? 'text-red-400' : isReduced ? 'text-yellow-600' : 'text-gray-700'}`}>
                                     {effectiveQty}
@@ -1041,7 +1040,7 @@ export default function Dashboard() {
                         {modifiedCount > 0 && (
                           <div className="mt-3 bg-orange-50 border border-orange-200 rounded-xl px-3 py-2">
                             <p className="text-xs text-orange-700 font-medium">
-                              ✏️ {Object.values(itemQtyOverrides).filter(q => q === 0).length} item(s) fully removed,{' '}
+                              âœï¸ {Object.values(itemQtyOverrides).filter(q => q === 0).length} item(s) fully removed,{' '}
                               {Object.values(itemQtyOverrides).filter(q => q > 0).length} item(s) qty reduced
                             </p>
                           </div>
@@ -1051,21 +1050,21 @@ export default function Dashboard() {
 
                     {/* Add from menu */}
                     <div className="px-5 py-4 border-b">
-                      <p className="text-xs font-bold text-gray-500 uppercase mb-3">➕ Add from Menu</p>
+                      <p className="text-xs font-bold text-gray-500 uppercase mb-3">âž• Add from Menu</p>
                       <input type="text" value={menuSearch} onChange={e => setMenuSearch(e.target.value)}
-                        placeholder="🔍 Search menu item..."
+                        placeholder="ðŸ” Search menu item..."
                         className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm mb-3 focus:outline-none focus:ring-2 focus:ring-orange-400" />
                       {manualItems.filter(m => m.foodItemId).length > 0 && (
                         <div className="mb-3 space-y-1.5">
-                          <p className="text-xs text-green-600 font-medium">✅ Added:</p>
+                          <p className="text-xs text-green-600 font-medium">âœ… Added:</p>
                           {manualItems.filter(m => m.foodItemId).map(mi => (
                             <div key={mi.tempId} className="flex items-center justify-between bg-green-50 border border-green-100 rounded-lg px-3 py-2">
                               <div>
                                 <p className="text-sm font-medium text-gray-700">{mi.name}</p>
-                                <p className="text-xs text-gray-400">₹{mi.price} × {mi.qty} = ₹{mi.price * mi.qty}</p>
+                                <p className="text-xs text-gray-400">â‚¹{mi.price} Ã— {mi.qty} = â‚¹{mi.price * mi.qty}</p>
                               </div>
                               <div className="flex items-center gap-2">
-                                <button onClick={() => changeMenuItemQty(mi.foodItemId, -1)} className="w-7 h-7 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center hover:bg-red-200">−</button>
+                                <button onClick={() => changeMenuItemQty(mi.foodItemId, -1)} className="w-7 h-7 rounded-full bg-red-100 text-red-500 font-bold flex items-center justify-center hover:bg-red-200">âˆ’</button>
                                 <span className="font-bold text-gray-700 w-4 text-center">{mi.qty}</span>
                                 <button onClick={() => changeMenuItemQty(mi.foodItemId, 1)} className="w-7 h-7 rounded-full bg-green-100 text-green-600 font-bold flex items-center justify-center hover:bg-green-200">+</button>
                               </div>
@@ -1082,8 +1081,8 @@ export default function Dashboard() {
                               className="w-full flex justify-between items-center px-3 py-2 rounded-lg hover:bg-orange-50 border border-transparent hover:border-orange-200 transition text-left">
                               <span className="text-sm text-gray-700">{fi.name}</span>
                               <div className="flex items-center gap-2">
-                                <span className="text-xs text-orange-500 font-bold">₹{fi.price}</span>
-                                {added ? <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full">×{added.qty}</span>
+                                <span className="text-xs text-orange-500 font-bold">â‚¹{fi.price}</span>
+                                {added ? <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full">Ã—{added.qty}</span>
                                   : <span className="text-xs bg-orange-100 text-orange-600 px-2 py-0.5 rounded-full">+ Add</span>}
                               </div>
                             </button>
@@ -1095,10 +1094,10 @@ export default function Dashboard() {
                     {/* Add Open Item */}
                     <div className="px-5 py-4">
                       <div className="flex items-center justify-between mb-3">
-                        <p className="text-xs font-bold text-gray-500 uppercase">🆕 Add Open Item (Not in Menu)</p>
+                        <p className="text-xs font-bold text-gray-500 uppercase">ðŸ†• Add Open Item (Not in Menu)</p>
                         <button onClick={() => setShowOpenForm(!showOpenForm)}
                           className="text-xs bg-orange-500 text-white px-3 py-1 rounded-full hover:bg-orange-600">
-                          {showOpenForm ? '✕ Cancel' : '+ Open Item'}
+                          {showOpenForm ? 'âœ• Cancel' : '+ Open Item'}
                         </button>
                       </div>
                       {showOpenForm && (
@@ -1106,9 +1105,9 @@ export default function Dashboard() {
                           <div>
                             <p className="text-xs text-gray-500 mb-1.5 font-medium">Category</p>
                             <div className="flex gap-2">
-                              {[{ id: 'Food', icon: '🍽', color: 'bg-orange-500 text-white' },
-                                { id: 'Beverage', icon: '🥤', color: 'bg-blue-500 text-white' },
-                                { id: 'Liquor', icon: '🍺', color: 'bg-purple-500 text-white' }].map(d => (
+                              {[{ id: 'Food', icon: 'ðŸ½', color: 'bg-orange-500 text-white' },
+                                { id: 'Beverage', icon: 'ðŸ¥¤', color: 'bg-blue-500 text-white' },
+                                { id: 'Liquor', icon: 'ðŸº', color: 'bg-purple-500 text-white' }].map(d => (
                                 <button key={d.id} onClick={() => setOpenDept(d.id)}
                                   className={`flex-1 py-2 rounded-xl text-xs font-bold border-2 transition ${openDept === d.id ? d.color + ' border-transparent' : 'bg-white border-gray-200 text-gray-500 hover:border-orange-300'}`}>
                                   {d.icon} {d.id}
@@ -1124,7 +1123,7 @@ export default function Dashboard() {
                           </div>
                           <div className="grid grid-cols-2 gap-3">
                             <div>
-                              <label className="text-xs text-gray-500 block mb-1">Price (₹) *</label>
+                              <label className="text-xs text-gray-500 block mb-1">Price (â‚¹) *</label>
                               <input type="number" min="1" value={openPrice} onChange={e => setOpenPrice(e.target.value)}
                                 placeholder="0"
                                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
@@ -1133,7 +1132,7 @@ export default function Dashboard() {
                               <label className="text-xs text-gray-500 block mb-1">Quantity</label>
                               <div className="flex items-center gap-2">
                                 <button onClick={() => setOpenQty(q => Math.max(1, q - 1))}
-                                  className="w-9 h-9 rounded-full bg-gray-200 text-gray-600 font-bold flex items-center justify-center hover:bg-gray-300">−</button>
+                                  className="w-9 h-9 rounded-full bg-gray-200 text-gray-600 font-bold flex items-center justify-center hover:bg-gray-300">âˆ’</button>
                                 <span className="font-bold text-gray-700 text-lg w-6 text-center">{openQty}</span>
                                 <button onClick={() => setOpenQty(q => q + 1)}
                                   className="w-9 h-9 rounded-full bg-orange-100 text-orange-600 font-bold flex items-center justify-center hover:bg-orange-200">+</button>
@@ -1142,32 +1141,32 @@ export default function Dashboard() {
                           </div>
                           {openPrice && parseFloat(openPrice) > 0 && (
                             <div className="bg-white rounded-lg px-3 py-2 flex justify-between text-sm">
-                              <span className="text-gray-600">{openName || 'Item'} × {openQty}</span>
-                              <span className="font-bold text-orange-500">₹{(parseFloat(openPrice) * openQty).toFixed(0)}</span>
+                              <span className="text-gray-600">{openName || 'Item'} Ã— {openQty}</span>
+                              <span className="font-bold text-orange-500">â‚¹{(parseFloat(openPrice) * openQty).toFixed(0)}</span>
                             </div>
                           )}
                           <button onClick={addOpenItem}
                             className="w-full bg-orange-500 text-white py-2.5 rounded-xl font-bold hover:bg-orange-600">
-                            ✅ Add to Bill
+                            âœ… Add to Bill
                           </button>
                         </div>
                       )}
                       {manualItems.filter(m => m.isOpen).length > 0 && (
                         <div className="mt-3 space-y-1.5">
-                          <p className="text-xs text-purple-600 font-medium">🆕 Open Items Added:</p>
+                          <p className="text-xs text-purple-600 font-medium">ðŸ†• Open Items Added:</p>
                           {manualItems.filter(m => m.isOpen).map(mi => (
                             <div key={mi.tempId} className="flex items-center justify-between bg-purple-50 border border-purple-100 rounded-lg px-3 py-2">
                               <div>
                                 <div className="flex items-center gap-2">
                                   <span className="text-xs px-1.5 py-0.5 rounded-full font-medium bg-purple-100 text-purple-600">
-                                    {mi.dept === 'Food' ? '🍽' : mi.dept === 'Beverage' ? '🥤' : '🍺'} {mi.dept}
+                                    {mi.dept === 'Food' ? 'ðŸ½' : mi.dept === 'Beverage' ? 'ðŸ¥¤' : 'ðŸº'} {mi.dept}
                                   </span>
                                   <p className="text-sm font-medium text-gray-700">{mi.name}</p>
                                 </div>
-                                <p className="text-xs text-gray-400 mt-0.5">₹{mi.price} × {mi.qty} = ₹{mi.price * mi.qty}</p>
+                                <p className="text-xs text-gray-400 mt-0.5">â‚¹{mi.price} Ã— {mi.qty} = â‚¹{mi.price * mi.qty}</p>
                               </div>
                               <button onClick={() => setManualItems(prev => prev.filter(m => m.tempId !== mi.tempId))}
-                                className="text-xs bg-red-100 text-red-500 px-2 py-1 rounded-full hover:bg-red-200">✕</button>
+                                className="text-xs bg-red-100 text-red-500 px-2 py-1 rounded-full hover:bg-red-200">âœ•</button>
                             </div>
                           ))}
                         </div>
@@ -1177,7 +1176,7 @@ export default function Dashboard() {
                 )}
               </div>
 
-              {/* ── Order rounds display ── */}
+              {/* â”€â”€ Order rounds display â”€â”€ */}
               <div className="space-y-4 mb-4">
                 {groupedByOrder.map((order, index) => {
                   const isNewOrder = newOrderIds.has(order.id)
@@ -1187,10 +1186,10 @@ export default function Dashboard() {
                       <div className="flex justify-between items-center mb-3 flex-wrap gap-2">
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="bg-orange-100 text-orange-600 text-xs font-bold px-3 py-1 rounded-full">Round {groupedByOrder.length - index}</span>
-                          {isNewOrder && <span className="bg-yellow-400 text-yellow-900 text-xs font-bold px-3 py-1 rounded-full animate-pulse">🆕 New!</span>}
-                          {!isNewOrder && index === 0 && <span className="bg-green-100 text-green-600 text-xs font-bold px-3 py-1 rounded-full">Latest ✨</span>}
+                          {isNewOrder && <span className="bg-yellow-400 text-yellow-900 text-xs font-bold px-3 py-1 rounded-full animate-pulse">ðŸ†• New!</span>}
+                          {!isNewOrder && index === 0 && <span className="bg-green-100 text-green-600 text-xs font-bold px-3 py-1 rounded-full">Latest âœ¨</span>}
                         </div>
-                        <span className="text-xs text-gray-400">🕐 {toIST(order.created_at)}</span>
+                        <span className="text-xs text-gray-400">ðŸ• {toIST(order.created_at)}</span>
                       </div>
                       <div className="space-y-2">
                         {order.items.map((row) => {
@@ -1214,16 +1213,16 @@ export default function Dashboard() {
                                   )}
                                   {isReduced && (
                                     <span className="text-xs bg-yellow-100 text-yellow-600 px-1.5 py-0.5 rounded-full">
-                                      {originalQty}→{effectiveQty}
+                                      {originalQty}â†’{effectiveQty}
                                     </span>
                                   )}
                                 </div>
                                 <span className={`${isFullyRemoved ? 'text-gray-300 line-through' : isReduced ? 'text-yellow-600' : 'text-gray-500'}`}>
-                                  × {isFullyRemoved ? originalQty : effectiveQty}
+                                  Ã— {isFullyRemoved ? originalQty : effectiveQty}
                                 </span>
                               </div>
                               {row.note && row.note.trim() !== '' && (
-                                <p className="text-xs text-orange-500 italic mt-1">📝 "{row.note}"</p>
+                                <p className="text-xs text-orange-500 italic mt-1">ðŸ“ "{row.note}"</p>
                               )}
                             </div>
                           )
@@ -1238,11 +1237,11 @@ export default function Dashboard() {
               <div className="bg-orange-500 rounded-2xl shadow p-5 text-white mb-4">
                 <div className="flex justify-between items-center mb-1">
                   <span className="font-bold text-lg">Subtotal</span>
-                  <span className="font-bold text-2xl">₹{displaySubtotal}</span>
+                  <span className="font-bold text-2xl">â‚¹{displaySubtotal}</span>
                 </div>
                 {(modifiedCount > 0 || manualItems.length > 0) && (
                   <p className="text-orange-100 text-xs mb-2">
-                    {modifiedCount > 0 ? `${modifiedCount} item(s) qty adjusted · ` : ''}
+                    {modifiedCount > 0 ? `${modifiedCount} item(s) qty adjusted Â· ` : ''}
                     {manualItems.length > 0 ? `${manualItems.length} item(s) added` : ''}
                   </p>
                 )}
@@ -1250,7 +1249,7 @@ export default function Dashboard() {
                 <button onClick={() => openPreview(selectedTable.id)}
                   disabled={clearing || tableOrders.length === 0}
                   className="w-full bg-white text-orange-500 py-3 rounded-xl font-bold hover:bg-orange-50 transition text-sm disabled:opacity-50">
-                  🖨️ Print Bill & Clear Table
+                  ðŸ–¨ï¸ Print Bill & Clear Table
                 </button>
               </div>
             </div>
