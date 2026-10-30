@@ -1,9 +1,23 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
+import { sanitizeDiscountValue, calcDiscountAmount, clampDiscountInput } from '../utils/billing'
 
 // ── Helpers ─────────────────────────────────────────────
-const ADMIN_PASSWORD = 'KHALASI@999' // Change this password
+// The admin code is no longer stored in this file. It is checked on the server
+// by the verify_admin_code() function (see supabase-fixes.sql).
+const writeAuditLog = async (action, bill, details = {}) => {
+  const { data: { user } } = await supabase.auth.getUser()
+  const { error } = await supabase.from('bill_audit_log').insert({
+    action,
+    table_name: bill.table_name_snapshot || null,
+    order_ids: bill._orderIds,
+    performed_by: user?.email || 'unknown',
+    snapshot: { orders: bill._rawOrders, open_items: bill.open_items },
+    details,
+  })
+  return error
+}
 
 const toIST = (d) => new Date(d).toLocaleTimeString('en-IN', {
   timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true
@@ -36,8 +50,21 @@ function PasswordGate({ onUnlock }) {
   const [error, setError] = useState(false)
   const [shake, setShake] = useState(false)
 
-  const attempt = () => {
-    if (pw === ADMIN_PASSWORD) {
+  const [checking, setChecking] = useState(false)
+
+  // ST_04: the code is verified on the server, not compared in browser JavaScript
+  const attempt = async () => {
+    if (checking || !pw) return
+    setChecking(true)
+    const { data, error: rpcError } = await supabase.rpc('verify_admin_code', { code: pw })
+    setChecking(false)
+
+    if (rpcError) {
+      console.error('verify_admin_code failed:', rpcError.message)
+      alert('Could not verify the code. Has supabase-fixes.sql been run in Supabase?')
+      return
+    }
+    if (data === true) {
       onUnlock()
     } else {
       setError(true)
@@ -119,10 +146,7 @@ export default function AdminCode() {
     const subtotal = editItems.reduce((s, i) => s + i.price * i.qty, 0)
     const svcAmt = Math.round(subtotal * (parseFloat(editServicePct) || 0) / 100)
     const afterSvc = subtotal + svcAmt
-    const dv = parseFloat(editDiscValue) || 0
-    const discAmt = editDiscType === 'percent'
-      ? Math.round(afterSvc * dv / 100)
-      : Math.min(dv, afterSvc)
+    const discAmt = calcDiscountAmount(editDiscType, editDiscValue, afterSvc)
     const finalAmount = afterSvc - discAmt
     return { subtotal, svcAmt, discAmt, finalAmount }
   }
@@ -289,7 +313,14 @@ export default function AdminCode() {
     try {
       const newPaidAt = toISOLocal(editDate, editTime)
       const { subtotal, svcAmt, discAmt, finalAmount } = computeTotals()
-      const dv = parseFloat(editDiscValue) || 0
+      const dv = sanitizeDiscountValue(editDiscType, editDiscValue)
+
+      // ST_06: record who changed this bill, and what it looked like before.
+      // If the log cannot be written, the bill is NOT changed.
+      const editAuditErr = await writeAuditLog('edit', editingBill, {
+        new_subtotal: subtotal, new_discount_amt: discAmt, new_final_amount: finalAmount,
+      })
+      if (editAuditErr) throw new Error('Audit log could not be saved, so the bill was not changed. ' + editAuditErr.message)
 
       // Split items
       const openItems = editItems.filter(i => i.isOpen).map(i => ({
@@ -365,9 +396,17 @@ export default function AdminCode() {
   const handleDeleteBill = async (bill) => {
     if (!window.confirm(`⚠️ PERMANENTLY DELETE this bill for ${bill.table_name_snapshot}?\n\nThis CANNOT be undone!`)) return
     try {
+      // ST_06: save a full copy of the bill in the audit log BEFORE deleting it.
+      const delAuditErr = await writeAuditLog('delete', bill)
+      if (delAuditErr) {
+        alert('Audit log could not be saved, so the bill was NOT deleted: ' + delAuditErr.message)
+        return
+      }
       for (const orderId of bill._orderIds) {
-        await supabase.from('order_items').delete().eq('order_id', orderId)
-        await supabase.from('orders').delete().eq('id', orderId)
+        const { error: itemsErr } = await supabase.from('order_items').delete().eq('order_id', orderId)
+        if (itemsErr) throw itemsErr
+        const { error: orderErr } = await supabase.from('orders').delete().eq('id', orderId)
+        if (orderErr) throw orderErr
       }
       alert('🗑️ Bill deleted.')
       fetchBills()
@@ -584,7 +623,7 @@ export default function AdminCode() {
                 </div>
                 <div>
                   <label className="text-xs text-gray-500 block mb-1">Discount Value</label>
-                  <input type="number" min="0" value={editDiscValue} onChange={e => setEditDiscValue(e.target.value)}
+                  <input type="number" min="0" max={editDiscType === 'percent' ? 100 : undefined} value={editDiscValue} onChange={e => setEditDiscValue(clampDiscountInput(editDiscType, e.target.value))}
                     placeholder="0"
                     className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-orange-500" />
                 </div>
