@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
+import { sanitizeDiscountValue, calcDiscountAmount, clampDiscountInput } from '../utils/billing'
 
 const toIST = (d) => new Date(d).toLocaleTimeString('en-IN', {
   timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true
@@ -292,10 +293,7 @@ export default function TodayReport() {
     const subtotal = orderItemsTotal + openItemsTotal
     const serviceChargeAmt = Math.round(subtotal * (bill.service_charge_pct || 0) / 100)
     const afterService = subtotal + serviceChargeAmt
-    const dv = parseFloat(discVal) || 0
-    const discountAmt = discType === 'percent'
-      ? Math.round(afterService * dv / 100)
-      : Math.min(dv, afterService)
+    const discountAmt = calcDiscountAmount(discType, discVal, afterService)
     const finalAmount = afterService - discountAmt
     return { subtotal, serviceChargeAmt, discountAmt, finalAmount, effectiveItems }
   }
@@ -436,7 +434,7 @@ export default function TodayReport() {
   // Only once all of that is confirmed do we recompute totals from the
   // now-persisted quantities, save the discount, and print.
   const handleSaveModify = async () => {
-    const dv = parseFloat(modDiscountValue) || 0
+    const dv = sanitizeDiscountValue(modDiscountType, modDiscountValue)
     if (dv > 0 && !modDiscountReason.trim()) {
       setModDiscountReasonError(true)
       return
@@ -1065,7 +1063,7 @@ export default function TodayReport() {
                               <input
                                 type="number" min="0"
                                 value={modDiscountValue}
-                                onChange={e => { setModDiscountValue(e.target.value); setModDiscountReasonError(false) }}
+                                onChange={e => { setModDiscountValue(clampDiscountInput(modDiscountType, e.target.value)); setModDiscountReasonError(false) }}
                                 placeholder={modDiscountType === 'percent' ? 'e.g. 10' : 'e.g. 50'}
                                 className="flex-1 border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400"
                               />
