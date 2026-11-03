@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
-import { sanitizeDiscountValue, calcDiscountAmount, clampDiscountInput } from '../utils/billing'
+import { calcDiscountAmount } from '../utils/billing'
 import { validateDiscount, isSoleItemRemoval } from '../utils/discountValidation'
 
 const toIST = (d) => new Date(d).toLocaleTimeString('en-IN', {
@@ -79,7 +79,6 @@ export default function Dashboard() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [loading, setLoading] = useState(true)
   const [clearing, setClearing] = useState(false)
-  const [showClearAllConfirm, setShowClearAllConfirm] = useState(false)
   const [soundReady, setSoundReady] = useState(false)
   const [sessionStart] = useState(() => new Date().toISOString())
   const [saving, setSaving] = useState(false)
@@ -196,12 +195,8 @@ export default function Dashboard() {
   }, [fetchAll])
 
   // ── Build a frozen, row-id-keyed snapshot for a table ────────────────
-  // FIX: rows whose current DB quantity is already 0 are skipped. A row
-  // can legitimately sit at quantity 0 now (see handlePrintAndSave below
-  // — we update quantity to 0 instead of deleting, so a failed delete
-  // can never leave a "ghost" row with stale quantity behind). A 0-qty
-  // row is effectively already removed and shouldn't reappear in the
-  // item editor as if it still had stock to reduce.
+  // Rows whose current DB quantity is already 0 are skipped: a 0-qty row
+  // is effectively already removed and must not reappear in the editor.
   const buildSnapshot = (tableId) => {
     const tOrders = orders.filter(o => o.table_id === tableId)
     const rows = []
@@ -278,7 +273,8 @@ export default function Dashboard() {
     const subtotal = foodSubtotal + liquorSubtotal
     const serviceChargeAmt = Math.round(subtotal * serviceChargePct / 100)
     const afterService = subtotal + serviceChargeAmt
-    // Discount validation: an invalid discount is never applied to the bill.
+    // Discount rule: percent must be 1-99. An invalid discount is never
+    // applied to the bill (discountAmt stays 0 until the input is valid).
     const discountCheck = validateDiscount(discountType, discountValue, afterService)
     const discountAmt = discountCheck.ok
       ? calcDiscountAmount(discountType, discountValue, afterService)
@@ -301,17 +297,122 @@ export default function Dashboard() {
     setShowPreview(true)
   }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // EMPTY BILL  ->  END THE TABLE SESSION (no bill, no Rs.0 receipt)
+  //
+  // When the LAST billable line is removed, the table has nothing left to
+  // bill. Instead of producing a zero-rupee bill we clear the table:
+  //   - nothing is printed
+  //   - nothing is marked paid (so Today's Report / Reports get no 0 bill)
+  //   - the unpaid orders are deleted and the table session is rotated
+  //     (new PIN + session_version + 1, same as a normal table clear)
+  // ═══════════════════════════════════════════════════════════════════
+  const resetBillingUi = () => {
+    setItemQtyOverrides({}); setManualItems([])
+    setShowItemEditor(false); setShowOpenForm(false); setShowPreview(false)
+    billingSnapshotRef.current = { tableId: null, items: [] }
+    setSelectedTable(null)
+  }
+
+  const endSessionForEmptyBill = async (table, removed) => {
+    if (!table) return
+    const snapshot = billingSnapshotRef.current
+    setClearing(true)
+    try {
+      // a) The snapshot is frozen when the table is opened. If the waiter
+      //    placed a NEW round since then, never delete an order the admin
+      //    has not seen - stop and let them review it first.
+      const { data: live, error: liveErr } = await supabase
+        .from('orders').select('id').eq('table_id', table.id).eq('is_paid', false)
+      if (liveErr) throw new Error(liveErr.message)
+      const liveIds = (live || []).map(o => o.id)
+      const knownIds = snapshot.orderIds || []
+      if (liveIds.some(id => !knownIds.includes(id))) {
+        alert(`A new order just arrived for ${table.table_name}. Nothing was cleared - please re-open the table and review it.`)
+        resetBillingUi()
+        fetchAll()
+        return
+      }
+
+      // b) Delete children first, then the orders. Stop on the first error.
+      if (liveIds.length > 0) {
+        const { error: e1 } = await supabase.from('order_items').delete().in('order_id', liveIds)
+        if (e1) throw new Error(e1.message)
+        const { error: e2 } = await supabase.from('orders').delete().in('id', liveIds)
+        if (e2) throw new Error(e2.message)
+      }
+
+      // c) Rotate the table session (new PIN, session_version + 1, clear
+      //    table_sessions / table_order_summary). Nothing is left to
+      //    delete, so the helper only performs the session reset.
+      const rotated = await nukeClearTable(table.id, [])
+      if (!rotated) throw new Error('Could not reset the table session.')
+
+      // d) Best-effort audit trail. order_id / order_item_id are null on
+      //    purpose: those rows no longer exist.
+      if (removed) {
+        try {
+          await supabase.from('item_quantity_audit').insert({
+            table_name: table.table_name,
+            order_id: null,
+            order_item_id: null,
+            item_name: removed.itemName,
+            original_qty: removed.qty,
+            new_qty: 0,
+            status: 'success',
+            fail_reason: 'Table session ended: last item removed, no bill generated',
+          })
+        } catch (auditErr) {
+          // Diagnostic logging must never break the flow.
+        }
+      }
+
+      // e) Reset the screen
+      setNewOrderIds(prev => { const n = new Set(prev); liveIds.forEach(id => n.delete(id)); return n })
+      setNewOrderTables(prev => { const n = new Set(prev); n.delete(table.id); return n })
+      resetBillingUi()
+      await fetchAll()
+      alert(`${table.table_name} cleared. No bill was generated.`)
+    } catch (err) {
+      alert(`Could not end the session for ${table.table_name}: ${err.message}\nPlease check the table and try again.`)
+      fetchAll()
+    } finally {
+      setClearing(false)
+    }
+  }
+
+  // Ask once, then end the session. `removed` = { itemName, qty } or null
+  // (null = the table simply has no billable items left).
+  const requestEndSession = (removed) => {
+    const table = selectedTable
+    if (!table) return
+    const intro = removed
+      ? `"${removed.itemName}" is the only item left on ${table.table_name}.`
+      : `${table.table_name} has no billable items.`
+    const ok = window.confirm(
+      `${intro}\n\n` +
+      `This will end the table's session and clear the table.\n` +
+      `No bill will be printed or saved.\n\nContinue?`
+    )
+    if (ok) endSessionForEmptyBill(table, removed)
+  }
+
+  const liveLineCountFor = () =>
+    selectedTable ? getEffectiveItems(selectedTable.id).length : 0
+
   const setItemQty = (rowId, originalQty, delta) => {
     const key = `row:${rowId}`
 
-    // Guard: removing the ONLY remaining line would leave an empty ₹0 bill.
+    // Removing the LAST remaining line would leave an empty bill:
+    // end the session instead of creating a zero-rupee bill.
     const currentQtyNow = itemQtyOverrides.hasOwnProperty(key) ? itemQtyOverrides[key] : originalQty
-    const liveLineCount = selectedTable ? getEffectiveItems(selectedTable.id).length : 0
-    if (isSoleItemRemoval({ liveLineCount, currentQty: currentQtyNow, delta })) {
-      const proceed = window.confirm(
-        'This is the only item on the bill.\n\nRemoving it will leave an empty bill of ₹0. Continue?'
-      )
-      if (!proceed) return
+    if (isSoleItemRemoval({ liveLineCount: liveLineCountFor(), currentQty: currentQtyNow, delta })) {
+      const row = billingSnapshotRef.current.items.find(r => r.rowId === rowId)
+      requestEndSession({
+        itemName: row?.food_items?.name || 'This item',
+        qty: row?.originalQty ?? originalQty,
+      })
+      return
     }
 
     setItemQtyOverrides(prev => {
@@ -336,9 +437,24 @@ export default function Dashboard() {
   }
 
   const changeMenuItemQty = (foodItemId, delta) => {
+    // Same rule for items added at billing time: removing the last
+    // remaining line ends the session instead of leaving a zero bill.
+    const target = manualItems.find(m => m.foodItemId === foodItemId)
+    if (target && isSoleItemRemoval({ liveLineCount: liveLineCountFor(), currentQty: target.qty, delta })) {
+      requestEndSession({ itemName: target.name, qty: target.qty })
+      return
+    }
     setManualItems(prev =>
       prev.map(m => m.foodItemId === foodItemId ? { ...m, qty: m.qty + delta } : m).filter(m => m.qty > 0)
     )
+  }
+
+  const removeManualItem = (mi) => {
+    if (isSoleItemRemoval({ liveLineCount: liveLineCountFor(), currentQty: mi.qty, delta: -mi.qty })) {
+      requestEndSession({ itemName: mi.name, qty: mi.qty })
+      return
+    }
+    setManualItems(prev => prev.filter(m => m.tempId !== mi.tempId))
   }
 
   const addOpenItem = () => {
@@ -352,51 +468,30 @@ export default function Dashboard() {
     setOpenName(''); setOpenPrice(''); setOpenQty(1); setShowOpenForm(false)
   }
 
-  // ── handlePrintAndSave — FIXED write-back verification ───────────────
-  // ROOT CAUSE of "Classic LIIT × 4" still showing in DB reads (Reports /
-  // Today's Report) after reducing to 2 in the editor, while the money
-  // fields (subtotal/final_amount) were correct:
+  // ── handlePrintAndSave — verified write-back ─────────────────────────
+  // Every order_items write checks the RETURNED quantity, then every
+  // touched row is re-read from the DB before anything prints or is marked
+  // paid. If any check fails we STOP: no receipt, no paid order.
   //
-  // The previous verification only checked that the UPDATE matched a row
-  // at all (`updatedRows.length === 0` as the sole failure condition). It
-  // never checked that the row it got back actually carried the NEW
-  // quantity. Supabase/PostgREST can return success with a matched row
-  // whose value didn't change the way you expect in edge cases (e.g. a
-  // stale closure value, a trigger normalizing/rejecting the value, a
-  // concurrent write racing it) — and none of those show up as a thrown
-  // error or an empty result set. So the function sailed past STEP 1,
-  // printed the receipt, and wrote the (correct) computed totals to
-  // `orders` in STEP 2 — leaving `order_items.quantity` permanently out
-  // of sync with `orders.subtotal` / `orders.final_amount`.
-  //
-  // FIX:
-  //   1. Every order_items write now checks the RETURNED quantity value,
-  //      not just row presence — `updatedRows[0].quantity !== newQty` is
-  //      now itself a failure condition.
-  //   2. As a second, independent safety net, we re-SELECT every touched
-  //      row after the update loop completes and confirm the persisted
-  //      quantity matches what we intended, before allowing anything to
-  //      print or save. This guards against any write that reports
-  //      "success" with the right shape but wrong value, or gets quietly
-  //      reverted between the UPDATE and here.
-  //   3. If ANY item fails either check, we STOP — no receipt is printed,
-  //      no order is marked paid — exactly as before, just with a
-  //      verification step that can no longer be fooled by a partially
-  //      "successful-looking" write.
+  // Validation order matters: discount and empty-bill checks run BEFORE
+  // setSaving(true) and before any database write, so a rejected request
+  // never causes a partial update.
   const handlePrintAndSave = async () => {
-    const dv = sanitizeDiscountValue(discountType, discountValue)
-    if (dv > 0 && !discountReason.trim()) { setDiscountReasonError(true); return }
-    setDiscountReasonError(false)
-
     const tblData = tables.find(t => t.id === payTableId)
     const {
       foodItems, liquorItems, foodSubtotal, liquorSubtotal,
       subtotal, serviceChargeAmt, discountAmt, finalAmount, discountCheck
     } = computeTotals(payTableId)
 
-    // Discount validation: block printing/saving if the discount is invalid.
-    // The reason is shown live under the discount input in the bill preview.
-    if (!discountCheck.ok) { return }
+    // 1. Reject an out-of-range discount (percent must be 1-99).
+    if (!discountCheck.ok) { alert(discountCheck.message); return }
+    // 2. Never print or save an empty bill.
+    if (subtotal <= 0) { alert('There is nothing to bill for this table.'); return }
+    if (finalAmount <= 0) { alert('This discount would leave nothing to pay. Please lower it.'); return }
+
+    const dv = discountCheck.value
+    if (dv > 0 && !discountReason.trim()) { setDiscountReasonError(true); return }
+    setDiscountReasonError(false)
 
     const snapshot = billingSnapshotRef.current.tableId === payTableId
       ? billingSnapshotRef.current
@@ -405,29 +500,14 @@ export default function Dashboard() {
     setSaving(true)
 
     // ── STEP 1: Persist itemQtyOverrides into real order_items rows ────
-    // This must succeed BEFORE we print anything or touch `orders`, so
-    // that a partial failure never results in a printed/saved bill whose
-    // totals don't match its item rows.
+    // Must succeed BEFORE printing or touching `orders`, so a partial
+    // failure never leaves a printed/saved bill whose totals don't match
+    // its item rows.
     //
-    // DIAGNOSTIC UPGRADE: every failure is now classified into ONE of
-    // exactly 3 plain-language reasons, and that reason is shown right
-    // inside the popup — no browser console needed:
-    //
-    //   Reason A — "Database rejected the change"
-    //     Supabase itself returned an error (network drop, permissions,
-    //     server-side rule). The `error.message` is included verbatim.
-    //
-    //   Reason B — "This item's record could not be found"
-    //     The UPDATE ran but matched ZERO rows — the row id this screen
-    //     was holding no longer exists in the database. Usually means
-    //     this bill was already modified/printed elsewhere (a second
-    //     browser tab, or the table was cleared) while this screen was
-    //     still open with old data.
-    //
-    //   Reason C — "Change was sent but did not save correctly"
-    //     The UPDATE matched the row, but when we immediately re-checked
-    //     it, the value wasn't what we asked for. Something else wrote
-    //     to this row at nearly the same time.
+    //   Reason A - database rejected the change (error message shown)
+    //   Reason B - the item's record could not be found (matched 0 rows)
+    //   Reason C - change was sent but did not save correctly
+    //   Reason D - read-back check below found a different value
     if (Object.keys(itemQtyOverrides).length > 0) {
       const failedItems = []
       const writtenRowIds = []
@@ -464,12 +544,8 @@ export default function Dashboard() {
           auditReason = `Change was sent but did not save correctly (tried to set ${newQty}, database still shows ${updatedRows[0].quantity}). Something else may be editing this bill at the same time.`
         }
 
-        // ── NEW: log this attempt to item_quantity_audit ──────────────
-        // One row per attempt, success or failure, with table name,
-        // item name, before/after quantity, and an exact timestamp.
-        // Never blocks the billing flow — if the audit write itself
-        // fails, we swallow that error (it's a diagnostic aid, not a
-        // correctness requirement) and continue with the normal logic.
+        // Log this attempt to item_quantity_audit (success or failure).
+        // Never blocks the billing flow.
         try {
           await supabase.from('item_quantity_audit').insert({
             table_name: tblData?.table_name || 'Unknown',
@@ -505,13 +581,6 @@ export default function Dashboard() {
       }
 
       // ── STEP 1b: Independent read-back verification ──────────────────
-      // Second safety net: re-fetch every row we just wrote and confirm
-      // what's actually persisted in the DB matches what we intended.
-      // This catches any write that reported "success" with the right
-      // shape but the wrong value, or got reverted between the UPDATE
-      // and now (e.g. by a concurrent process). This is a 4th check —
-      // "looked fine a moment ago, but isn't anymore" — reported with
-      // its own plain-language reason (Reason D).
       if (writtenRowIds.length > 0) {
         const { data: verifyRows, error: verifyError } = await supabase
           .from('order_items')
@@ -538,9 +607,6 @@ export default function Dashboard() {
         if (mismatches.length > 0) {
           setSaving(false)
 
-          // ── NEW: log the read-back mismatch too, so this 4th outcome
-          // ("looked fine right after saving, but wasn't a moment later")
-          // shows up in item_quantity_audit exactly like the other 3.
           for (const m of mismatches) {
             try {
               await supabase.from('item_quantity_audit').insert({
@@ -570,8 +636,8 @@ export default function Dashboard() {
       }
     }
 
-    // ── STEP 2: Now that item quantities are confirmed persisted, build
-    // and print the receipt, and write the order totals. ───────────────
+    // ── STEP 2: Item quantities are confirmed persisted. Build and print
+    // the receipt, and write the order totals. ─────────────────────────
     const now = new Date()
     const lines = {
       restaurantName: restaurant.name, address: restaurant.address,
@@ -660,14 +726,6 @@ export default function Dashboard() {
     } catch (err) { return false }
   }
 
-  const clearAllTables = async () => {
-    setShowClearAllConfirm(false); setClearing(true)
-    const active = tables.filter(t => orders.some(o => o.table_id === t.id))
-    for (const table of active) await nukeClearTable(table.id, [])
-    setNewOrderIds(new Set()); setNewOrderTables(new Set())
-    setSelectedTable(null); setClearing(false); fetchAll()
-  }
-
   const handleLogout = async () => { await supabase.auth.signOut(); navigate('/') }
 
   const liveSnapshot = selectedTable && billingSnapshotRef.current.tableId === selectedTable.id
@@ -687,7 +745,7 @@ export default function Dashboard() {
   const currentPin = selectedTableData?.pin || '----'
   const previewTotals = payTableId ? computeTotals(payTableId) : null
   const previewTableName = tables.find(t => t.id === payTableId)?.table_name || ''
-  const dv = sanitizeDiscountValue(discountType, discountValue)
+  const dv = previewTotals?.discountCheck?.value ?? 0
   const filteredMenuItems = allFoodItems.filter(f => f.name.toLowerCase().includes(menuSearch.toLowerCase()))
   const modifiedCount = Object.keys(itemQtyOverrides).length
 
@@ -785,15 +843,19 @@ export default function Dashboard() {
                       className="border rounded px-2 py-0.5 text-xs">
                       <option value="percent">%</option><option value="flat">₹ flat</option>
                     </select>
-                    <input type="number" min="0" max={discountType === 'percent' ? 100 : undefined} value={discountValue}
-                      onChange={e => { setDiscountValue(clampDiscountInput(discountType, e.target.value)); setDiscountReasonError(false) }}
+                    {/* Raw value is stored (no silent clamping) so an
+                        out-of-range entry shows an error instead of being
+                        quietly changed. Percent must be 1-99. */}
+                    <input type="number" min="1" max={discountType === 'percent' ? 99 : undefined} step="any"
+                      value={discountValue}
+                      onChange={e => { setDiscountValue(e.target.value); setDiscountReasonError(false) }}
                       placeholder="0"
                       className={`border rounded px-2 py-0.5 text-xs w-16 text-right ${!previewTotals.discountCheck.ok ? 'border-red-500 bg-red-50' : ''}`} />
                     {previewTotals.discountAmt > 0 && <span className="text-green-600 text-xs font-medium">-₹{previewTotals.discountAmt}</span>}
                   </div>
                 </div>
                 {!previewTotals.discountCheck.ok && (
-                  <p className="text-red-500 text-xs">⚠️ {previewTotals.discountCheck.message}</p>
+                  <p role="alert" className="text-red-500 text-xs">⚠️ {previewTotals.discountCheck.message}</p>
                 )}
                 {dv > 0 && (
                   <div>
@@ -831,7 +893,8 @@ export default function Dashboard() {
             </div>
 
             <div className="p-4 border-t space-y-2">
-              <button onClick={handlePrintAndSave} disabled={clearing || saving}
+              <button onClick={handlePrintAndSave}
+                disabled={clearing || saving || !previewTotals.discountCheck.ok || previewTotals.finalAmount <= 0}
                 className="w-full bg-green-500 text-white py-3 rounded-xl font-bold hover:bg-green-600 disabled:opacity-50">
                 {saving ? '⏳ Saving…' : '🖨️ Print & Save Bill'}
               </button>
@@ -839,19 +902,6 @@ export default function Dashboard() {
                 className="w-full bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium disabled:opacity-50">
                 ← Back to Edit
               </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showClearAllConfirm && (
-        <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl">
-            <h2 className="text-xl font-bold text-red-500 mb-2">⚠️ Clear All Active Tables?</h2>
-            <p className="text-gray-600 text-sm mb-4">This will clear all {activeTables.length} active tables.</p>
-            <div className="flex gap-3">
-              <button onClick={() => setShowClearAllConfirm(false)} className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium">Cancel</button>
-              <button onClick={clearAllTables} className="flex-1 bg-red-500 text-white py-2 rounded-xl font-medium">Yes, Clear All</button>
             </div>
           </div>
         </div>
@@ -865,12 +915,6 @@ export default function Dashboard() {
           <h1 className="text-lg font-bold text-orange-500 hidden sm:block">QR Menu Dashboard</h1>
         </div>
         <div className="flex gap-2 flex-wrap justify-end">
-          {activeTables.length > 0 && (
-            <button onClick={() => setShowClearAllConfirm(true)} disabled={clearing}
-              className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200 disabled:opacity-50">
-              🧹 Clear All
-            </button>
-          )}
           <button onClick={() => navigate('/admin/today-report')} className="bg-green-100 text-green-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-green-200">📋 Today's Report</button>
           <button onClick={() => navigate('/admin/reports')} className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">📊 Reports</button>
           <button onClick={() => navigate('/admin/menu')} className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Menu</button>
@@ -957,7 +1001,7 @@ export default function Dashboard() {
                     </div>
                   </div>
                   <button onClick={() => openPreview(selectedTable.id)}
-                    disabled={clearing || tableOrders.length === 0}
+                    disabled={clearing || tableOrders.length === 0 || displaySubtotal <= 0}
                     className="bg-green-500 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-green-600 transition disabled:opacity-50">
                     🖨️ Print Bill & Clear
                   </button>
@@ -1190,7 +1234,7 @@ export default function Dashboard() {
                                 </div>
                                 <p className="text-xs text-gray-400 mt-0.5">₹{mi.price} × {mi.qty} = ₹{mi.price * mi.qty}</p>
                               </div>
-                              <button onClick={() => setManualItems(prev => prev.filter(m => m.tempId !== mi.tempId))}
+                              <button onClick={() => removeManualItem(mi)}
                                 className="text-xs bg-red-100 text-red-500 px-2 py-1 rounded-full hover:bg-red-200">✕</button>
                             </div>
                           ))}
@@ -1262,7 +1306,9 @@ export default function Dashboard() {
               <div className="bg-orange-500 rounded-2xl shadow p-5 text-white mb-4">
                 <div className="flex justify-between items-center mb-1">
                   <span className="font-bold text-lg">Subtotal</span>
-                  <span className="font-bold text-2xl">₹{displaySubtotal}</span>
+                  {displaySubtotal > 0
+                    ? <span className="font-bold text-2xl">₹{displaySubtotal}</span>
+                    : <span className="font-semibold text-base">No billable items</span>}
                 </div>
                 {(modifiedCount > 0 || manualItems.length > 0) && (
                   <p className="text-orange-100 text-xs mb-2">
@@ -1271,11 +1317,19 @@ export default function Dashboard() {
                   </p>
                 )}
                 <p className="text-orange-100 text-xs mb-4">* Charges, discount & payment method set when printing bill</p>
-                <button onClick={() => openPreview(selectedTable.id)}
-                  disabled={clearing || tableOrders.length === 0}
-                  className="w-full bg-white text-orange-500 py-3 rounded-xl font-bold hover:bg-orange-50 transition text-sm disabled:opacity-50">
-                  🖨️ Print Bill & Clear Table
-                </button>
+                {displaySubtotal > 0 ? (
+                  <button onClick={() => openPreview(selectedTable.id)}
+                    disabled={clearing || tableOrders.length === 0}
+                    className="w-full bg-white text-orange-500 py-3 rounded-xl font-bold hover:bg-orange-50 transition text-sm disabled:opacity-50">
+                    🖨️ Print Bill & Clear Table
+                  </button>
+                ) : (
+                  <button onClick={() => requestEndSession(null)}
+                    disabled={clearing}
+                    className="w-full bg-white text-red-500 py-3 rounded-xl font-bold hover:bg-red-50 transition text-sm disabled:opacity-50">
+                    🧹 End Session (no bill)
+                  </button>
+                )}
               </div>
             </div>
           )}
