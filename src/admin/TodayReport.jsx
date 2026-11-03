@@ -1,7 +1,8 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
-import { sanitizeDiscountValue, calcDiscountAmount, clampDiscountInput } from '../utils/billing'
+import { calcDiscountAmount } from '../utils/billing'
+import { validateDiscount } from '../utils/discountValidation'
 
 const toIST = (d) => new Date(d).toLocaleTimeString('en-IN', {
   timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true
@@ -52,6 +53,17 @@ const formatDate = (d) => new Date(d).toLocaleDateString('en-IN', {
 // — i.e. they are genuinely part of the same bill. Different bills
 // (different print actions) will never share the exact same timestamp.
 // ─────────────────────────────────────────────────────────────────────
+// Per-order money snapshot. A merged bill can hold several order rows, and
+// each row must be zeroed out on its own when a bill is made complimentary.
+const orderMoney = (o) => ({
+  id: o.id,
+  subtotal: o.subtotal || 0,
+  service_charge_amt: o.service_charge_amt || 0,
+  discount_amt: o.discount_amt || 0,
+  discount_reason: o.discount_reason || '',
+  final_amount: o.final_amount || 0,
+})
+
 const groupOrdersIntoBills = (orders) => {
   const map = {}
   orders.forEach(order => {
@@ -59,7 +71,7 @@ const groupOrdersIntoBills = (orders) => {
     const key = `${order.table_name_snapshot || ''}__${order.paid_at || order.id}`
     if (!map[key]) {
       map[key] = {
-        _orderIds: [order.id], _key: key,
+        _orderIds: [order.id], _key: key, _orders: [orderMoney(order)],
         payment_type: order.payment_type,
         split_payment: order.split_payment || null,
         settlement_status: order.settlement_status,
@@ -90,6 +102,7 @@ const groupOrdersIntoBills = (orders) => {
       }
     } else {
       map[key]._orderIds.push(order.id)
+      map[key]._orders.push(orderMoney(order))
       map[key].order_items = [
         ...map[key].order_items,
         ...(order.order_items || [])
@@ -190,6 +203,9 @@ export default function TodayReport() {
   const [splitMode, setSplitMode] = useState('cash+upi')
   const [splitAmounts, setSplitAmounts] = useState({ first: '', second: '' })
   const [splitError, setSplitError] = useState('')
+  // Complimentary settlement: reason is mandatory
+  const [compReason, setCompReason] = useState('')
+  const [compReasonError, setCompReasonError] = useState(false)
 
   // ── Modify (discount-only) state ────────────────────────────────────
   const [modifyingBillKey, setModifyingBillKey] = useState(null)
@@ -261,7 +277,11 @@ export default function TodayReport() {
       if (b.split_payment) return s + (b.split_payment.card || 0)
       return s + (b.payment_type === 'card' ? b.final_amount || 0 : 0)
     }, 0)
-    setSummary({ totalRevenue, cashRev, upiRev, cardRev, settled: settled.length, pending: pending.length, total: grouped.length })
+    // Complimentary bills: ₹0 collected, so they add nothing to revenue above.
+    // compValue is the price of the items that were given free.
+    const compBills = settled.filter(b => b.payment_type === 'complimentary')
+    const compValue = compBills.reduce((s, b) => s + (b.subtotal || 0), 0)
+    setSummary({ totalRevenue, cashRev, upiRev, cardRev, settled: settled.length, pending: pending.length, total: grouped.length, compCount: compBills.length, compValue })
     setLoading(false)
   }
 
@@ -293,9 +313,13 @@ export default function TodayReport() {
     const subtotal = orderItemsTotal + openItemsTotal
     const serviceChargeAmt = Math.round(subtotal * (bill.service_charge_pct || 0) / 100)
     const afterService = subtotal + serviceChargeAmt
-    const discountAmt = calcDiscountAmount(discType, discVal, afterService)
+    // Same rule as the Dashboard: percent must be 1-99. An invalid discount is
+    // never applied (discountAmt stays 0 until the input is valid).
+    // A bill that should cost nothing goes through Settle -> Complimentary.
+    const discountCheck = validateDiscount(discType, discVal, afterService)
+    const discountAmt = discountCheck.ok ? calcDiscountAmount(discType, discVal, afterService) : 0
     const finalAmount = afterService - discountAmt
-    return { subtotal, serviceChargeAmt, discountAmt, finalAmount, effectiveItems }
+    return { subtotal, serviceChargeAmt, discountAmt, finalAmount, effectiveItems, discountCheck }
   }
 
   const modTotals = modifyingBill
@@ -434,13 +458,18 @@ export default function TodayReport() {
   // Only once all of that is confirmed do we recompute totals from the
   // now-persisted quantities, save the discount, and print.
   const handleSaveModify = async () => {
-    const dv = sanitizeDiscountValue(modDiscountType, modDiscountValue)
+    if (!modifyingBill || !modTotals) return
+    if (!modTotals.discountCheck.ok) { alert(modTotals.discountCheck.message); return }
+    if (modTotals.finalAmount <= 0) {
+      alert('This would leave nothing to pay. To give a bill free, use Settle Payment -> 🎁 Complimentary.')
+      return
+    }
+    const dv = modTotals.discountCheck.value
     if (dv > 0 && !modDiscountReason.trim()) {
       setModDiscountReasonError(true)
       return
     }
     setModDiscountReasonError(false)
-    if (!modifyingBill || !modTotals) return
     setModSaving(true)
     try {
       // ── STEP A: persist item quantity changes, if any ────────────────
@@ -637,6 +666,8 @@ export default function TodayReport() {
     setSplitMode('cash+upi')
     setSplitAmounts({ first: '', second: '' })
     setSplitError('')
+    setCompReason('')
+    setCompReasonError(false)
     setShowSettleModal(true)
   }
 
@@ -645,8 +676,90 @@ export default function TodayReport() {
     return { firstMethod: parts[0], secondMethod: parts[1] }
   }
 
+  // ── Complimentary: the guest pays nothing, the items stay on the bill ──
+  // How it is stored (no new columns needed):
+  //   payment_type = 'complimentary', final_amount = 0,
+  //   subtotal stays the real value of the items eaten,
+  //   discount_amt = subtotal + service charge (so the maths still adds up),
+  //   discount_reason = "Complimentary: <reason>".
+  // An audit row is written FIRST; if that fails nothing is changed.
+  const confirmComplimentary = async () => {
+    const reason = compReason.trim()
+    if (!reason) { setCompReasonError(true); return }
+    setCompReasonError(false)
+
+    const bill = settleBill
+    const name = bill.table_name_snapshot || 'this bill'
+    if (!window.confirm(
+      `Mark ${name} as COMPLIMENTARY?\n\n` +
+      `Items worth ₹${bill.subtotal} will be given free. The customer pays ₹0.\n` +
+      `The bill is locked after this and cannot be undone from this screen.\n\n` +
+      `Reason: ${reason}`
+    )) return
+
+    setSettling(bill._key)
+    try {
+      // 1. Audit trail first (fail closed)
+      const { data: { user } } = await supabase.auth.getUser()
+      const { error: auditErr } = await supabase.from('bill_audit_log').insert({
+        action: 'complimentary',
+        table_name: bill.table_name_snapshot || null,
+        order_ids: bill._orderIds,
+        performed_by: user?.email || 'unknown',
+        snapshot: { orders: bill._orders, open_items: bill.open_items, payment_type: bill.payment_type },
+        details: { reason, items_value: bill.subtotal, amount_before: bill.final_amount },
+      })
+      if (auditErr) {
+        throw new Error('Audit log could not be saved, so nothing was changed. ' +
+          auditErr.message + ' (Has complimentary-support.sql been run in Supabase?)')
+      }
+
+      // 2. Zero out every order row of this bill, checking each write
+      for (const o of bill._orders) {
+        const waivedRow = o.subtotal + o.service_charge_amt
+        const { data: rows, error } = await supabase.from('orders').update({
+          payment_type: 'complimentary',
+          settlement_status: 'settled',
+          split_payment: null,
+          discount_type: 'flat',
+          discount_value: waivedRow,
+          discount_amt: waivedRow,
+          discount_reason: `Complimentary: ${reason}` +
+            (o.discount_reason ? ` (earlier discount: ${o.discount_reason})` : ''),
+          final_amount: 0,
+        }).eq('id', o.id).select('id, final_amount')
+        if (error) throw new Error(error.message)
+        if (!rows || rows.length === 0 || rows[0].final_amount !== 0) {
+          throw new Error('One order row could not be updated. Please refresh and check this bill.')
+        }
+      }
+
+      // 3. Daily report: the bill is counted, but no money is added
+      const today = todayIST()
+      const { data: existing } = await supabase.from('daily_reports').select('*').eq('report_date', today).single()
+      if (existing) {
+        await supabase.from('daily_reports').update({
+          total_orders: existing.total_orders + 1,
+          updated_at: new Date().toISOString()
+        }).eq('report_date', today)
+      } else {
+        await supabase.from('daily_reports').insert({
+          report_date: today, total_orders: 1, total_revenue: 0,
+          cash_revenue: 0, upi_revenue: 0, card_revenue: 0, service_charge_total: 0
+        })
+      }
+    } catch (err) {
+      alert('❌ Could not mark this bill as complimentary:\n' + err.message + '\n\nPlease check the bill before trying again.')
+    } finally {
+      setSettling(null)
+      setShowSettleModal(false)
+      fetchTodayBills()
+    }
+  }
+
   const confirmSettle = async () => {
     if (!settleBill) return
+    if (settleType === 'complimentary') { await confirmComplimentary(); return }
 
     let paymentType = settleType
     let splitPayload = null
@@ -739,6 +852,7 @@ export default function TodayReport() {
   const PayBadge = ({ type, split }) => {
     if (split) return <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-indigo-100 text-indigo-700">🔀 Split</span>
     if (!type || type === 'pending') return <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-yellow-100 text-yellow-700">⏳ Pending</span>
+    if (type === 'complimentary') return <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-pink-100 text-pink-700">🎁 Complimentary</span>
     return <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${type === 'cash' ? 'bg-green-100 text-green-600' : type === 'upi' ? 'bg-blue-100 text-blue-600' : 'bg-purple-100 text-purple-600'}`}>
       {type === 'cash' ? '💵 Cash' : type === 'upi' ? '📱 UPI' : '💳 Card'}
     </span>
@@ -771,20 +885,21 @@ export default function TodayReport() {
               )}
               <div className="border-t pt-2 flex justify-between font-bold text-gray-800">
                 <span>Amount to Collect</span>
-                <span className="text-orange-500 text-lg">₹{settleBill.final_amount}</span>
+                <span className="text-orange-500 text-lg">{settleType === 'complimentary' ? '₹0' : `₹${settleBill.final_amount}`}</span>
               </div>
             </div>
 
             <p className="text-sm font-medium text-gray-700 mb-2">How did they pay?</p>
-            <div className="grid grid-cols-4 gap-1.5 mb-4">
+            <div className="grid grid-cols-5 gap-1 mb-4">
               {[
                 { id: 'cash',  label: '💵 Cash' },
                 { id: 'upi',   label: '📱 UPI' },
                 { id: 'card',  label: '💳 Card' },
                 { id: 'split', label: '🔀 Split' },
+                { id: 'complimentary', label: '🎁 Free' },
               ].map(p => (
-                <button key={p.id} onClick={() => { setSettleType(p.id); setSplitError('') }}
-                  className={`py-2.5 rounded-xl text-xs font-semibold border-2 transition
+                <button key={p.id} onClick={() => { setSettleType(p.id); setSplitError(''); setCompReasonError(false) }}
+                  className={`py-2.5 rounded-xl text-[11px] font-semibold border-2 transition
                     ${settleType === p.id ? 'border-orange-500 bg-orange-50 text-orange-600' : 'border-gray-200 text-gray-500 hover:border-orange-300'}`}>
                   {p.label}
                 </button>
@@ -837,11 +952,29 @@ export default function TodayReport() {
               </div>
             )}
 
+            {settleType === 'complimentary' && (
+              <div className="bg-pink-50 border border-pink-200 rounded-xl p-3 mb-4 space-y-2">
+                <p className="text-sm font-bold text-pink-700">🎁 Complimentary bill</p>
+                <p className="text-xs text-pink-600">
+                  The customer pays ₹0. Items worth ₹{settleBill.subtotal} stay on the bill and are shown in reports as given free.
+                  This cannot be undone from here.
+                </p>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Reason <span className="text-red-500">*</span></label>
+                  <input type="text" value={compReason}
+                    onChange={e => { setCompReason(e.target.value); setCompReasonError(false) }}
+                    placeholder="e.g. Owner's guest, service recovery…"
+                    className={`w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-pink-400 ${compReasonError ? 'border-red-500 bg-red-50' : 'border-gray-300'}`} />
+                  {compReasonError && <p className="text-red-500 text-xs mt-1">⚠️ A reason is required for a complimentary bill.</p>}
+                </div>
+              </div>
+            )}
+
             <div className="flex gap-3">
               <button onClick={() => setShowSettleModal(false)} className="flex-1 bg-gray-100 text-gray-700 py-3 rounded-xl font-medium">Cancel</button>
               <button onClick={confirmSettle} disabled={!!settling}
                 className="flex-1 bg-orange-500 text-white py-3 rounded-xl font-bold hover:bg-orange-600 disabled:opacity-50">
-                {settling ? '⏳...' : '✅ Confirm'}
+                {settling ? '⏳...' : settleType === 'complimentary' ? '🎁 Mark Free' : '✅ Confirm'}
               </button>
             </div>
           </div>
@@ -866,6 +999,7 @@ export default function TodayReport() {
                 <div className="flex justify-between text-green-600"><span>💵 Cash</span><span className="font-bold">₹{summary.cashRev}</span></div>
                 <div className="flex justify-between text-blue-600"><span>📱 UPI</span><span className="font-bold">₹{summary.upiRev}</span></div>
                 <div className="flex justify-between text-purple-600"><span>💳 Card</span><span className="font-bold">₹{summary.cardRev}</span></div>
+                {summary.compCount > 0 && <div className="flex justify-between text-pink-600"><span>🎁 Complimentary</span><span className="font-bold">{summary.compCount} · ₹{summary.compValue}</span></div>}
               </div>
             )}
             <div className="flex gap-3">
@@ -919,6 +1053,16 @@ export default function TodayReport() {
               <p className="text-xs text-gray-500 mb-1">📱 UPI + 💳 Card</p>
               <p className="text-2xl font-bold text-blue-600">₹{summary.upiRev + summary.cardRev}</p>
             </div>
+          </div>
+        )}
+
+        {summary && summary.compCount > 0 && (
+          <div className="bg-pink-50 border border-pink-200 rounded-2xl p-4 mb-6 flex justify-between items-center">
+            <div>
+              <p className="text-xs text-gray-500 mb-1">🎁 Complimentary (given free)</p>
+              <p className="text-xl font-bold text-pink-600">₹{summary.compValue}</p>
+            </div>
+            <p className="text-sm text-pink-600">{summary.compCount} bill{summary.compCount > 1 ? 's' : ''} · ₹0 collected</p>
           </div>
         )}
 
@@ -1061,16 +1205,19 @@ export default function TodayReport() {
                                 <option value="flat">₹ Flat</option>
                               </select>
                               <input
-                                type="number" min="0"
+                                type="number" min="1" max={modDiscountType === 'percent' ? 99 : undefined} step="any"
                                 value={modDiscountValue}
-                                onChange={e => { setModDiscountValue(clampDiscountInput(modDiscountType, e.target.value)); setModDiscountReasonError(false) }}
+                                onChange={e => { setModDiscountValue(e.target.value); setModDiscountReasonError(false) }}
                                 placeholder={modDiscountType === 'percent' ? 'e.g. 10' : 'e.g. 50'}
-                                className="flex-1 border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400"
+                                className={`flex-1 border rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400 ${liveModTotals && !liveModTotals.discountCheck.ok ? 'border-red-500 bg-red-50' : 'border-gray-200'}`}
                               />
                               {liveModTotals && liveModTotals.discountAmt > 0 && (
                                 <span className="text-green-600 text-sm font-bold">-₹{liveModTotals.discountAmt}</span>
                               )}
                             </div>
+                            {liveModTotals && !liveModTotals.discountCheck.ok && (
+                              <p role="alert" className="text-red-500 text-xs">⚠️ {liveModTotals.discountCheck.message}</p>
+                            )}
 
                             {/* Reason — mandatory when discount > 0 */}
                             <div>
@@ -1114,7 +1261,7 @@ export default function TodayReport() {
                               className="flex-1 bg-gray-100 text-gray-600 py-2.5 rounded-xl text-sm font-medium">
                               Cancel
                             </button>
-                            <button onClick={handleSaveModify} disabled={modSaving}
+                            <button onClick={handleSaveModify} disabled={modSaving || (liveModTotals && !liveModTotals.discountCheck.ok)}
                               className="flex-1 bg-purple-500 text-white py-2.5 rounded-xl font-bold hover:bg-purple-600 disabled:opacity-50 flex items-center justify-center gap-2">
                               {modSaving ? '⏳ Saving...' : '🖨️ Print & Save'}
                             </button>
@@ -1177,6 +1324,11 @@ export default function TodayReport() {
                             <span>₹{amt}</span>
                           </div>
                         ))}
+                      </div>
+                    )}
+                    {bill.payment_type === 'complimentary' && (
+                      <div className="mt-2 bg-pink-50 rounded-lg px-3 py-2 text-xs text-pink-600">
+                        🎁 Given free · items worth ₹{bill.subtotal}
                       </div>
                     )}
                     {(bill.service_charge_amt > 0 || bill.discount_amt > 0) && (
