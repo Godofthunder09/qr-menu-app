@@ -11,16 +11,26 @@ export default function TableManager() {
   const [loading, setLoading] = useState(false)
   const [deleting, setDeleting] = useState(null)
   const [message, setMessage] = useState('')
+  const [loadError, setLoadError] = useState('')
   const navigate = useNavigate()
 
   // Only show tables that have not been (soft) deleted.
+  // Needs the `deleted_at` column on the `tables` table
+  // (added by PART 2 of complete_db_setup.sql).
   const fetchTables = async () => {
     const { data, error } = await supabase
       .from('tables')
       .select('*')
       .is('deleted_at', null)
       .order('created_at')
-    if (error) { alert('Error loading tables: ' + error.message + '\n\nHave you run the deleted_at SQL in Supabase?'); return }
+    if (error) {
+      setLoadError(
+        'Error loading tables: ' + error.message +
+        ' — run complete_db_setup.sql in the Supabase SQL Editor (it adds the deleted_at column).'
+      )
+      return
+    }
+    setLoadError('')
     setTables(data || [])
   }
 
@@ -71,9 +81,9 @@ export default function TableManager() {
   }
 
   // ── SAFE DELETE (soft delete) ─────────────────────────────────────────
-  // The table row is only marked as deleted. Orders, order items and
-  // payments are NEVER touched, so reports and settled bills keep working
-  // (orders already store table_name_snapshot for display).
+  // The table row is only marked as deleted (deleted_at is set).
+  // Orders, order items and payments are NEVER touched, so reports and
+  // settled bills keep working (orders store table_name_snapshot for display).
   const deleteTable = async (table) => {
     // Refuse to remove a table that still has unpaid orders.
     const { data: unpaid, error: unpaidErr } = await supabase
@@ -93,6 +103,14 @@ export default function TableManager() {
 
     setDeleting(table.id)
     try {
+      // Make sure old paid orders keep the table name for reports.
+      const { error: snapErr } = await supabase
+        .from('orders')
+        .update({ table_name_snapshot: table.table_name })
+        .eq('table_id', table.id)
+        .or('table_name_snapshot.is.null,table_name_snapshot.eq.')
+      if (snapErr) throw new Error(snapErr.message)
+
       const { error } = await supabase
         .from('tables')
         .update({
@@ -148,6 +166,12 @@ export default function TableManager() {
           </div>
         )}
 
+        {loadError && (
+          <div className="bg-red-100 text-red-700 px-4 py-3 rounded-lg mb-4 text-sm font-medium">
+            {loadError}
+          </div>
+        )}
+
         {/* Add Table */}
         <div className="bg-white rounded-2xl shadow p-6 mb-6">
           <h2 className="font-bold text-gray-700 mb-4">
@@ -174,7 +198,7 @@ export default function TableManager() {
 
         {/* Tables Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {tables.length === 0 && (
+          {tables.length === 0 && !loadError && (
             <div className="col-span-2 text-center py-16 text-gray-400">
               <div className="text-5xl mb-3">🪑</div>
               <p>No tables yet. Add your first table above!</p>
