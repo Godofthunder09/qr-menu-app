@@ -101,8 +101,9 @@ const DEPT_COLORS = {
   Bakery:   { badge: 'bg-yellow-100 text-yellow-700', icon: '🥖', card: 'bg-yellow-50 border-yellow-200', text: 'text-yellow-700' },
   Beverage: { badge: 'bg-blue-100 text-blue-700',     icon: '🥤', card: 'bg-blue-50 border-blue-200',     text: 'text-blue-600' },
   Liquor:   { badge: 'bg-purple-100 text-purple-700', icon: '🍺', card: 'bg-purple-50 border-purple-200', text: 'text-purple-600' },
+  Billing:  { badge: 'bg-emerald-100 text-emerald-700', icon: '🧾', card: 'bg-emerald-50 border-emerald-200', text: 'text-emerald-600' },
 }
-const DEPT_ORDER = ['Kitchen', 'Tandoor', 'Bakery', 'Beverage', 'Liquor']
+const DEPT_ORDER = ['Kitchen', 'Tandoor', 'Bakery', 'Beverage', 'Liquor', 'Billing']
 const deptStyle = (d) => DEPT_COLORS[d] || DEPT_COLORS.Kitchen
 
 const resolveDept = (dbDept, name) => (dbDept && DEPT_COLORS[dbDept] ? dbDept : guessDept(name))
