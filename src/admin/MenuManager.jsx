@@ -4,8 +4,7 @@ import { supabase } from '../supabase/client'
 import * as XLSX from 'xlsx'
 
 // Allowed kitchen/production departments (matches DB column `department` on food_items)
-const DEPARTMENTS = ['Kitchen', 'Beverage', 'Liquor', 'Tandoor']
-
+const DEPARTMENTS = ['Kitchen', 'Beverage', 'Liquor', 'Tandoor', 'Billing']
 // Supabase Storage bucket used for item photos.
 // Create this bucket once in Supabase Dashboard → Storage → New bucket
 // Name: menu-images   |   Public bucket: ON
@@ -399,7 +398,7 @@ export default function MenuManager() {
             '  C: Item Name',
             '  D: Description',
             '  E: Price',
-            '  F: Department (optional — Kitchen / Beverage / Liquor / Tandoor)',
+            '  F: Department (optional — Kitchen / Beverage / Liquor / Tandoor / Billing)',
           ]); return
         }
 
@@ -551,6 +550,7 @@ export default function MenuManager() {
       case 'Beverage': return 'bg-cyan-100 text-cyan-700'
       case 'Liquor':   return 'bg-purple-100 text-purple-700'
       case 'Tandoor':  return 'bg-red-100 text-red-700'
+      case 'Billing':  return 'bg-emerald-100 text-emerald-700'
       default:         return 'bg-gray-100 text-gray-400'
     }
   }
