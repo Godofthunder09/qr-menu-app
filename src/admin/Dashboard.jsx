@@ -3,6 +3,10 @@ import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 import { calcDiscountAmount } from '../utils/billing'
 import { validateDiscount, isSoleItemRemoval } from '../utils/discountValidation'
+import {
+  DEPARTMENTS, loadPrinterConfig, savePrinterConfig,
+  loadPrintedItemIds, savePrintedItemIds, printDepartmentTickets
+} from '../utils/departmentPrint'
 
 const toIST = (d) => new Date(d).toLocaleTimeString('en-IN', {
   timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true
@@ -83,6 +87,14 @@ export default function Dashboard() {
   const [sessionStart] = useState(() => new Date().toISOString())
   const [saving, setSaving] = useState(false)
 
+  // ── Department printers (KOT) ───────────────────────────────────
+  const [printerConfig, setPrinterConfig] = useState(() => loadPrinterConfig())
+  const [showPrinterSetup, setShowPrinterSetup] = useState(false)
+  const [printStatus, setPrintStatus] = useState(null) // { ok, text }
+  const printerConfigRef = useRef(printerConfig)
+  const printedItemIdsRef = useRef(loadPrintedItemIds())
+  const printingRef = useRef(false)
+
   const [restaurant, setRestaurant] = useState({
     name: 'My Restaurant', address: '', phone: '',
     gst_number: '', footer_note: 'Thank you! Visit again!'
@@ -159,12 +171,82 @@ export default function Dashboard() {
     } catch (e) {}
   }, [])
 
+  // ── Auto-print department tickets for every NEW order item ─────────
+  // Each order_items row is printed exactly once (its id is remembered in
+  // localStorage). Items are grouped by food_items.department and each
+  // group goes to that department's printer: name + quantity only.
+  const autoPrintNewItems = useCallback(async (ordersData) => {
+    const cfg = printerConfigRef.current
+    if (!cfg.enabled || printingRef.current) return
+    const printed = printedItemIdsRef.current
+    const batches = [] // one per order, so each ticket shows its table
+    ordersData.forEach(o => {
+      if (!(o.created_at > sessionStart)) return // only orders placed this session
+      const fresh = (o.order_items || []).filter(i => i.quantity > 0 && !printed.has(i.id))
+      if (fresh.length === 0) return
+      batches.push({ order: o, items: fresh })
+    })
+    if (batches.length === 0) return
+
+    printingRef.current = true
+    try {
+      for (const { order, items } of batches) {
+        const result = await printDepartmentTickets({
+          tableName: order.tables?.table_name || order.table_name_snapshot || 'Table',
+          time: toIST(order.created_at),
+          items: items.map(i => ({
+            name: i.food_items?.name || 'Unknown',
+            qty: i.quantity,
+            department: i.food_items?.department || null,
+          })),
+          config: cfg,
+        })
+        // Mark as printed only the departments that really printed,
+        // so a failed printer is retried on the next poll.
+        items.forEach(i => {
+          const dep = i.food_items?.department || cfg.defaultDepartment
+          if (!result.failed.includes(dep)) printed.add(i.id)
+        })
+        savePrintedItemIds(printed)
+        if (result.failed.length > 0) {
+          setPrintStatus({ ok: false, text: `⚠️ Could not print to: ${result.failed.join(', ')} (${order.tables?.table_name || ''}). ${result.error || ''}` })
+        } else {
+          setPrintStatus({ ok: true, text: `🖨️ Sent to ${result.printed.join(', ')} — ${order.tables?.table_name || ''}` })
+        }
+      }
+    } finally {
+      printingRef.current = false
+    }
+  }, [sessionStart])
+
+  const reprintOrder = async (order) => {
+    const cfg = printerConfigRef.current
+    const result = await printDepartmentTickets({
+      tableName: order.tables?.table_name || 'Table',
+      time: toIST(order.created_at),
+      items: (order.order_items || []).filter(i => i.quantity > 0).map(i => ({
+        name: i.food_items?.name || 'Unknown', qty: i.quantity,
+        department: i.food_items?.department || null,
+      })),
+      config: cfg, reprint: true,
+    })
+    setPrintStatus(result.failed.length
+      ? { ok: false, text: `⚠️ Reprint failed: ${result.failed.join(', ')}. ${result.error || ''}` }
+      : { ok: true, text: `🖨️ Reprinted to ${result.printed.join(', ')}` })
+  }
+
+  const updatePrinterConfig = (next) => {
+    setPrinterConfig(next)
+    printerConfigRef.current = next
+    savePrinterConfig(next)
+  }
+
   const fetchAll = useCallback(async () => {
     const { data: tablesData } = await supabase.from('tables').select('*').order('created_at')
     setTables(tablesData || [])
     const { data: ordersData } = await supabase
       .from('orders')
-      .select(`*, tables(table_name), order_items(id, food_item_id, quantity, price_at_order, note, food_items(name))`)
+      .select(`*, tables(table_name), order_items(id, food_item_id, quantity, price_at_order, note, food_items(name, department))`)
       .eq('is_paid', false).order('created_at', { ascending: false })
     if (ordersData) {
       const addedOrderIds = new Set(); const addedTableIds = new Set()
@@ -180,9 +262,10 @@ export default function Dashboard() {
       }
       prevOrderIds.current = new Set(ordersData.map(o => o.id))
       setOrders(ordersData)
+      autoPrintNewItems(ordersData)
     }
     setLoading(false)
-  }, [sessionStart, playTingTing])
+  }, [sessionStart, playTingTing, autoPrintNewItems])
 
   useEffect(() => {
     fetchAll()
@@ -758,6 +841,53 @@ export default function Dashboard() {
         </div>
       )}
 
+      {printStatus && (
+        <div className={`${printStatus.ok ? 'bg-green-600' : 'bg-red-600'} text-white text-xs py-1.5 px-3 flex justify-between items-center`}>
+          <span>{printStatus.text}</span>
+          <button onClick={() => setPrintStatus(null)} className="ml-3 font-bold">✕</button>
+        </div>
+      )}
+
+      {/* ── Department Printer Setup Modal ───────────── */}
+      {showPrinterSetup && (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl max-h-[92vh] overflow-y-auto p-5 space-y-4">
+            <h3 className="font-bold text-lg text-gray-800">🖨️ Department Printers</h3>
+            <p className="text-xs text-gray-500">
+              Type the exact printer name as shown in QZ Tray / your OS printer list.
+              Saved on this computer only.
+            </p>
+            <label className="flex items-center gap-2 text-sm text-gray-700">
+              <input type="checkbox" checked={printerConfig.enabled}
+                onChange={e => updatePrinterConfig({ ...printerConfig, enabled: e.target.checked })} />
+              Auto-print new orders to department printers
+            </label>
+            {DEPARTMENTS.map(dep => (
+              <div key={dep}>
+                <label className="text-xs text-gray-500 block mb-1">{dep} printer</label>
+                <input type="text" value={printerConfig.printers[dep] || ''}
+                  onChange={e => updatePrinterConfig({
+                    ...printerConfig,
+                    printers: { ...printerConfig.printers, [dep]: e.target.value }
+                  })}
+                  placeholder={`e.g. ${dep.toUpperCase()}-PRINTER`}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+              </div>
+            ))}
+            <div>
+              <label className="text-xs text-gray-500 block mb-1">Items with no department go to</label>
+              <select value={printerConfig.defaultDepartment}
+                onChange={e => updatePrinterConfig({ ...printerConfig, defaultDepartment: e.target.value })}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+              </select>
+            </div>
+            <button onClick={() => setShowPrinterSetup(false)}
+              className="w-full bg-orange-500 text-white py-2.5 rounded-xl font-bold">Done</button>
+          </div>
+        </div>
+      )}
+
       {/* ── Bill Preview Modal ───────────────────────── */}
       {showPreview && previewTotals && (
         <div className="fixed inset-0 z-50 bg-black bg-opacity-70 flex items-center justify-center p-4">
@@ -919,6 +1049,7 @@ export default function Dashboard() {
           <button onClick={() => navigate('/admin/reports')} className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">📊 Reports</button>
           <button onClick={() => navigate('/admin/menu')} className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Menu</button>
           <button onClick={() => navigate('/admin/tables')} className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">Tables</button>
+          <button onClick={() => setShowPrinterSetup(true)} className="bg-purple-100 text-purple-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-purple-200">🖨️ Printers</button>
           <button onClick={() => navigate('/admin/settings')} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-gray-200">⚙️ Settings</button>
           <button onClick={handleLogout} className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200">Logout</button>
         </div>
@@ -1258,7 +1389,11 @@ export default function Dashboard() {
                           {isNewOrder && <span className="bg-yellow-400 text-yellow-900 text-xs font-bold px-3 py-1 rounded-full animate-pulse">🆕 New!</span>}
                           {!isNewOrder && index === 0 && <span className="bg-green-100 text-green-600 text-xs font-bold px-3 py-1 rounded-full">Latest ✨</span>}
                         </div>
-                        <span className="text-xs text-gray-400">🕐 {toIST(order.created_at)}</span>
+                        <div className="flex items-center gap-2">
+                          <button onClick={() => reprintOrder(order)}
+                            className="text-xs bg-purple-100 text-purple-600 px-2 py-1 rounded-full hover:bg-purple-200">🖨️ Reprint KOT</button>
+                          <span className="text-xs text-gray-400">🕐 {toIST(order.created_at)}</span>
+                        </div>
                       </div>
                       <div className="space-y-2">
                         {order.items.map((row) => {
