@@ -1,1282 +1,640 @@
-import { useEffect, useState, useRef } from 'react'
-import { useNavigate } from 'react-router-dom'
+// src/customer/MenuPage.jsx
+// Replace your existing MenuPage.jsx with this file.
+// "My Orders" tab removed — replaced with 📋 Orders button in header.
+
+import { useEffect, useRef, useState } from 'react'
+import { useSearchParams, useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
-import * as XLSX from 'xlsx'
+import { useOrderSummary } from './useOrderSummary'
 
-// Allowed kitchen/production departments (matches DB column `department` on food_items)
-const DEPARTMENTS = ['Kitchen', 'Beverage', 'Liquor', 'Tandoor', 'Billing']
-// Supabase Storage bucket used for item photos.
-// Create this bucket once in Supabase Dashboard → Storage → New bucket
-// Name: menu-images   |   Public bucket: ON
-const IMAGE_BUCKET = 'menu-images'
+export default function MenuPage() {
+  const [searchParams] = useSearchParams()
+  const tableId = searchParams.get('table')
 
-export default function MenuManager() {
+  const [tableName, setTableName]           = useState('')
+  const [, setSessionVersion]               = useState(null)
+  const [categories, setCategories]         = useState([])
+  const [foodItems, setFoodItems]           = useState([])
+  const [activeCategory, setActiveCategory] = useState('all')
+  const [cart, setCart]                     = useState([])
+  const [showCart, setShowCart]             = useState(false)
+  const [showOrders, setShowOrders]         = useState(false)
+  const [loading, setLoading]               = useState(true)
+  const [placing, setPlacing]               = useState(false)
+  const [searchQuery, setSearchQuery]       = useState('')
+  const [suggestions, setSuggestions]       = useState([])
+  const [zoomedImage, setZoomedImage]       = useState(null)
+  const [phase, setPhase]                   = useState('welcome')
+  const [noteItem, setNoteItem]             = useState(null)
+  const [noteText, setNoteText]             = useState('')
+  const [pinPhase, setPinPhase]             = useState(false)
+  const [pinInput, setPinInput]             = useState('')
+  const [pinError, setPinError]             = useState('')
+  const [pinVerified, setPinVerified]       = useState(false)
   const navigate = useNavigate()
+  const placingRef = useRef(false) // blocks double taps instantly (state updates are too slow)
 
-  // ── State ─────────────────────────────────────────────────
-  const [categories, setCategories] = useState([])
-  const [subcategories, setSubcategories] = useState([])
-  const [foodItems, setFoodItems] = useState([])
-  const [filterCat, setFilterCat] = useState('all')
-  const [filterDept, setFilterDept] = useState('all')
-  const [activeTab, setActiveTab] = useState('items')
-  const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
-  const [msg, setMsg] = useState(null)
+  const { orderSummary, loadOrderSummary, saveCartToSummary, clearSummary } = useOrderSummary()
 
-  // Category forms
-  const [newCatName, setNewCatName] = useState('')
-  const [newSubName, setNewSubName] = useState('')
-  const [newSubParent, setNewSubParent] = useState('')
-  const [editCatId, setEditCatId] = useState(null)
-  const [editCatName, setEditCatName] = useState('')
-  const [editSubId, setEditSubId] = useState(null)
-  const [editSubName, setEditSubName] = useState('')
-  const [editSubParent, setEditSubParent] = useState('')
+  const SESSION_KEY = `pin_session_${tableId}`
+  const VERSION_KEY = `ver_${tableId}`
 
-  // Item forms
-  const [newItem, setNewItem] = useState({
-    name: '', price: '', category_id: '', subcategory_id: '',
-    description: '', is_available: true, image_url: '', department: ''
-  })
-  const [editItem, setEditItem] = useState(null)
+  // ── Splash animation ───────────────────────────────────────
+  useEffect(() => {
+    const t1 = setTimeout(() => setPhase('logo'), 2000)
+    const t2 = setTimeout(() => setPhase('ready'), 4000)
+    return () => { clearTimeout(t1); clearTimeout(t2) }
+  }, [])
 
-  // ── Image upload state ────────────────────────────────────
-  const [uploadingNewImage, setUploadingNewImage] = useState(false)
-  const [uploadingEditImage, setUploadingEditImage] = useState(false)
-
-  // ── Checkbox / bulk selection ─────────────────────────────
-  const [selectedIds, setSelectedIds] = useState(new Set())
-  const [bulkLoading, setBulkLoading] = useState(false)
-
-  // ── Excel upload ──────────────────────────────────────────
-  const [showExcelModal, setShowExcelModal] = useState(false)
-  const [excelPreview, setExcelPreview] = useState([])   // parsed rows
-  const [excelErrors, setExcelErrors] = useState([])
-  const [excelUploading, setExcelUploading] = useState(false)
-  const [excelResult, setExcelResult] = useState(null)   // { added, skipped, errors }
-  const fileInputRef = useRef(null)
-
-  // ── Message helper ────────────────────────────────────────
-  const showMsg = (text, type = 'success') => {
-    setMsg({ text, type })
-    setTimeout(() => setMsg(null), 5000)
-  }
-
-  // ── Fetch ─────────────────────────────────────────────────
-  useEffect(() => { fetchAll() }, [])
-
-  const fetchAll = async () => {
+  // ── Init ───────────────────────────────────────────────────
+  const init = async () => {
     setLoading(true)
-    const [{ data: cats }, { data: items }] = await Promise.all([
-      supabase.from('categories').select('*').order('created_at'),
-      supabase.from('food_items')
-        .select(`*, category:categories!food_items_category_id_fkey(id,name),
-                     subcategory:categories!food_items_subcategory_id_fkey(id,name)`)
-        .order('created_at'),
-    ])
-    setCategories((cats || []).filter(c => !c.is_subcategory))
-    setSubcategories((cats || []).filter(c => c.is_subcategory))
-    setFoodItems(items || [])
-    setSelectedIds(new Set())
-    setLoading(false)
-  }
+    const { data: tbl } = await supabase
+      .from('tables').select('*').eq('id', tableId).single()
 
-  // ── Category CRUD ─────────────────────────────────────────
-  const addCategory = async () => {
-    const name = newCatName.trim()
-    if (!name) { showMsg('Enter category name', 'error'); return }
-    setSaving(true)
-    const { error } = await supabase.from('categories').insert({ name, is_subcategory: false })
-    setSaving(false)
-    if (error) { showMsg('Error adding category: ' + error.message, 'error'); return }
-    setNewCatName(''); showMsg('Category added ✅'); fetchAll()
-  }
+    if (!tbl) { setLoading(false); setPinPhase(true); return }
+    setTableName(tbl.table_name)
 
-  const saveEditCategory = async () => {
-    const name = editCatName.trim()
-    if (!name) { showMsg('Enter category name', 'error'); return }
-    setSaving(true)
-    const { error } = await supabase.from('categories').update({ name }).eq('id', editCatId)
-    setSaving(false)
-    if (error) { showMsg('Error updating category: ' + error.message, 'error'); return }
-    setEditCatId(null); setEditCatName(''); showMsg('Category updated ✅'); fetchAll()
-  }
+    const dbVer = tbl.session_version || 1
+    const myVer = parseInt(localStorage.getItem(VERSION_KEY) || '0')
 
-  const deleteCategory = async (cat) => {
-    // Check food items using this category
-    const { count: itemCount } = await supabase
-      .from('food_items').select('id', { count: 'exact', head: true }).eq('category_id', cat.id)
-    if (itemCount > 0) {
-      showMsg(`❌ "${cat.name}" has ${itemCount} item(s). Remove or reassign them first.`, 'error'); return
+    if (dbVer !== myVer) {
+      clearLocalData(); setLoading(false); setPinPhase(true); return
     }
-    // Check subcategories — column is parent_id (NOT parent_category_id)
-    const subs = subcategories.filter(s => s.parent_id === cat.id)
-    if (subs.length > 0) {
-      showMsg(`❌ "${cat.name}" has ${subs.length} subcategory/ies. Delete them first.`, 'error'); return
-    }
-    if (!window.confirm(`Delete category "${cat.name}"?`)) return
-    setSaving(true)
-    const { error } = await supabase.from('categories').delete().eq('id', cat.id)
-    setSaving(false)
-    if (error) { showMsg('Error deleting category: ' + error.message, 'error'); return }
-    showMsg('Category deleted ✅'); fetchAll()
-  }
 
-  // ── Subcategory CRUD — uses correct column `parent_id` ───
-  const addSubcategory = async () => {
-    const name = newSubName.trim()
-    if (!name) { showMsg('Enter subcategory name', 'error'); return }
-    if (!newSubParent) { showMsg('Select a parent category', 'error'); return }
-    setSaving(true)
-    // FIX: column is `parent_id`, NOT `parent_category_id`
-    const { error } = await supabase.from('categories').insert({
-      name, is_subcategory: true, parent_id: newSubParent
-    })
-    setSaving(false)
-    if (error) { showMsg('Error adding subcategory: ' + error.message, 'error'); return }
-    setNewSubName(''); setNewSubParent(''); showMsg('Subcategory added ✅'); fetchAll()
-  }
-
-  const saveEditSubcategory = async () => {
-    const name = editSubName.trim()
-    if (!name) { showMsg('Enter subcategory name', 'error'); return }
-    if (!editSubParent) { showMsg('Select a parent category', 'error'); return }
-    setSaving(true)
-    // FIX: column is `parent_id`
-    const { error } = await supabase.from('categories')
-      .update({ name, parent_id: editSubParent }).eq('id', editSubId)
-    setSaving(false)
-    if (error) { showMsg('Error updating subcategory: ' + error.message, 'error'); return }
-    setEditSubId(null); setEditSubName(''); setEditSubParent('')
-    showMsg('Subcategory updated ✅'); fetchAll()
-  }
-
-  const deleteSubcategory = async (sub) => {
-    const { count } = await supabase
-      .from('food_items').select('id', { count: 'exact', head: true }).eq('subcategory_id', sub.id)
-    if (count > 0) {
-      showMsg(`❌ "${sub.name}" has ${count} item(s). Remove or reassign them first.`, 'error'); return
-    }
-    if (!window.confirm(`Delete subcategory "${sub.name}"?`)) return
-    setSaving(true)
-    const { error } = await supabase.from('categories').delete().eq('id', sub.id)
-    setSaving(false)
-    if (error) { showMsg('Error deleting subcategory: ' + error.message, 'error'); return }
-    showMsg('Subcategory deleted ✅'); fetchAll()
-  }
-
-  // ── Image upload helper ───────────────────────────────────
-  // Uploads a File to Supabase Storage and returns its public URL.
-  const uploadImageFile = async (file) => {
-    if (!file.type.startsWith('image/')) {
-      throw new Error('Please choose an image file (jpg, png, webp, etc).')
-    }
-    const MAX_MB = 5
-    if (file.size > MAX_MB * 1024 * 1024) {
-      throw new Error(`Image too large — max ${MAX_MB}MB.`)
-    }
-    const ext = file.name.split('.').pop().toLowerCase()
-    const fileName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`
-
-    const { error: uploadError } = await supabase.storage
-      .from(IMAGE_BUCKET)
-      .upload(fileName, file, { cacheControl: '3600', upsert: false })
-    if (uploadError) throw uploadError
-
-    const { data } = supabase.storage.from(IMAGE_BUCKET).getPublicUrl(fileName)
-    return data.publicUrl
-  }
-
-  const handleNewItemImageSelect = async (e) => {
-    const file = e.target.files[0]
-    e.target.value = '' // allow re-selecting the same file later
-    if (!file) return
-    setUploadingNewImage(true)
-    try {
-      const url = await uploadImageFile(file)
-      setNewItem(p => ({ ...p, image_url: url }))
-    } catch (err) {
-      showMsg('Image upload failed: ' + err.message, 'error')
-    }
-    setUploadingNewImage(false)
-  }
-
-  const handleEditItemImageSelect = async (e) => {
-    const file = e.target.files[0]
-    e.target.value = ''
-    if (!file) return
-    setUploadingEditImage(true)
-    try {
-      const url = await uploadImageFile(file)
-      setEditItem(p => ({ ...p, image_url: url }))
-    } catch (err) {
-      showMsg('Image upload failed: ' + err.message, 'error')
-    }
-    setUploadingEditImage(false)
-  }
-
-  // ── Food Item CRUD ────────────────────────────────────────
-  const addFoodItem = async () => {
-    const name = newItem.name.trim()
-    const price = parseFloat(newItem.price)
-    if (!name) { showMsg('Enter item name', 'error'); return }
-    if (!price || price <= 0) { showMsg('Enter valid price', 'error'); return }
-    if (!newItem.category_id) { showMsg('Select a category', 'error'); return }
-    setSaving(true)
-    const { error } = await supabase.from('food_items').insert({
-      name, price,
-      category_id: newItem.category_id,
-      subcategory_id: newItem.subcategory_id || null,
-      description: newItem.description.trim() || null,
-      is_available: newItem.is_available,
-      image_url: newItem.image_url.trim() || null,
-      department: newItem.department || null,
-    })
-    setSaving(false)
-    if (error) { showMsg('Error adding item: ' + error.message, 'error'); return }
-    setNewItem({ name: '', price: '', category_id: '', subcategory_id: '', description: '', is_available: true, image_url: '', department: '' })
-    showMsg(`"${name}" added ✅`); fetchAll()
-  }
-
-  const openEditItem = (item) => setEditItem({
-    id: item.id, name: item.name, price: item.price,
-    category_id: item.category_id || '',
-    subcategory_id: item.subcategory_id || '',
-    description: item.description || '',
-    is_available: item.is_available,
-    image_url: item.image_url || '',
-    department: item.department || '',
-  })
-
-  const saveEditItem = async () => {
-    const name = editItem.name.trim()
-    const price = parseFloat(editItem.price)
-    if (!name) { showMsg('Enter item name', 'error'); return }
-    if (!price || price <= 0) { showMsg('Enter valid price', 'error'); return }
-    if (!editItem.category_id) { showMsg('Select a category', 'error'); return }
-    setSaving(true)
-    const { error } = await supabase.from('food_items').update({
-      name, price,
-      category_id: editItem.category_id,
-      subcategory_id: editItem.subcategory_id || null,
-      description: editItem.description.trim() || null,
-      is_available: editItem.is_available,
-      image_url: editItem.image_url.trim() || null,
-      department: editItem.department || null,
-    }).eq('id', editItem.id)
-    setSaving(false)
-    if (error) { showMsg('Error updating item: ' + error.message, 'error'); return }
-    setEditItem(null); showMsg(`"${name}" updated ✅`); fetchAll()
-  }
-
-  const deleteFoodItem = async (item) => {
-    if (!window.confirm(`Delete "${item.name}"?\n\nIt will be removed from the menu but kept in order history.`)) return
-    setSaving(true)
-    // Nullify FK references before deleting
-    await supabase.from('order_items').update({ food_item_id: null }).eq('food_item_id', item.id)
-    await supabase.from('table_order_summary').update({ food_item_id: null }).eq('food_item_id', item.id)
-    const { error } = await supabase.from('food_items').delete().eq('id', item.id)
-    setSaving(false)
-    if (error) { showMsg('Error deleting item: ' + error.message, 'error'); return }
-    showMsg(`"${item.name}" deleted ✅`); fetchAll()
-  }
-
-  const toggleAvailability = async (item) => {
-    const { error } = await supabase.from('food_items')
-      .update({ is_available: !item.is_available }).eq('id', item.id)
-    if (error) { showMsg('Error: ' + error.message, 'error'); return }
-    showMsg(`"${item.name}" ${!item.is_available ? 'shown ✅' : 'hidden ✅'}`)
-    fetchAll()
-  }
-
-  // ── Bulk operations ───────────────────────────────────────
-  const filteredItems = foodItems.filter(i =>
-    (filterCat === 'all' || i.category_id === filterCat) &&
-    (filterDept === 'all' || i.department === filterDept)
-  )
-  const allFilteredIds = filteredItems.map(i => i.id)
-  const allSelected = allFilteredIds.length > 0 && allFilteredIds.every(id => selectedIds.has(id))
-  const someSelected = selectedIds.size > 0
-
-  const toggleSelect = (id) => {
-    setSelectedIds(prev => {
-      const n = new Set(prev)
-      n.has(id) ? n.delete(id) : n.add(id)
-      return n
-    })
-  }
-
-  const toggleSelectAll = () => {
-    if (allSelected) {
-      setSelectedIds(prev => { const n = new Set(prev); allFilteredIds.forEach(id => n.delete(id)); return n })
+    const session = localStorage.getItem(SESSION_KEY)
+    if (session) {
+      const parsed = JSON.parse(session)
+      if (parsed.version === tbl.session_version) {
+        setSessionVersion(tbl.session_version)
+        setPinVerified(true); setPinPhase(false)
+        await loadMenuData()
+        await loadOrderSummary(tableId, tbl.session_version)
+        setLoading(false)
+      } else {
+        clearLocalData(); setLoading(false); setPinPhase(true)
+      }
     } else {
-      setSelectedIds(prev => new Set([...prev, ...allFilteredIds]))
+      setLoading(false); setPinPhase(true)
     }
   }
 
-  const bulkSetAvailable = async (available) => {
-    if (selectedIds.size === 0) return
-    setBulkLoading(true)
-    const ids = [...selectedIds]
-    const { error } = await supabase.from('food_items')
-      .update({ is_available: available }).in('id', ids)
-    setBulkLoading(false)
-    if (error) { showMsg('Bulk update error: ' + error.message, 'error'); return }
-    showMsg(`${ids.length} item(s) ${available ? 'shown' : 'hidden'} ✅`)
-    fetchAll()
+  const clearLocalData = () => {
+    localStorage.removeItem(SESSION_KEY)
+    localStorage.removeItem(VERSION_KEY)
+    clearSummary()
+    setCart([])
+    setSessionVersion(null)
   }
 
-  const bulkSetDepartment = async (department) => {
-    if (selectedIds.size === 0) return
-    setBulkLoading(true)
-    const ids = [...selectedIds]
-    const { error } = await supabase.from('food_items')
-      .update({ department }).in('id', ids)
-    setBulkLoading(false)
-    if (error) { showMsg('Bulk update error: ' + error.message, 'error'); return }
-    showMsg(`${ids.length} item(s) set to ${department} ✅`)
-    fetchAll()
+  const loadMenuData = async () => {
+    const { data: cats } = await supabase
+      .from('categories').select('*').eq('is_subcategory', false).order('created_at')
+    setCategories(cats || [])
+
+    const { data: items, error } = await supabase
+      .from('food_items')
+      .select(`*,
+        category:categories!food_items_category_id_fkey(id, name),
+        subcategory:categories!food_items_subcategory_id_fkey(id, name)`)
+      .eq('is_available', true).order('created_at')
+
+    if (error) console.error('loadMenuData error:', error.message)
+    setFoodItems(items || [])
   }
 
-  const bulkDelete = async () => {
-    if (selectedIds.size === 0) return
-    const ids = [...selectedIds]
-    const names = filteredItems.filter(i => ids.includes(i.id)).map(i => i.name).join(', ')
-    if (!window.confirm(`Delete ${ids.length} item(s)?\n\n${names}\n\nThis cannot be undone.`)) return
-    setBulkLoading(true)
-    // Nullify FK refs
-    await supabase.from('order_items').update({ food_item_id: null }).in('food_item_id', ids)
-    await supabase.from('table_order_summary').update({ food_item_id: null }).in('food_item_id', ids)
-    const { error } = await supabase.from('food_items').delete().in('id', ids)
-    setBulkLoading(false)
-    if (error) { showMsg('Bulk delete error: ' + error.message, 'error'); return }
-    showMsg(`${ids.length} item(s) deleted ✅`)
-    fetchAll()
+  const checkSessionValid = async () => {
+    const { data: tbl } = await supabase
+      .from('tables').select('session_version').eq('id', tableId).single()
+    if (!tbl) return
+    const session = localStorage.getItem(SESSION_KEY)
+    if (!session) {
+      clearLocalData(); setPinVerified(false); setPinPhase(true); return
+    }
+    const parsed = JSON.parse(session)
+    if (parsed.version !== tbl.session_version) {
+      clearLocalData()
+      setPinVerified(false); setPinInput(''); setPinError(''); setPinPhase(true)
+    }
   }
 
-  // ── Excel Upload ──────────────────────────────────────────
-  // Required format (columns A–E), Department (F) is optional:
-  //   A: Category   B: Subcategory   C: Item Name   D: Description   E: Price   F: Department
-  // Row 1 must be the header row with exactly these labels.
+  useEffect(() => {
+    if (phase !== 'ready' || !tableId) return
+    const t = setTimeout(init, 0)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, tableId])
 
-  const REQUIRED_HEADERS = ['category', 'subcategory', 'item name', 'description', 'price']
+  // ── Poll every 5s — detect table clear by admin ────────────
+  useEffect(() => {
+    if (!tableId || !pinVerified) return
+    const t = setInterval(checkSessionValid, 5000)
+    return () => clearInterval(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tableId, pinVerified])
 
-  const normalizeDepartment = (raw) => {
-    const val = String(raw || '').trim()
-    if (!val) return null
-    const match = DEPARTMENTS.find(d => d.toLowerCase() === val.toLowerCase())
-    return match || null
+  const verifyPin = async () => {
+    if (pinInput.length !== 4) { setPinError('Enter 4 digit PIN'); return }
+    const { data: tbl } = await supabase
+      .from('tables').select('*').eq('id', tableId).single()
+    if (!tbl) { setPinError('Table not found.'); return }
+
+    if (pinInput === tbl.pin) {
+      const ver = tbl.session_version
+      localStorage.setItem(SESSION_KEY, JSON.stringify({
+        version: ver, tableId, enteredAt: new Date().toISOString()
+      }))
+      localStorage.setItem(VERSION_KEY, ver.toString())
+      setSessionVersion(ver)
+      setPinVerified(true); setPinPhase(false); setPinError('')
+      setLoading(true)
+      await loadMenuData()
+      await loadOrderSummary(tableId, ver)
+      setLoading(false)
+    } else {
+      setPinError('Wrong PIN. Ask your waiter.')
+      setPinInput('')
+    }
   }
 
-  const handleExcelFile = (e) => {
-    const file = e.target.files[0]
-    if (!file) return
-    setExcelPreview([]); setExcelErrors([]); setExcelResult(null)
+  // ── Place order ────────────────────────────────────────────
+  const placeOrder = async () => {
+    if (placingRef.current) return            // OR_09: ignore taps while an order is in progress
+    if (!cart.length) { alert('Add items first!'); return }
+    placingRef.current = true
+    setPlacing(true)
 
-    const reader = new FileReader()
-    reader.onload = (evt) => {
-      try {
-        const wb = XLSX.read(evt.target.result, { type: 'binary' })
-        const ws = wb.Sheets[wb.SheetNames[0]]
-        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' })
+    try {
+      const { data: tbl } = await supabase
+        .from('tables').select('session_version').eq('id', tableId).single()
+      if (!tbl) { alert('Table not found. Please scan the QR code again.'); return }
 
-        if (rows.length < 2) {
-          setExcelErrors(['❌ File is empty or has no data rows.']); return
-        }
-
-        // Validate headers
-        const headers = rows[0].map(h => String(h).trim().toLowerCase())
-        const missing = REQUIRED_HEADERS.filter(h => !headers.includes(h))
-        if (missing.length > 0) {
-          setExcelErrors([
-            `❌ Wrong format. Missing columns: ${missing.map(h => `"${h}"`).join(', ')}`,
-            '',
-            'Required columns (row 1 headers, in any order):',
-            '  A: Category',
-            '  B: Subcategory',
-            '  C: Item Name',
-            '  D: Description',
-            '  E: Price',
-            '  F: Department (optional — Kitchen / Beverage / Liquor / Tandoor / Billing)',
-          ]); return
-        }
-
-        // Map column indices
-        const ci = (name) => headers.indexOf(name)
-        const catIdx  = ci('category')
-        const subIdx  = ci('subcategory')
-        const nameIdx = ci('item name')
-        const descIdx = ci('description')
-        const priceIdx = ci('price')
-        const deptIdx = ci('department') // -1 if column not present — that's fine, it's optional
-
-        const errors = []
-        const parsed = []
-
-        rows.slice(1).forEach((row, i) => {
-          const rowNum = i + 2 // 1-indexed, row 1 is header
-          const cat   = String(row[catIdx]  || '').trim()
-          const sub   = String(row[subIdx]  || '').trim()
-          const name  = String(row[nameIdx] || '').trim()
-          const desc  = String(row[descIdx] || '').trim()
-          const price = parseFloat(row[priceIdx])
-          const deptRaw = deptIdx >= 0 ? row[deptIdx] : ''
-          const department = normalizeDepartment(deptRaw)
-
-          if (!cat && !name && !price) return // skip fully empty rows
-
-          if (!cat)  errors.push(`Row ${rowNum}: Category is required`)
-          if (!name) errors.push(`Row ${rowNum}: Item Name is required`)
-          if (!price || isNaN(price) || price <= 0)
-            errors.push(`Row ${rowNum}: Price must be a positive number (got "${row[priceIdx]}")`)
-          if (deptRaw && !department)
-            errors.push(`Row ${rowNum}: Department "${deptRaw}" is invalid — must be one of ${DEPARTMENTS.join(', ')}`)
-
-          if (cat && name && price > 0) {
-            parsed.push({ rowNum, category: cat, subcategory: sub, name, description: desc, price, department })
-          }
-        })
-
-        setExcelErrors(errors)
-        setExcelPreview(parsed)
-      } catch (err) {
-        setExcelErrors(['❌ Could not read file: ' + err.message])
+      // OC_05: the customer's OWN session must match the table's current session.
+      // If the admin cleared the table (or changed the PIN) in the meantime, stop here.
+      let myVersion = null
+      try { myVersion = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null')?.version ?? null } catch { /* ignore */ }
+      if (myVersion === null || myVersion !== tbl.session_version) {
+        clearLocalData()
+        setPinVerified(false); setPinInput(''); setPinError(''); setPinPhase(true)
+        alert('This table was reset. Please enter the new PIN to order.')
+        return
       }
-    }
-    reader.readAsBinaryString(file)
-    // Reset input so same file can be re-selected
-    e.target.value = ''
-  }
+      const ver = tbl.session_version
+      setSessionVersion(ver)
 
-  const uploadExcel = async () => {
-    if (excelPreview.length === 0) return
-    setExcelUploading(true)
+      // 1. Create order
+      const { data: order, error: orderErr } = await supabase
+        .from('orders')
+        .insert({ table_id: tableId, status: 'pending', session_id: `${tableId}_${ver}` })
+        .select().single()
+      if (orderErr) { alert('Error placing order: ' + orderErr.message); return }
 
-    // Build lookup maps of existing categories/subcategories (lowercased)
-    const catMap  = {}  // lowercase name → id
-    const subMap  = {}  // `${parentId}::${lowercase name}` → id
-    categories.forEach(c => { catMap[c.name.toLowerCase()] = c.id })
-    subcategories.forEach(s => { subMap[`${s.parent_id}::${s.name.toLowerCase()}`] = s.id })
-
-    let added = 0, skipped = 0
-    const rowErrors = []
-
-    for (const row of excelPreview) {
-      try {
-        // 1. Get or create category
-        const catKey = row.category.toLowerCase()
-        let catId = catMap[catKey]
-        if (!catId) {
-          const { data: newCat, error: catErr } = await supabase
-            .from('categories').insert({ name: row.category, is_subcategory: false }).select().single()
-          if (catErr) { rowErrors.push(`Row ${row.rowNum} "${row.name}": Category error — ${catErr.message}`); skipped++; continue }
-          catId = newCat.id
-          catMap[catKey] = catId
-        }
-
-        // 2. Get or create subcategory (if provided)
-        let subId = null
-        if (row.subcategory) {
-          const subKey = `${catId}::${row.subcategory.toLowerCase()}`
-          subId = subMap[subKey]
-          if (!subId) {
-            const { data: newSub, error: subErr } = await supabase
-              .from('categories').insert({ name: row.subcategory, is_subcategory: true, parent_id: catId }).select().single()
-            if (subErr) { rowErrors.push(`Row ${row.rowNum} "${row.name}": Subcategory error — ${subErr.message}`); skipped++; continue }
-            subId = newSub.id
-            subMap[subKey] = subId
-          }
-        }
-
-        // 3. Insert food item (skip if same name+category already exists)
-        const exists = foodItems.find(
-          f => f.name.toLowerCase() === row.name.toLowerCase() && f.category_id === catId
-        )
-        if (exists) { skipped++; continue }
-
-        const { error: itemErr } = await supabase.from('food_items').insert({
-          name: row.name,
-          price: row.price,
-          category_id: catId,
-          subcategory_id: subId,
-          description: row.description || null,
-          is_available: true,
-          department: row.department || null,
-        })
-        if (itemErr) { rowErrors.push(`Row ${row.rowNum} "${row.name}": ${itemErr.message}`); skipped++; continue }
-        added++
-      } catch (err) {
-        rowErrors.push(`Row ${row.rowNum}: Unexpected error — ${err.message}`); skipped++
+      // 2. Insert order_items
+      const { error: itemsErr } = await supabase.from('order_items').insert(
+        cart.map(i => ({
+          order_id:       order.id,
+          food_item_id:   i.id,
+          quantity:       i.quantity,
+          price_at_order: i.price,
+          note:           i.note || ''
+        }))
+      )
+      if (itemsErr) {
+        // OR_09: don't leave an empty order behind on the admin dashboard
+        const { error: rollbackErr } = await supabase.from('orders').delete().eq('id', order.id)
+        if (rollbackErr) console.error('Could not remove incomplete order:', rollbackErr.message)
+        alert('Error saving items: ' + itemsErr.message + '\nYour order was not placed. Please try again.')
+        return
       }
-    }
 
-    setExcelUploading(false)
-    setExcelResult({ added, skipped, errors: rowErrors })
-    if (added > 0) fetchAll()
-  }
+      // 3. Save to table_order_summary (powers the Orders drawer)
+      await saveCartToSummary(tableId, ver, cart)
 
-  const closeExcelModal = () => {
-    setShowExcelModal(false)
-    setExcelPreview([]); setExcelErrors([]); setExcelResult(null)
-    if (fileInputRef.current) fileInputRef.current.value = ''
-  }
+      // 4. Reload summary so badges update
+      await loadOrderSummary(tableId, ver)
 
-  // Download sample Excel template
-  const downloadTemplate = () => {
-    const ws = XLSX.utils.aoa_to_sheet([
-      ['Category', 'Subcategory', 'Item Name', 'Description', 'Price', 'Department'],
-      ['Beverages', 'Cold Drinks', 'Cold Coffee', 'Chilled cold coffee with milk', 150, 'Beverage'],
-      ['Beverages', 'Cold Drinks', 'Frappe Mocha', 'Mocha frappe with cream', 190, 'Beverage'],
-      ['Beverages', 'Fresh Juices', 'Fresh Pineapple Juice', 'Freshly squeezed pineapple', 150, 'Beverage'],
-      ['Starters', '', 'Paneer Tikka', 'Grilled paneer with spices', 220, 'Tandoor'],
-      ['Main Course', 'Veg', 'Paneer Butter Masala', 'Rich paneer curry', 280, 'Kitchen'],
-    ])
-    ws['!cols'] = [{ wch: 18 }, { wch: 18 }, { wch: 22 }, { wch: 35 }, { wch: 10 }, { wch: 12 }]
-    const wb = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(wb, ws, 'Menu')
-    XLSX.writeFile(wb, 'menu_template.xlsx')
-  }
-
-  // ── Derived ───────────────────────────────────────────────
-  const subsForCatId = (catId) => subcategories.filter(s => s.parent_id === catId)
-  const subsForNewItem  = newItem.category_id  ? subsForCatId(newItem.category_id)  : []
-  const subsForEditItem = editItem?.category_id ? subsForCatId(editItem.category_id) : []
-
-  // Small helper to color-code department badges
-  const deptBadgeClass = (dept) => {
-    switch (dept) {
-      case 'Kitchen':  return 'bg-orange-100 text-orange-700'
-      case 'Beverage': return 'bg-cyan-100 text-cyan-700'
-      case 'Liquor':   return 'bg-purple-100 text-purple-700'
-      case 'Tandoor':  return 'bg-red-100 text-red-700'
-      case 'Billing':  return 'bg-emerald-100 text-emerald-700'
-      default:         return 'bg-gray-100 text-gray-400'
+      setCart([])
+      setShowCart(false)
+      navigate(`/order-confirmation?table=${tableId}&name=${tableName}`)
+    } finally {
+      placingRef.current = false
+      setPlacing(false)
     }
   }
 
-  // ── Render ────────────────────────────────────────────────
-  return (
-    <div className="min-h-screen bg-gray-50">
+  // ── Cart helpers ───────────────────────────────────────────
+  const handleSearch = (q) => {
+    setSearchQuery(q)
+    if (q.trim().length < 2) { setSuggestions([]); return }
+    setSuggestions(
+      foodItems.filter(i => i.name.toLowerCase().includes(q.toLowerCase())).slice(0, 5)
+    )
+  }
 
-      {/* Toast Message */}
-      {msg && (
-        <div className={`fixed top-4 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-2xl shadow-xl text-sm font-medium max-w-md text-center
-          ${msg.type === 'error' ? 'bg-red-500 text-white' : 'bg-green-500 text-white'}`}>
-          {msg.text}
-        </div>
-      )}
+  const addToCart = (item, note = '') =>
+    setCart(prev => {
+      const ex = prev.find(c => c.id === item.id)
+      if (ex) return prev.map(c => c.id === item.id ? { ...c, quantity: c.quantity + 1 } : c)
+      return [...prev, { ...item, quantity: 1, note }]
+    })
 
-      {/* ── Edit Item Modal ──────────────────────────────── */}
-      {editItem && (
-        <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl max-h-[92vh] overflow-y-auto">
-            <div className="p-5 border-b flex justify-between items-center">
-              <h2 className="font-bold text-gray-800">✏️ Edit Item</h2>
-              <button onClick={() => setEditItem(null)} className="text-gray-400 text-2xl font-bold leading-none">×</button>
-            </div>
-            <div className="p-5 space-y-3">
-              <div>
-                <label className="text-xs text-gray-500 block mb-1">Item Name *</label>
-                <input type="text" value={editItem.name} onChange={e => setEditItem(p => ({ ...p, name: e.target.value }))}
-                  className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-              </div>
-              <div>
-                <label className="text-xs text-gray-500 block mb-1">Price (₹) *</label>
-                <input type="number" min="0" value={editItem.price} onChange={e => setEditItem(p => ({ ...p, price: e.target.value }))}
-                  className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-              </div>
-              <div>
-                <label className="text-xs text-gray-500 block mb-1">Category *</label>
-                <select value={editItem.category_id} onChange={e => setEditItem(p => ({ ...p, category_id: e.target.value, subcategory_id: '' }))}
-                  className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                  <option value="">Select category</option>
-                  {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                </select>
-              </div>
-              {subsForEditItem.length > 0 && (
-                <div>
-                  <label className="text-xs text-gray-500 block mb-1">Subcategory</label>
-                  <select value={editItem.subcategory_id} onChange={e => setEditItem(p => ({ ...p, subcategory_id: e.target.value }))}
-                    className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                    <option value="">None</option>
-                    {subsForEditItem.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                  </select>
-                </div>
-              )}
-              <div>
-                <label className="text-xs text-gray-500 block mb-1">Department (kitchen station)</label>
-                <select value={editItem.department} onChange={e => setEditItem(p => ({ ...p, department: e.target.value }))}
-                  className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                  <option value="">None</option>
-                  {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-xs text-gray-500 block mb-1">Description</label>
-                <textarea value={editItem.description} onChange={e => setEditItem(p => ({ ...p, description: e.target.value }))}
-                  rows={2} className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-              </div>
+  const removeFromCart = (id) => setCart(prev => prev.filter(c => c.id !== id))
 
-              {/* ── Image: file picker (was URL input) ─────────── */}
-              <div>
-                <label className="text-xs text-gray-500 block mb-1">Item Photo</label>
-                <div className="flex items-center gap-3">
-                  {editItem.image_url
-                    ? <img src={editItem.image_url} alt="Preview" className="w-14 h-14 rounded-xl object-cover border border-gray-200 flex-shrink-0" />
-                    : <div className="w-14 h-14 bg-gray-100 rounded-xl flex items-center justify-center text-xl flex-shrink-0 text-gray-300">🍴</div>
-                  }
-                  <label className={`flex-1 border-2 border-dashed rounded-xl px-3 py-2.5 text-xs text-center cursor-pointer transition
-                    ${uploadingEditImage ? 'border-orange-300 bg-orange-50 text-orange-500' : 'border-gray-300 hover:border-orange-400 hover:bg-orange-50 text-gray-500'}`}>
-                    <input type="file" accept="image/*" onChange={handleEditItemImageSelect} disabled={uploadingEditImage} className="hidden" />
-                    {uploadingEditImage ? '⏳ Uploading...' : (editItem.image_url ? '📷 Change Photo' : '📷 Choose Photo from Device')}
-                  </label>
-                  {editItem.image_url && !uploadingEditImage && (
-                    <button type="button" onClick={() => setEditItem(p => ({ ...p, image_url: '' }))}
-                      className="text-red-400 text-xs font-medium hover:text-red-600 flex-shrink-0">Remove</button>
-                  )}
-                </div>
-              </div>
+  const updateQty = (id, qty) => {
+    if (qty < 1) { removeFromCart(id); return }
+    setCart(prev => prev.map(c => c.id === id ? { ...c, quantity: qty } : c))
+  }
 
-              <div className="flex items-center gap-3">
-                <label className="text-sm text-gray-700 font-medium">Available</label>
-                <button onClick={() => setEditItem(p => ({ ...p, is_available: !p.is_available }))}
-                  className={`w-12 h-6 rounded-full transition-colors relative ${editItem.is_available ? 'bg-green-500' : 'bg-gray-300'}`}>
-                  <div className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-all ${editItem.is_available ? 'left-6' : 'left-0.5'}`} />
-                </button>
-              </div>
-              <div className="flex gap-3 pt-2">
-                <button onClick={() => setEditItem(null)} className="flex-1 bg-gray-100 text-gray-700 py-2.5 rounded-xl font-medium text-sm">Cancel</button>
-                <button onClick={saveEditItem} disabled={saving || uploadingEditImage}
-                  className="flex-1 bg-orange-500 text-white py-2.5 rounded-xl font-bold text-sm hover:bg-orange-600 disabled:opacity-50">
-                  {saving ? 'Saving...' : '💾 Save'}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+  const updateNote = (id, note) =>
+    setCart(prev => prev.map(c => c.id === id ? { ...c, note } : c))
 
-      {/* ── Excel Upload Modal ───────────────────────────── */}
-      {showExcelModal && (
-        <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl w-full max-w-2xl shadow-2xl max-h-[92vh] flex flex-col">
-            <div className="p-5 border-b flex justify-between items-center">
-              <div>
-                <h2 className="font-bold text-gray-800 text-lg">📊 Upload Menu from Excel</h2>
-                <p className="text-xs text-gray-400 mt-0.5">Add multiple items at once from a spreadsheet</p>
-              </div>
-              <button onClick={closeExcelModal} className="text-gray-400 text-2xl font-bold leading-none">×</button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+  const getQty            = (id) => cart.find(c => c.id === id)?.quantity || 0
+  const totalItems        = cart.reduce((s, i) => s + i.quantity, 0)
+  const totalOrderedItems = orderSummary.reduce((s, i) => s + i.quantity, 0)
 
-              {/* Format guide */}
-              {!excelResult && (
-                <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
-                  <p className="text-sm font-bold text-blue-700 mb-2">📋 Required Excel Format</p>
-                  <p className="text-xs text-blue-600 mb-3">Row 1 must be headers, data from Row 2 onwards:</p>
-                  <div className="overflow-x-auto">
-                    <table className="text-xs w-full border-collapse">
-                      <thead>
-                        <tr className="bg-blue-100">
-                          {['A: Category *', 'B: Subcategory', 'C: Item Name *', 'D: Description', 'E: Price *', 'F: Department'].map(h => (
-                            <th key={h} className="border border-blue-200 px-2 py-1 text-blue-700 text-left whitespace-nowrap">{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {[
-                          ['Beverages', 'Cold Drinks', 'Cold Coffee', 'Chilled with milk', '150', 'Beverage'],
-                          ['Beverages', 'Fresh Juices', 'Pineapple Juice', 'Freshly squeezed', '150', 'Beverage'],
-                          ['Starters', '', 'Paneer Tikka', 'Grilled paneer', '220', 'Tandoor'],
-                        ].map((row, i) => (
-                          <tr key={i} className="bg-white">
-                            {row.map((cell, j) => (
-                              <td key={j} className="border border-blue-100 px-2 py-1 text-blue-800">{cell}</td>
-                            ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                  <div className="flex items-center gap-2 mt-3 flex-wrap">
-                    <span className="text-xs text-blue-600">* = required column</span>
-                    <span className="text-blue-300">·</span>
-                    <span className="text-xs text-blue-600">Subcategory can be blank</span>
-                    <span className="text-blue-300">·</span>
-                    <span className="text-xs text-blue-600">Department is optional: {DEPARTMENTS.join(', ')}</span>
-                    <span className="text-blue-300">·</span>
-                    <span className="text-xs text-blue-600">Duplicate items are skipped</span>
-                  </div>
-                  <button onClick={downloadTemplate}
-                    className="mt-3 text-xs bg-blue-500 text-white px-4 py-2 rounded-lg font-medium hover:bg-blue-600">
-                    ⬇️ Download Template
-                  </button>
-                </div>
-              )}
+  const filtered = searchQuery.trim()
+    ? foodItems.filter(i => i.name.toLowerCase().includes(searchQuery.toLowerCase()))
+    : activeCategory === 'all'
+      ? foodItems
+      : foodItems.filter(i => i.category_id === activeCategory)
 
-              {/* File picker */}
-              {!excelResult && (
-                <div>
-                  <label className="block w-full border-2 border-dashed border-gray-300 rounded-xl p-8 text-center cursor-pointer hover:border-orange-400 hover:bg-orange-50 transition">
-                    <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleExcelFile} className="hidden" />
-                    <div className="text-4xl mb-2">📂</div>
-                    <p className="font-medium text-gray-700">Click to choose Excel file</p>
-                    <p className="text-xs text-gray-400 mt-1">.xlsx, .xls, .csv accepted</p>
-                  </label>
-                </div>
-              )}
-
-              {/* Validation errors */}
-              {excelErrors.length > 0 && (
-                <div className="bg-red-50 border border-red-200 rounded-xl p-4">
-                  <p className="font-bold text-red-600 text-sm mb-2">❌ Errors found — please fix your file:</p>
-                  <div className="space-y-1">
-                    {excelErrors.map((e, i) => (
-                      <p key={i} className="text-xs text-red-600 font-mono">{e}</p>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Preview table */}
-              {excelPreview.length > 0 && !excelResult && (
-                <div>
-                  <div className="flex justify-between items-center mb-2">
-                    <p className="font-bold text-gray-700 text-sm">
-                      ✅ Preview — {excelPreview.length} item(s) ready to import
-                      {excelErrors.length > 0 && <span className="text-orange-500 ml-2">({excelErrors.length} row(s) with errors will be skipped)</span>}
-                    </p>
-                  </div>
-                  <div className="overflow-x-auto rounded-xl border border-gray-200">
-                    <table className="w-full text-xs">
-                      <thead className="bg-gray-50">
-                        <tr>
-                          {['Row', 'Category', 'Subcategory', 'Item Name', 'Description', 'Price', 'Department'].map(h => (
-                            <th key={h} className="px-3 py-2 text-left text-gray-500 font-semibold whitespace-nowrap">{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-gray-50">
-                        {excelPreview.map((row, i) => (
-                          <tr key={i} className="hover:bg-gray-50">
-                            <td className="px-3 py-2 text-gray-400">{row.rowNum}</td>
-                            <td className="px-3 py-2 font-medium text-orange-600">{row.category}</td>
-                            <td className="px-3 py-2 text-blue-600">{row.subcategory || <span className="text-gray-300">—</span>}</td>
-                            <td className="px-3 py-2 font-medium text-gray-800">{row.name}</td>
-                            <td className="px-3 py-2 text-gray-500 max-w-[160px] truncate">{row.description || <span className="text-gray-300">—</span>}</td>
-                            <td className="px-3 py-2 font-bold text-green-600">₹{row.price}</td>
-                            <td className="px-3 py-2 text-purple-600">{row.department || <span className="text-gray-300">—</span>}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                  <button onClick={uploadExcel} disabled={excelUploading}
-                    className="mt-4 w-full bg-green-500 text-white py-3 rounded-xl font-bold hover:bg-green-600 disabled:opacity-50">
-                    {excelUploading ? '⏳ Uploading...' : `⬆️ Import ${excelPreview.length} Item(s)`}
-                  </button>
-                </div>
-              )}
-
-              {/* Upload result */}
-              {excelResult && (
-                <div className="space-y-3">
-                  <div className={`rounded-2xl p-5 text-center ${excelResult.added > 0 ? 'bg-green-50 border border-green-200' : 'bg-yellow-50 border border-yellow-200'}`}>
-                    <div className="text-4xl mb-2">{excelResult.added > 0 ? '✅' : '⚠️'}</div>
-                    <p className="font-bold text-gray-800 text-lg">{excelResult.added > 0 ? 'Import Complete!' : 'Import Finished'}</p>
-                    <div className="flex justify-center gap-6 mt-3 text-sm">
-                      <div className="text-center">
-                        <p className="text-2xl font-bold text-green-600">{excelResult.added}</p>
-                        <p className="text-gray-500">Added</p>
-                      </div>
-                      <div className="text-center">
-                        <p className="text-2xl font-bold text-yellow-600">{excelResult.skipped}</p>
-                        <p className="text-gray-500">Skipped</p>
-                      </div>
-                    </div>
-                    {excelResult.skipped > 0 && (
-                      <p className="text-xs text-gray-500 mt-2">Skipped = already exists or had errors</p>
-                    )}
-                  </div>
-                  {excelResult.errors.length > 0 && (
-                    <div className="bg-red-50 border border-red-200 rounded-xl p-4">
-                      <p className="font-bold text-red-600 text-sm mb-2">Row errors:</p>
-                      {excelResult.errors.map((e, i) => <p key={i} className="text-xs text-red-600">{e}</p>)}
-                    </div>
-                  )}
-                  <div className="flex gap-3">
-                    <button onClick={closeExcelModal} className="flex-1 bg-gray-100 text-gray-700 py-2.5 rounded-xl font-medium">Close</button>
-                    <button onClick={() => { setExcelPreview([]); setExcelErrors([]); setExcelResult(null) }}
-                      className="flex-1 bg-orange-500 text-white py-2.5 rounded-xl font-bold hover:bg-orange-600">
-                      Upload Another
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Navbar */}
-      <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30">
-        <div className="flex items-center gap-3">
-          <span className="text-xl">🍽️</span>
-          <h1 className="text-lg font-bold text-orange-500">Menu Manager</h1>
-        </div>
-        <div className="flex gap-2">
-          <button onClick={() => setShowExcelModal(true)}
-            className="bg-green-100 text-green-700 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-green-200">
-            📊 Excel Upload
-          </button>
-          <button onClick={() => navigate('/admin/dashboard')}
-            className="bg-orange-100 text-orange-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-orange-200">
-            ← Dashboard
-          </button>
-        </div>
+  // ── Splash screens ─────────────────────────────────────────
+  if (phase === 'welcome') return (
+    <div className="min-h-screen bg-orange-500 flex items-center justify-center">
+      <div className="text-center animate-pulse">
+        <div className="text-6xl mb-4">👋</div>
+        <h1 className="text-3xl font-bold text-white">Welcome!</h1>
+        <p className="text-orange-100 mt-2">Please wait a moment...</p>
       </div>
+    </div>
+  )
 
-      <div className="p-4 max-w-3xl mx-auto">
+  if (phase === 'logo') return (
+    <div className="min-h-screen bg-white flex items-center justify-center">
+      <div className="text-center">
+        <div className="text-8xl mb-4">🍽️</div>
+        <h1 className="text-4xl font-bold text-orange-500">QR Menu</h1>
+        <p className="text-gray-400 mt-2">Loading your experience...</p>
+      </div>
+    </div>
+  )
 
-        {/* Tabs */}
-        <div className="flex gap-0 rounded-xl overflow-hidden border border-gray-200 mb-5">
-          {[
-            { id: 'items',      label: `🍴 Items (${foodItems.length})` },
-            { id: 'categories', label: `📂 Categories (${categories.length})` },
-          ].map(tab => (
-            <button key={tab.id} onClick={() => setActiveTab(tab.id)}
-              className={`flex-1 py-2.5 text-sm font-semibold transition
-                ${activeTab === tab.id ? 'bg-orange-500 text-white' : 'bg-white text-gray-500 hover:bg-orange-50'}`}>
-              {tab.label}
-            </button>
+  if (!tableId) return (
+    <div className="min-h-screen bg-orange-50 flex items-center justify-center">
+      <div className="text-center"><div className="text-5xl mb-3">❌</div><p className="text-gray-500">Invalid QR Code.</p></div>
+    </div>
+  )
+
+  if (loading) return (
+    <div className="min-h-screen bg-orange-50 flex items-center justify-center">
+      <div className="text-center"><div className="text-5xl mb-3">🍽️</div><p className="text-gray-400">Loading...</p></div>
+    </div>
+  )
+
+  // ── PIN Screen ─────────────────────────────────────────────
+  if (pinPhase && !pinVerified) return (
+    <div className="min-h-screen bg-orange-50 flex items-center justify-center px-4">
+      <div className="bg-white rounded-3xl shadow-lg p-8 w-full max-w-sm text-center">
+        <div className="text-5xl mb-4">🔐</div>
+        <h1 className="text-2xl font-bold text-gray-800 mb-1">Enter Table PIN</h1>
+        <p className="text-gray-400 text-sm mb-6">
+          Ask your waiter for the PIN for{' '}
+          <span className="font-semibold text-orange-500">{tableName}</span>
+        </p>
+        <div className="flex justify-center gap-3 mb-4">
+          {[0,1,2,3].map(i => (
+            <div key={i} className={`w-14 h-14 rounded-xl border-2 flex items-center justify-center text-2xl font-bold
+              ${pinInput.length > i ? 'border-orange-500 bg-orange-50 text-orange-600' : 'border-gray-200 bg-gray-50'}`}>
+              {pinInput[i] ? '●' : '○'}
+            </div>
           ))}
         </div>
+        {pinError && <p className="text-red-500 text-sm mb-4 font-medium">{pinError}</p>}
+        <div className="grid grid-cols-3 gap-3 mb-4">
+          {[1,2,3,4,5,6,7,8,9].map(n => (
+            <button key={n} onClick={() => { if (pinInput.length < 4) setPinInput(prev => prev + n) }}
+              className="bg-gray-100 hover:bg-orange-100 text-gray-800 font-bold text-xl py-4 rounded-xl transition">{n}</button>
+          ))}
+          <button onClick={() => setPinInput(prev => prev.slice(0, -1))}
+            className="bg-gray-100 hover:bg-red-100 text-gray-600 font-bold py-4 rounded-xl transition text-sm">⌫</button>
+          <button onClick={() => { if (pinInput.length < 4) setPinInput(prev => prev + '0') }}
+            className="bg-gray-100 hover:bg-orange-100 text-gray-800 font-bold text-xl py-4 rounded-xl transition">0</button>
+          <button onClick={verifyPin}
+            className="bg-orange-500 hover:bg-orange-600 text-white font-bold py-4 rounded-xl transition text-sm">✓ OK</button>
+        </div>
+        <p className="text-xs text-gray-300">🍽️ QR Menu System</p>
+      </div>
+    </div>
+  )
 
-        {loading && <div className="text-center py-12 text-gray-400">Loading...</div>}
+  // ── Main Menu ──────────────────────────────────────────────
+  return (
+    <div className="min-h-screen bg-orange-50 pb-24">
 
-        {/* ════════════════════════════════════════════════ */}
-        {/* TAB: FOOD ITEMS                                  */}
-        {/* ════════════════════════════════════════════════ */}
-        {!loading && activeTab === 'items' && (
-          <div>
-            {/* Add Item Form */}
-            <div className="bg-white rounded-2xl shadow p-5 mb-5">
-              <h2 className="font-bold text-gray-700 mb-4">➕ Add New Item</h2>
-              <div className="space-y-3">
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-xs text-gray-500 block mb-1">Item Name *</label>
-                    <input type="text" value={newItem.name}
-                      onChange={e => setNewItem(p => ({ ...p, name: e.target.value }))}
-                      placeholder="e.g. Paneer Butter Masala"
-                      className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-500 block mb-1">Price (₹) *</label>
-                    <input type="number" min="0" value={newItem.price}
-                      onChange={e => setNewItem(p => ({ ...p, price: e.target.value }))}
-                      placeholder="0"
-                      className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-xs text-gray-500 block mb-1">Category *</label>
-                    <select value={newItem.category_id}
-                      onChange={e => setNewItem(p => ({ ...p, category_id: e.target.value, subcategory_id: '' }))}
-                      className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                      <option value="">Select category</option>
-                      {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-500 block mb-1">Subcategory</label>
-                    <select value={newItem.subcategory_id}
-                      onChange={e => setNewItem(p => ({ ...p, subcategory_id: e.target.value }))}
-                      disabled={subsForNewItem.length === 0}
-                      className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 disabled:bg-gray-50 disabled:text-gray-400">
-                      <option value="">None</option>
-                      {subsForNewItem.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                    </select>
-                  </div>
-                </div>
-                <div>
-                  <label className="text-xs text-gray-500 block mb-1">Department (kitchen station)</label>
-                  <select value={newItem.department}
-                    onChange={e => setNewItem(p => ({ ...p, department: e.target.value }))}
-                    className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                    <option value="">None</option>
-                    {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs text-gray-500 block mb-1">Description</label>
-                  <textarea value={newItem.description}
-                    onChange={e => setNewItem(p => ({ ...p, description: e.target.value }))}
-                    rows={2} placeholder="Optional..."
-                    className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-                </div>
+      {/* Image zoom modal */}
+      {zoomedImage && (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-80 flex items-center justify-center p-4"
+          onClick={() => setZoomedImage(null)}>
+          <div className="relative max-w-lg w-full">
+            <img src={zoomedImage} alt="zoom" className="w-full rounded-2xl object-contain max-h-96" />
+            <button onClick={() => setZoomedImage(null)}
+              className="absolute top-2 right-2 bg-white rounded-full w-8 h-8 flex items-center justify-center font-bold text-lg">×</button>
+          </div>
+        </div>
+      )}
 
-                {/* ── Image: file picker (was URL input) ─────────── */}
-                <div>
-                  <label className="text-xs text-gray-500 block mb-1">Item Photo</label>
-                  <div className="flex items-center gap-3">
-                    {newItem.image_url
-                      ? <img src={newItem.image_url} alt="Preview" className="w-14 h-14 rounded-xl object-cover border border-gray-200 flex-shrink-0" />
-                      : <div className="w-14 h-14 bg-gray-100 rounded-xl flex items-center justify-center text-xl flex-shrink-0 text-gray-300">🍴</div>
-                    }
-                    <label className={`flex-1 border-2 border-dashed rounded-xl px-3 py-2.5 text-xs text-center cursor-pointer transition
-                      ${uploadingNewImage ? 'border-orange-300 bg-orange-50 text-orange-500' : 'border-gray-300 hover:border-orange-400 hover:bg-orange-50 text-gray-500'}`}>
-                      <input type="file" accept="image/*" onChange={handleNewItemImageSelect} disabled={uploadingNewImage} className="hidden" />
-                      {uploadingNewImage ? '⏳ Uploading...' : (newItem.image_url ? '📷 Change Photo' : '📷 Choose Photo from Device')}
-                    </label>
-                    {newItem.image_url && !uploadingNewImage && (
-                      <button type="button" onClick={() => setNewItem(p => ({ ...p, image_url: '' }))}
-                        className="text-red-400 text-xs font-medium hover:text-red-600 flex-shrink-0">Remove</button>
-                    )}
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-3">
-                  <label className="text-sm text-gray-700 font-medium">Available on menu</label>
-                  <button onClick={() => setNewItem(p => ({ ...p, is_available: !p.is_available }))}
-                    className={`w-12 h-6 rounded-full transition-colors relative ${newItem.is_available ? 'bg-green-500' : 'bg-gray-300'}`}>
-                    <div className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-all ${newItem.is_available ? 'left-6' : 'left-0.5'}`} />
-                  </button>
-                </div>
-                <button onClick={addFoodItem} disabled={saving || uploadingNewImage}
-                  className="w-full bg-orange-500 text-white py-3 rounded-xl font-bold hover:bg-orange-600 disabled:opacity-50">
-                  {saving ? 'Adding...' : '➕ Add Item'}
-                </button>
-              </div>
-            </div>
-
-            {/* Filter bar — category */}
-            <div className="flex gap-2 overflow-x-auto pb-2 mb-2">
-              <button onClick={() => setFilterCat('all')}
-                className={`px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap flex-shrink-0 ${filterCat === 'all' ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
-                All ({foodItems.length})
+      {/* Customize note modal */}
+      {noteItem && (
+        <div className="fixed inset-0 z-50 bg-black bg-opacity-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-5 w-full max-w-sm shadow-xl">
+            <h3 className="font-bold text-gray-800 mb-1">📝 Customize Order</h3>
+            <p className="text-sm text-orange-500 font-medium mb-3">{noteItem.name}</p>
+            <textarea value={noteText} onChange={e => setNoteText(e.target.value)}
+              placeholder="e.g. Less spicy, no onion, extra sauce..."
+              rows={3}
+              className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 mb-4" />
+            <div className="flex gap-3">
+              <button onClick={() => { setNoteItem(null); setNoteText('') }}
+                className="flex-1 bg-gray-100 text-gray-700 py-2 rounded-xl font-medium text-sm">Cancel</button>
+              <button onClick={() => {
+                const inCart = cart.find(c => c.id === noteItem.id)
+                if (inCart) updateNote(noteItem.id, noteText)
+                else addToCart(noteItem, noteText)
+                setNoteItem(null); setNoteText('')
+              }} className="flex-1 bg-orange-500 text-white py-2 rounded-xl font-medium text-sm">
+                {cart.find(c => c.id === noteItem.id) ? 'Update Note' : 'Add to Cart'}
               </button>
-              {categories.map(c => {
-                const count = foodItems.filter(i => i.category_id === c.id).length
-                return (
-                  <button key={c.id} onClick={() => setFilterCat(c.id)}
-                    className={`px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap flex-shrink-0 ${filterCat === c.id ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
-                    {c.name} ({count})
-                  </button>
-                )
-              })}
-            </div>
-
-            {/* Filter bar — department */}
-            <div className="flex gap-2 overflow-x-auto pb-2 mb-3">
-              <button onClick={() => setFilterDept('all')}
-                className={`px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap flex-shrink-0 ${filterDept === 'all' ? 'bg-purple-500 text-white' : 'bg-purple-100 text-purple-600'}`}>
-                All Departments
-              </button>
-              {DEPARTMENTS.map(d => {
-                const count = foodItems.filter(i => i.department === d).length
-                return (
-                  <button key={d} onClick={() => setFilterDept(d)}
-                    className={`px-4 py-1.5 rounded-full text-sm font-medium whitespace-nowrap flex-shrink-0 ${filterDept === d ? 'bg-purple-500 text-white' : 'bg-purple-100 text-purple-600'}`}>
-                    {d} ({count})
-                  </button>
-                )
-              })}
-            </div>
-
-            {/* ── Bulk action bar ──────────────────────── */}
-            <div className="bg-white rounded-xl shadow px-4 py-3 mb-3 flex items-center gap-3 flex-wrap">
-              {/* Select All checkbox */}
-              <label className="flex items-center gap-2 cursor-pointer select-none">
-                <input type="checkbox" checked={allSelected} onChange={toggleSelectAll}
-                  className="w-4 h-4 accent-orange-500 cursor-pointer" />
-                <span className="text-sm text-gray-600 font-medium">
-                  {allSelected ? 'Deselect all' : `Select all (${filteredItems.length})`}
-                </span>
-              </label>
-
-              {someSelected && (
-                <>
-                  <div className="h-4 border-l border-gray-200" />
-                  <span className="text-sm font-bold text-orange-500">{selectedIds.size} selected</span>
-                  <div className="h-4 border-l border-gray-200" />
-                  <button onClick={() => bulkSetAvailable(true)} disabled={bulkLoading}
-                    className="bg-green-100 text-green-700 px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-green-200 disabled:opacity-50">
-                    ✅ Show All
-                  </button>
-                  <button onClick={() => bulkSetAvailable(false)} disabled={bulkLoading}
-                    className="bg-yellow-100 text-yellow-700 px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-yellow-200 disabled:opacity-50">
-                    ⛔ Hide All
-                  </button>
-                  <select onChange={e => { if (e.target.value) { bulkSetDepartment(e.target.value); e.target.value = '' } }}
-                    disabled={bulkLoading} defaultValue=""
-                    className="bg-purple-100 text-purple-700 px-3 py-1.5 rounded-lg text-xs font-semibold border-none focus:outline-none disabled:opacity-50">
-                    <option value="" disabled>🏷️ Set Department...</option>
-                    {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
-                  </select>
-                  <button onClick={bulkDelete} disabled={bulkLoading}
-                    className="bg-red-100 text-red-600 px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-red-200 disabled:opacity-50">
-                    🗑️ Delete All
-                  </button>
-                  <button onClick={() => setSelectedIds(new Set())}
-                    className="text-gray-400 text-xs underline ml-auto">
-                    Clear selection
-                  </button>
-                </>
-              )}
-              {bulkLoading && <span className="text-xs text-gray-400 animate-pulse">Processing...</span>}
-            </div>
-
-            {/* Item list */}
-            {filteredItems.length === 0 && (
-              <div className="text-center py-12 text-gray-400">
-                <div className="text-4xl mb-2">🍴</div>
-                <p>No items {filterCat !== 'all' || filterDept !== 'all' ? 'match this filter' : 'yet'}</p>
-              </div>
-            )}
-            <div className="space-y-2">
-              {filteredItems.map(item => {
-                const isSelected = selectedIds.has(item.id)
-                return (
-                  <div key={item.id}
-                    className={`bg-white rounded-2xl shadow p-4 flex gap-3 items-start border-l-4 transition
-                      ${isSelected ? 'border-orange-500 ring-2 ring-orange-200' : item.is_available ? 'border-green-400' : 'border-gray-300 opacity-60'}`}>
-
-                    {/* Checkbox */}
-                    <div className="flex-shrink-0 pt-1">
-                      <input type="checkbox" checked={isSelected} onChange={() => toggleSelect(item.id)}
-                        className="w-4 h-4 accent-orange-500 cursor-pointer" />
-                    </div>
-
-                    {/* Image */}
-                    {item.image_url
-                      ? <img src={item.image_url} alt={item.name} className="w-14 h-14 rounded-xl object-cover flex-shrink-0" />
-                      : <div className="w-14 h-14 bg-orange-100 rounded-xl flex items-center justify-center text-2xl flex-shrink-0">🍴</div>
-                    }
-
-                    <div className="flex-1 min-w-0">
-                      <div className="flex justify-between items-start gap-2">
-                        <div>
-                          <p className="font-bold text-gray-800 text-sm">{item.name}</p>
-                          <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
-                            <span className="text-xs bg-orange-100 text-orange-600 px-2 py-0.5 rounded-full">
-                              {item.category?.name || '—'}
-                            </span>
-                            {item.subcategory?.name && (
-                              <span className="text-xs bg-blue-100 text-blue-600 px-2 py-0.5 rounded-full">
-                                {item.subcategory.name}
-                              </span>
-                            )}
-                            {item.department && (
-                              <span className={`text-xs px-2 py-0.5 rounded-full ${deptBadgeClass(item.department)}`}>
-                                {item.department}
-                              </span>
-                            )}
-                            <span className={`text-xs px-2 py-0.5 rounded-full ${item.is_available ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-500'}`}>
-                              {item.is_available ? '✅' : '⛔'}
-                            </span>
-                          </div>
-                          {item.description && <p className="text-xs text-gray-400 mt-1 line-clamp-1">{item.description}</p>}
-                        </div>
-                        <p className="font-bold text-orange-500 text-base flex-shrink-0">₹{item.price}</p>
-                      </div>
-                      <div className="flex gap-2 mt-2 flex-wrap">
-                        <button onClick={() => openEditItem(item)}
-                          className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">
-                          ✏️ Edit
-                        </button>
-                        <button onClick={() => toggleAvailability(item)}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-medium ${item.is_available ? 'bg-yellow-100 text-yellow-700 hover:bg-yellow-200' : 'bg-green-100 text-green-600 hover:bg-green-200'}`}>
-                          {item.is_available ? '⛔ Hide' : '✅ Show'}
-                        </button>
-                        <button onClick={() => deleteFoodItem(item)}
-                          className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200">
-                          🗑️ Delete
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                )
-              })}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ── Header ─────────────────────────────────────────────── */}
+      <div className="bg-white shadow px-4 py-3 sticky top-0 z-10">
+        <div className="flex justify-between items-center mb-3">
+          <div>
+            <h1 className="text-xl font-bold text-orange-500">🍽️ Our Menu</h1>
+            <p className="text-sm text-gray-400">{tableName}</p>
+          </div>
+
+          {/* Top-right: Orders button + Cart button */}
+          <div className="flex items-center gap-2">
+            {totalOrderedItems > 0 && (
+              <button onClick={() => setShowOrders(true)}
+                className="flex items-center gap-1.5 bg-green-50 border border-green-200 text-green-700 px-3 py-2 rounded-full text-sm font-semibold hover:bg-green-100 transition">
+                📋
+                <span className="hidden sm:inline">Orders</span>
+                <span className="bg-green-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                  {totalOrderedItems}
+                </span>
+              </button>
+            )}
+            {totalItems > 0 && (
+              <button onClick={() => setShowCart(true)}
+                className="relative bg-orange-500 text-white px-4 py-2 rounded-full text-sm font-medium">
+                🛒 Cart
+                <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
+                  {totalItems}
+                </span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Search */}
+        <div className="relative mb-3">
+          <input type="text" value={searchQuery} onChange={e => handleSearch(e.target.value)}
+            placeholder="🔍 Search food items..."
+            className="w-full border border-gray-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400 bg-orange-50" />
+          {suggestions.length > 0 && (
+            <div className="absolute top-full left-0 right-0 bg-white border rounded-xl shadow-lg z-20 mt-1">
+              {suggestions.map(item => (
+                <div key={item.id} onClick={() => { setSearchQuery(item.name); setSuggestions([]) }}
+                  className="px-4 py-2 text-sm text-gray-700 hover:bg-orange-50 cursor-pointer flex gap-2">
+                  🍴 {item.name}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Category pills */}
+        {!searchQuery && (
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            <button onClick={() => setActiveCategory('all')}
+              className={`px-4 py-1 rounded-full text-sm font-medium whitespace-nowrap
+                ${activeCategory === 'all' ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
+              All
+            </button>
+            {categories.map(cat => (
+              <button key={cat.id} onClick={() => setActiveCategory(cat.id)}
+                className={`px-4 py-1 rounded-full text-sm font-medium whitespace-nowrap
+                  ${activeCategory === cat.id ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-600'}`}>
+                {cat.name}
+              </button>
+            ))}
+          </div>
         )}
+      </div>
 
-        {/* ════════════════════════════════════════════════ */}
-        {/* TAB: CATEGORIES                                  */}
-        {/* ════════════════════════════════════════════════ */}
-        {!loading && activeTab === 'categories' && (
-          <div className="space-y-5">
-
-            {/* Main Categories */}
-            <div className="bg-white rounded-2xl shadow p-5">
-              <h2 className="font-bold text-gray-700 mb-4">📂 Main Categories</h2>
-              <div className="flex gap-2 mb-5">
-                <input type="text" value={newCatName} onChange={e => setNewCatName(e.target.value)}
-                  placeholder="New category name..."
-                  onKeyDown={e => e.key === 'Enter' && addCategory()}
-                  className="flex-1 border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-                <button onClick={addCategory} disabled={saving}
-                  className="bg-orange-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-orange-600 disabled:opacity-50">
-                  {saving ? '...' : '+ Add'}
-                </button>
-              </div>
-
-              {categories.length === 0 && (
-                <div className="text-center py-6 text-gray-400 text-sm">No categories yet</div>
-              )}
-              <div className="space-y-2">
-                {categories.map(cat => {
-                  const itemCount = foodItems.filter(i => i.category_id === cat.id).length
-                  // FIX: use parent_id (actual DB column)
-                  const subCount  = subcategories.filter(s => s.parent_id === cat.id).length
-                  const isEditing = editCatId === cat.id
-                  return (
-                    <div key={cat.id} className="border border-gray-100 rounded-xl overflow-hidden">
-                      {isEditing ? (
-                        <div className="p-3 bg-orange-50 flex gap-2">
-                          <input type="text" value={editCatName} onChange={e => setEditCatName(e.target.value)}
-                            onKeyDown={e => e.key === 'Enter' && saveEditCategory()}
-                            className="flex-1 border border-orange-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-                          <button onClick={saveEditCategory} disabled={saving} className="bg-orange-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold disabled:opacity-50">Save</button>
-                          <button onClick={() => { setEditCatId(null); setEditCatName('') }} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-xs">Cancel</button>
-                        </div>
-                      ) : (
-                        <div className="p-3 flex justify-between items-center">
-                          <div>
-                            <p className="font-semibold text-gray-800">{cat.name}</p>
-                            <p className="text-xs text-gray-400 mt-0.5">
-                              {itemCount} item{itemCount !== 1 ? 's' : ''}
-                              {subCount > 0 ? ` · ${subCount} sub` : ''}
-                            </p>
-                          </div>
-                          <div className="flex gap-2">
-                            <button onClick={() => { setEditCatId(cat.id); setEditCatName(cat.name) }}
-                              className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">✏️</button>
-                            <button onClick={() => deleteCategory(cat)} disabled={saving}
-                              className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200 disabled:opacity-50">🗑️</button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )
-                })}
+      {/* ── Food Items ────────────────────────────────────────── */}
+      <div className="p-4 space-y-3">
+        {filtered.length === 0 && (
+          <div className="text-center py-16 text-gray-400">
+            <div className="text-4xl mb-2">🍴</div>
+            <p>No items found</p>
+          </div>
+        )}
+        {filtered.map(item => {
+          const qty         = getQty(item.id)
+          const cartItem    = cart.find(c => c.id === item.id)
+          const summaryItem = orderSummary.find(s => s.id === item.id)
+          return (
+            <div key={item.id} className="bg-white rounded-2xl shadow p-4 flex gap-3">
+              {item.image_url
+                ? <img src={item.image_url} alt={item.name} onClick={() => setZoomedImage(item.image_url)}
+                    className="w-20 h-20 rounded-xl object-cover flex-shrink-0 cursor-pointer hover:opacity-90 transition" />
+                : <div className="w-20 h-20 bg-orange-100 rounded-xl flex items-center justify-center text-3xl flex-shrink-0">🍴</div>
+              }
+              <div className="flex-1">
+                <div className="flex justify-between items-start gap-1">
+                  <h3 className="font-semibold text-gray-800">{item.name}</h3>
+                  {summaryItem && (
+                    <span className="text-xs bg-green-100 text-green-600 px-2 py-0.5 rounded-full font-medium shrink-0">
+                      Ordered ×{summaryItem.quantity}
+                    </span>
+                  )}
+                </div>
+                {item.category?.name && (
+                  <p className="text-xs text-orange-400 font-medium mt-0.5">
+                    {item.category.name}{item.subcategory?.name && ` › ${item.subcategory.name}`}
+                  </p>
+                )}
+                {item.description && (
+                  <p className="text-xs text-gray-400 mt-1 line-clamp-2">{item.description}</p>
+                )}
+                <p className="text-orange-500 font-bold mt-1">₹{item.price}</p>
+                {cartItem?.note && (
+                  <p className="text-xs text-orange-400 italic mt-1">📝 "{cartItem.note}"</p>
+                )}
+                <div className="mt-2 flex items-center gap-2 flex-wrap">
+                  {qty === 0 ? (
+                    <>
+                      <button onClick={() => addToCart(item)}
+                        className="bg-orange-500 text-white px-4 py-1 rounded-full text-sm font-medium hover:bg-orange-600">
+                        + Add
+                      </button>
+                      <button onClick={() => { setNoteItem(item); setNoteText('') }}
+                        className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
+                        📝 Customize
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-2">
+                        <button onClick={() => updateQty(item.id, qty - 1)}
+                          className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
+                        <span className="font-semibold">{qty}</span>
+                        <button onClick={() => updateQty(item.id, qty + 1)}
+                          className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
+                      </div>
+                      <button onClick={() => { setNoteItem(item); setNoteText(cartItem?.note || '') }}
+                        className="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-medium">
+                        📝 {cartItem?.note ? 'Edit Note' : 'Add Note'}
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
             </div>
+          )
+        })}
+      </div>
 
-            {/* Subcategories */}
-            <div className="bg-white rounded-2xl shadow p-5">
-              <h2 className="font-bold text-gray-700 mb-4">📁 Subcategories</h2>
-
-              {categories.length === 0 ? (
-                <div className="bg-yellow-50 border border-yellow-200 rounded-xl px-4 py-3 mb-4">
-                  <p className="text-xs text-yellow-700">⚠️ Add at least one main category first.</p>
-                </div>
-              ) : (
-                <div className="space-y-2 mb-5">
-                  <input type="text" value={newSubName} onChange={e => setNewSubName(e.target.value)}
-                    placeholder="New subcategory name..."
-                    className="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400" />
-                  <div className="flex gap-2">
-                    <select value={newSubParent} onChange={e => setNewSubParent(e.target.value)}
-                      className="flex-1 border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400">
-                      <option value="">Select parent category</option>
-                      {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                    </select>
-                    <button onClick={addSubcategory} disabled={saving}
-                      className="bg-orange-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-orange-600 disabled:opacity-50">
-                      {saving ? '...' : '+ Add'}
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {subcategories.length === 0 && (
-                <div className="text-center py-6 text-gray-400 text-sm">No subcategories yet</div>
-              )}
-
-              {/* FIX: group by parent_id */}
-              {categories.map(cat => {
-                const subs = subcategories.filter(s => s.parent_id === cat.id)
-                if (subs.length === 0) return null
-                return (
-                  <div key={cat.id} className="mb-4">
-                    <p className="text-xs font-bold text-gray-500 uppercase mb-2 px-1">📂 {cat.name}</p>
-                    <div className="space-y-2">
-                      {subs.map(sub => {
-                        const itemCount = foodItems.filter(i => i.subcategory_id === sub.id).length
-                        const isEditing = editSubId === sub.id
-                        return (
-                          <div key={sub.id} className="border border-gray-100 rounded-xl overflow-hidden ml-3">
-                            {isEditing ? (
-                              <div className="p-3 bg-blue-50 space-y-2">
-                                <input type="text" value={editSubName} onChange={e => setEditSubName(e.target.value)}
-                                  className="w-full border border-blue-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none" />
-                                <div className="flex gap-2">
-                                  <select value={editSubParent} onChange={e => setEditSubParent(e.target.value)}
-                                    className="flex-1 border border-blue-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none">
-                                    {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                                  </select>
-                                  <button onClick={saveEditSubcategory} disabled={saving} className="bg-blue-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold disabled:opacity-50">Save</button>
-                                  <button onClick={() => { setEditSubId(null); setEditSubName(''); setEditSubParent('') }} className="bg-gray-100 text-gray-600 px-3 py-1.5 rounded-lg text-xs">Cancel</button>
-                                </div>
-                              </div>
-                            ) : (
-                              <div className="p-3 flex justify-between items-center">
-                                <div>
-                                  <p className="font-medium text-gray-700 text-sm">↳ {sub.name}</p>
-                                  <p className="text-xs text-gray-400 mt-0.5">{itemCount} item{itemCount !== 1 ? 's' : ''}</p>
-                                </div>
-                                <div className="flex gap-2">
-                                  <button onClick={() => { setEditSubId(sub.id); setEditSubName(sub.name); setEditSubParent(sub.parent_id) }}
-                                    className="bg-blue-100 text-blue-600 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-blue-200">✏️</button>
-                                  <button onClick={() => deleteSubcategory(sub)} disabled={saving}
-                                    className="bg-red-100 text-red-500 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-200 disabled:opacity-50">🗑️</button>
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        )
-                      })}
+      {/* ── Cart Drawer ───────────────────────────────────────── */}
+      {showCart && (
+        <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black bg-opacity-40"
+          onClick={e => { if (e.target === e.currentTarget) setShowCart(false) }}>
+          <div className="bg-white rounded-t-3xl p-5 max-h-[85vh] overflow-y-auto">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-lg font-bold">🛒 Your Cart</h2>
+              <button onClick={() => setShowCart(false)} className="text-gray-400 text-2xl font-bold">×</button>
+            </div>
+            <div className="space-y-3 mb-4">
+              {cart.map(item => (
+                <div key={item.id} className="border-b pb-3">
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1">
+                      <p className="font-medium text-gray-700">{item.name}</p>
+                      <p className="text-sm text-orange-500 font-semibold">
+                        ₹{item.price} × {item.quantity} = ₹{item.price * item.quantity}
+                      </p>
+                      {item.note && <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => updateQty(item.id, item.quantity - 1)}
+                        className="w-7 h-7 bg-orange-100 text-orange-600 rounded-full font-bold flex items-center justify-center">−</button>
+                      <span className="font-semibold w-4 text-center">{item.quantity}</span>
+                      <button onClick={() => updateQty(item.id, item.quantity + 1)}
+                        className="w-7 h-7 bg-orange-500 text-white rounded-full font-bold flex items-center justify-center">+</button>
+                      <button onClick={() => removeFromCart(item.id)} className="text-red-400 text-sm ml-1">✕</button>
                     </div>
                   </div>
-                )
-              })}
+                  <button onClick={() => { setNoteItem(item); setNoteText(item.note || ''); setShowCart(false) }}
+                    className="mt-1 text-xs text-orange-400 underline">
+                    {item.note ? '✏️ Edit customization' : '📝 Add customization'}
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="bg-orange-50 rounded-xl px-4 py-3 mb-4">
+              <div className="flex justify-between text-sm text-gray-600">
+                <span>Subtotal ({totalItems} item{totalItems !== 1 ? 's' : ''})</span>
+                <span className="font-bold text-orange-600">
+                  ₹{cart.reduce((s, i) => s + i.price * i.quantity, 0)}
+                </span>
+              </div>
+              <p className="text-xs text-gray-400 mt-1">Final bill at counter includes service charges</p>
+            </div>
+            {cart.length > 0 && (
+              <button onClick={placeOrder} disabled={placing}
+                className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg disabled:opacity-50">
+                {placing ? 'Placing order...' : '🍽️ Place Order'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
-              {/* Orphaned subcategories */}
-              {(() => {
-                const orphans = subcategories.filter(s => !categories.find(c => c.id === s.parent_id))
-                if (!orphans.length) return null
-                return (
-                  <div className="mt-4">
-                    <p className="text-xs font-bold text-red-500 uppercase mb-2 px-1">⚠️ Orphaned subcategories</p>
-                    <div className="space-y-2">
-                      {orphans.map(sub => (
-                        <div key={sub.id} className="border border-red-100 rounded-xl p-3 flex justify-between items-center bg-red-50 ml-3">
-                          <p className="text-sm text-red-600">{sub.name}</p>
-                          <button onClick={() => deleteSubcategory(sub)} disabled={saving}
-                            className="bg-red-200 text-red-700 px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-red-300 disabled:opacity-50">🗑️ Delete</button>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )
-              })()}
+      {/* ── My Orders Drawer ──────────────────────────────────── */}
+      {showOrders && (
+        <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black bg-opacity-40"
+          onClick={e => { if (e.target === e.currentTarget) setShowOrders(false) }}>
+          <div className="bg-white rounded-t-3xl p-5 max-h-[85vh] overflow-y-auto">
+            <div className="flex justify-between items-center mb-4">
+              <div>
+                <h2 className="text-lg font-bold text-gray-800">📋 My Orders</h2>
+                <p className="text-xs text-gray-400 mt-0.5">{tableName}</p>
+              </div>
+              <button onClick={() => setShowOrders(false)} className="text-gray-400 text-2xl font-bold">×</button>
             </div>
 
-            {/* Info box */}
-            <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4">
-              <p className="text-xs text-blue-700 font-medium mb-1">ℹ️ Why can't I delete a category?</p>
-              <p className="text-xs text-blue-600">
-                A category/subcategory with items assigned cannot be deleted. Go to <strong>Items</strong> tab, filter by that category, select all with the checkbox, and bulk-delete or reassign first.
+            <div className="bg-orange-500 rounded-2xl p-4 mb-4 text-white flex justify-between items-center">
+              <div>
+                <p className="text-xs opacity-80">Ordered this session</p>
+                <p className="text-2xl font-bold">{totalOrderedItems} items</p>
+                <p className="text-xs opacity-70 mt-0.5">
+                  {orderSummary.length} dish{orderSummary.length !== 1 ? 'es' : ''}
+                </p>
+              </div>
+              <div className="text-4xl opacity-80">🧾</div>
+            </div>
+
+            <div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 mb-4 flex items-start gap-2">
+              <span className="text-blue-500 mt-0.5">ℹ️</span>
+              <p className="text-xs text-blue-600 leading-relaxed">
+                All items you have ordered this session. Your waiter has received each order.
+                Billing is handled at the counter.
               </p>
             </div>
 
+            <div className="bg-white border border-gray-100 rounded-2xl overflow-hidden mb-4 shadow-sm">
+              <div className="divide-y divide-gray-50">
+                {orderSummary.map((item, i) => (
+                  <div key={i} className="px-4 py-3 flex items-center justify-between">
+                    <div className="flex-1">
+                      <p className="font-medium text-gray-800">{item.name}</p>
+                      {item.note && <p className="text-xs text-orange-400 italic mt-0.5">📝 "{item.note}"</p>}
+                    </div>
+                    <span className="bg-orange-100 text-orange-600 font-bold text-sm px-3 py-1 rounded-full ml-3">
+                      × {item.quantity}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div className="px-4 py-3 bg-gray-50 border-t border-gray-100">
+                <p className="text-xs text-gray-400 text-center">Prices and total will be on your final bill 🧾</p>
+              </div>
+            </div>
+
+            <button onClick={() => setShowOrders(false)}
+              className="w-full border-2 border-orange-500 text-orange-500 py-3 rounded-2xl font-semibold text-sm hover:bg-orange-50 transition">
+              + Add More Items
+            </button>
           </div>
-        )}
-      </div>
+        </div>
+      )}
+
+      {/* ── Bottom sticky cart bar ────────────────────────────── */}
+      {totalItems > 0 && !showCart && (
+        <div className="fixed bottom-0 left-0 right-0 p-4 bg-white border-t shadow-lg">
+          <button onClick={() => setShowCart(true)}
+            className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg flex justify-between px-6">
+            <span>🛒 {totalItems} item{totalItems !== 1 ? 's' : ''} in cart</span>
+            <span>View Cart →</span>
+          </button>
+        </div>
+      )}
     </div>
   )
 }
