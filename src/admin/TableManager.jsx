@@ -11,30 +11,20 @@ export default function TableManager() {
   const [loading, setLoading] = useState(false)
   const [deleting, setDeleting] = useState(null)
   const [message, setMessage] = useState('')
-  const [loadError, setLoadError] = useState('')
+  const [showPin, setShowPin] = useState({})
   const navigate = useNavigate()
 
-  // Only show tables that have not been (soft) deleted.
-  // Needs the `deleted_at` column on the `tables` table
-  // (added by PART 2 of complete_db_setup.sql).
   const fetchTables = async () => {
-    const { data, error } = await supabase
-      .from('tables')
-      .select('*')
-      .is('deleted_at', null)
-      .order('created_at')
-    if (error) {
-      setLoadError(
-        'Error loading tables: ' + error.message +
-        ' — run complete_db_setup.sql in the Supabase SQL Editor (it adds the deleted_at column).'
-      )
-      return
-    }
-    setLoadError('')
+    const { data } = await supabase.from('tables').select('*').order('created_at')
     setTables(data || [])
   }
 
-  useEffect(() => { fetchTables() }, [])
+  useEffect(() => {
+    let cancelled = false
+    supabase.from('tables').select('*').order('created_at')
+      .then(({ data }) => { if (!cancelled) setTables(data || []) })
+    return () => { cancelled = true }
+  }, [])
 
   const addTable = async () => {
     if (!tableName.trim()) { alert('Enter table name!'); return }
@@ -65,6 +55,8 @@ export default function TableManager() {
 
     const newPin = generatePin()
 
+    // Bump session_version too, so devices that already entered the OLD PIN
+    // are sent back to the PIN screen (the customer page checks this every 5s).
     const { data: tbl, error: readErr } = await supabase
       .from('tables').select('session_version').eq('id', tableId).single()
     if (readErr) { alert('Error: ' + readErr.message); return }
@@ -80,49 +72,26 @@ export default function TableManager() {
     fetchTables()
   }
 
-  // ── SAFE DELETE (soft delete) ─────────────────────────────────────────
-  // The table row is only marked as deleted (deleted_at is set).
-  // Orders, order items and payments are NEVER touched, so reports and
-  // settled bills keep working (orders store table_name_snapshot for display).
   const deleteTable = async (table) => {
-    // Refuse to remove a table that still has unpaid orders.
-    const { data: unpaid, error: unpaidErr } = await supabase
-      .from('orders').select('id').eq('table_id', table.id).eq('is_paid', false).limit(1)
-    if (unpaidErr) { alert('Error: ' + unpaidErr.message); return }
-    if (unpaid && unpaid.length > 0) {
-      alert(`"${table.table_name}" still has unpaid orders.\n\nPrint/settle its bill first, then delete the table.`)
-      return
-    }
-
     if (!window.confirm(
-      `Delete "${table.table_name}"?\n\n` +
-      `• The table and its QR code will stop working\n` +
-      `• Customers on this table are logged out\n` +
-      `• All past orders and payment data are KEPT in your reports`
+      `Delete "${table.table_name}" permanently?\n\nThis will delete:\n• All orders\n• All order items\n• The session\n• QR code stops working`
     )) return
 
     setDeleting(table.id)
     try {
-      // Make sure old paid orders keep the table name for reports.
-      const { error: snapErr } = await supabase
-        .from('orders')
-        .update({ table_name_snapshot: table.table_name })
-        .eq('table_id', table.id)
-        .or('table_name_snapshot.is.null,table_name_snapshot.eq.')
-      if (snapErr) throw new Error(snapErr.message)
+      const { data: ords } = await supabase
+        .from('orders').select('id').eq('table_id', table.id)
 
-      const { error } = await supabase
-        .from('tables')
-        .update({
-          deleted_at: new Date().toISOString(),
-          is_active: false,                                   // QR / menu should reject it
-          session_version: (table.session_version || 1) + 1,  // logs out any open customer device
-          pin: generatePin(),                                 // old PIN no longer valid
-        })
-        .eq('id', table.id)
-      if (error) throw new Error(error.message)
+      if (ords && ords.length > 0) {
+        await supabase.from('order_items')
+          .delete().in('order_id', ords.map(o => o.id))
+        await supabase.from('orders').delete().eq('table_id', table.id)
+      }
 
-      setMessage(`"${table.table_name}" deleted! Payment data kept ✅`)
+      await supabase.from('table_sessions').delete().eq('table_id', table.id)
+      await supabase.from('tables').delete().eq('id', table.id)
+
+      setMessage(`"${table.table_name}" deleted! ✅`)
       setTimeout(() => setMessage(''), 3000)
       fetchTables()
     } catch (err) {
@@ -166,12 +135,6 @@ export default function TableManager() {
           </div>
         )}
 
-        {loadError && (
-          <div className="bg-red-100 text-red-700 px-4 py-3 rounded-lg mb-4 text-sm font-medium">
-            {loadError}
-          </div>
-        )}
-
         {/* Add Table */}
         <div className="bg-white rounded-2xl shadow p-6 mb-6">
           <h2 className="font-bold text-gray-700 mb-4">
@@ -198,7 +161,7 @@ export default function TableManager() {
 
         {/* Tables Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {tables.length === 0 && !loadError && (
+          {tables.length === 0 && (
             <div className="col-span-2 text-center py-16 text-gray-400">
               <div className="text-5xl mb-3">🪑</div>
               <p>No tables yet. Add your first table above!</p>
@@ -210,19 +173,26 @@ export default function TableManager() {
 
               <h3 className="font-bold text-lg text-orange-500 mb-2">{table.table_name}</h3>
 
-              {/* PIN Display (always visible) */}
+              {/* PIN Display */}
               <div className="bg-orange-50 border border-orange-200 rounded-xl px-4 py-2 mb-4 flex items-center gap-3">
                 <div>
                   <p className="text-xs text-gray-400 mb-0.5">Table PIN</p>
                   <p className="text-2xl font-bold tracking-widest text-orange-600">
-                    {table.pin}
+                    {showPin[table.id] ? table.pin : '••••'}
                   </p>
                 </div>
-                <button
-                  onClick={() => regeneratePin(table.id)}
-                  className="text-xs bg-white border border-orange-200 px-2 py-1 rounded-lg text-orange-500 hover:bg-orange-50">
-                  🔄 New PIN
-                </button>
+                <div className="flex flex-col gap-1">
+                  <button
+                    onClick={() => setShowPin(prev => ({ ...prev, [table.id]: !prev[table.id] }))}
+                    className="text-xs bg-white border border-gray-200 px-2 py-1 rounded-lg text-gray-500 hover:bg-gray-50">
+                    {showPin[table.id] ? '🙈 Hide' : '👁️ Show'}
+                  </button>
+                  <button
+                    onClick={() => regeneratePin(table.id)}
+                    className="text-xs bg-white border border-orange-200 px-2 py-1 rounded-lg text-orange-500 hover:bg-orange-50">
+                    🔄 New PIN
+                  </button>
+                </div>
               </div>
 
               {/* QR Code */}
@@ -251,8 +221,8 @@ export default function TableManager() {
                 </button>
               </div>
 
-              <p className="text-xs text-gray-400 mt-2 text-center">
-                Deleting keeps all past payment data
+              <p className="text-xs text-red-300 mt-2 text-center">
+                Deleting removes ALL data for this table
               </p>
             </div>
           ))}
