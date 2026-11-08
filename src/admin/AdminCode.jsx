@@ -35,14 +35,6 @@ const toRange = (from, to) => ({
   endISO: new Date(to + 'T23:59:59+05:30').toISOString(),
 })
 const localDate = (isoStr) => new Date(isoStr).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
-const localTime = (isoStr) => {
-  const d = new Date(isoStr)
-  const h = String(d.getHours()).padStart(2, '0') // using local is fine for input
-  const m = String(d.getMinutes()).padStart(2, '0')
-  // Actually we want IST hours
-  const ist = new Date(isoStr).toLocaleString('en-CA', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false })
-  return ist.replace(',', '').trim()
-}
 
 // ── Password Gate ────────────────────────────────────────
 function PasswordGate({ onUnlock }) {
@@ -153,15 +145,6 @@ export default function AdminCode() {
 
   const totals = computeTotals()
 
-  useEffect(() => {
-    if (unlocked) {
-      fetchBills()
-      supabase.from('food_items').select('id, name, price, is_available')
-        .eq('is_available', true).order('name')
-        .then(({ data }) => setAllFoodItems(data || []))
-    }
-  }, [unlocked])
-
   const fetchBills = async () => {
     setLoading(true)
     const { startISO, endISO } = toRange(filterFrom, filterTo)
@@ -215,6 +198,16 @@ export default function AdminCode() {
     setBills(result)
     setLoading(false)
   }
+
+  useEffect(() => {
+    if (!unlocked) return
+    const first = setTimeout(fetchBills, 0) // load bills once, right after unlocking
+    supabase.from('food_items').select('id, name, price, is_available')
+      .eq('is_available', true).order('name')
+      .then(({ data }) => setAllFoodItems(data || []))
+    return () => clearTimeout(first)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unlocked])
 
   const openEdit = (bill) => {
     setEditingBill(bill)
@@ -313,7 +306,7 @@ export default function AdminCode() {
     try {
       const newPaidAt = toISOLocal(editDate, editTime)
       const { subtotal, svcAmt, discAmt, finalAmount } = computeTotals()
-      const dv = sanitizeDiscountValue(editDiscType, editDiscValue)
+      const dv = sanitizeDiscountValue(editDiscType, editDiscValue, subtotal + svcAmt)
 
       // ST_06: record who changed this bill, and what it looked like before.
       // If the log cannot be written, the bill is NOT changed.
@@ -338,7 +331,7 @@ export default function AdminCode() {
           service_charge_pct: parseFloat(editServicePct) || 0,
           service_charge_amt: svcAmt,
           discount_type: editDiscType,
-          discount_value: dv,
+          discount_value: editDiscType === 'flat' ? discAmt : dv,
           discount_amt: discAmt,
           discount_reason: editDiscReason.trim(),
           final_amount: finalAmount,
@@ -476,6 +469,7 @@ export default function AdminCode() {
                     <option value="cash">💵 Cash</option>
                     <option value="upi">📱 UPI</option>
                     <option value="card">💳 Card</option>
+                    <option value="complimentary">🎁 Complimentary</option>
                     <option value="pending">⏳ Pending</option>
                   </select>
                 </div>
@@ -623,7 +617,7 @@ export default function AdminCode() {
                 </div>
                 <div>
                   <label className="text-xs text-gray-500 block mb-1">Discount Value</label>
-                  <input type="number" min="0" max={editDiscType === 'percent' ? 100 : undefined} value={editDiscValue} onChange={e => setEditDiscValue(clampDiscountInput(editDiscType, e.target.value))}
+                  <input type="number" min="0" max={editDiscType === 'percent' ? 100 : totals.subtotal + totals.svcAmt} value={editDiscValue} onChange={e => setEditDiscValue(clampDiscountInput(editDiscType, e.target.value, totals.subtotal + totals.svcAmt))}
                     placeholder="0"
                     className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-orange-500" />
                 </div>
