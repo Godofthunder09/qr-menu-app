@@ -7,6 +7,46 @@ import { useSearchParams, useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 import { useOrderSummary } from './useOrderSummary'
 
+// ── One phone per table ─────────────────────────────────────────────────
+// While one phone is using a table, a second phone that enters the right PIN is
+// refused and told to ask the waiter. The lock is released when the waiter changes
+// the PIN, when the bill is cleared, or when the first phone has not been seen for
+// LOCK_SECONDS. Set ONE_PHONE_PER_TABLE to false to let a whole group use their phones.
+const ONE_PHONE_PER_TABLE = true
+const LOCK_SECONDS = 300
+const BUSY_MSG = 'This table is already in use on another phone. Please ask your waiter.'
+const DEVICE_KEY = 'qr_device_id'
+
+const getDeviceId = () => {
+  let id = null
+  try { id = localStorage.getItem(DEVICE_KEY) } catch { /* ignore */ }
+  if (!id) {
+    id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+    try { localStorage.setItem(DEVICE_KEY, id) } catch { /* ignore */ }
+  }
+  return id
+}
+
+// Claims the table for this phone, or refreshes the claim if it is already ours.
+// One UPDATE with a WHERE clause, so two phones tapping at the same moment cannot both win.
+// Returns 'ok' or 'busy'. If the database columns are missing it returns 'ok', so a
+// missing SQL step never locks customers out.
+const claimTable = async (tableId, version) => {
+  if (!ONE_PHONE_PER_TABLE) return 'ok'
+  const me = getDeviceId()
+  const staleBefore = new Date(Date.now() - LOCK_SECONDS * 1000).toISOString()
+  const { data, error } = await supabase
+    .from('tables')
+    .update({ device_id: me, device_seen_at: new Date().toISOString(), device_version: version })
+    .eq('id', tableId)
+    .or(`device_id.is.null,device_id.eq.${me},device_seen_at.lt.${staleBefore},device_version.neq.${version}`)
+    .select('id')
+  if (error) { console.warn('claimTable:', error.message); return 'ok' }
+  return data && data.length > 0 ? 'ok' : 'busy'
+}
+
 export default function MenuPage() {
   const [searchParams] = useSearchParams()
   const tableId = searchParams.get('table')
@@ -77,6 +117,9 @@ export default function MenuPage() {
     if (session) {
       const parsed = JSON.parse(session)
       if (parsed.version === tbl.session_version) {
+        if (await claimTable(tableId, tbl.session_version) === 'busy') {
+          clearLocalData(); setLoading(false); setPinPhase(true); setPinError(BUSY_MSG); return
+        }
         setSessionVersion(tbl.session_version)
         setPinVerified(true); setPinPhase(false)
         await loadMenuData()
@@ -126,6 +169,12 @@ export default function MenuPage() {
     if (parsed.version !== tbl.session_version) {
       clearLocalData()
       setPinVerified(false); setPinInput(''); setPinError(''); setPinPhase(true)
+      return
+    }
+    // Keep our claim on the table fresh. If another phone has taken it, step aside.
+    if (await claimTable(tableId, tbl.session_version) === 'busy') {
+      clearLocalData()
+      setPinVerified(false); setPinInput(''); setPinError(BUSY_MSG); setPinPhase(true)
     }
   }
 
@@ -137,6 +186,9 @@ export default function MenuPage() {
 
     if (pinInput === tbl.pin) {
       const ver = tbl.session_version
+      if (await claimTable(tableId, ver) === 'busy') {
+        setPinError(BUSY_MSG); setPinInput(''); return
+      }
       localStorage.setItem(SESSION_KEY, JSON.stringify({
         version: ver, tableId, enteredAt: new Date().toISOString()
       }))
