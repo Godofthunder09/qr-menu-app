@@ -947,7 +947,7 @@ export default function Reports() {
     <div className="min-h-screen bg-gray-50">
   <div className="bg-white shadow px-4 py-3 flex justify-between items-center sticky top-0 z-30 print:hidden">
     <div 
-      onClick={() => navigate('src/admin/AdminCode.jsx')} // <-- Replace with the actual route path for AdminCode.jsx
+      onClick={() => navigate('/admin/admin-code')} // <-- Replace with the actual route path for AdminCode.jsx
       className="flex items-center gap-3 cursor-pointer hover:opacity-80 transition-opacity"
     >
       <span className="text-xl">📊</span>
