@@ -383,7 +383,7 @@ export default function AdminCode() {
         })))
       }
 
-      alert('✅ Bill updated successfully! Changes will reflect in all Reports.')
+      alert('✅ Bill updated successfully! Changes will reflect in all Reports,yes.')
       closeEdit()
       fetchBills()
     } catch (err) {
