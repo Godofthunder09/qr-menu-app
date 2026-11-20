@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import Login from './admin/Login'
 import Dashboard from './admin/Dashboard'
 import MenuManager from './admin/MenuManager'
@@ -26,6 +26,8 @@ function App() {
         <Route path="/menu" element={<MenuPage />} />
         <Route path="/order-confirmation" element={<OrderConfirmation />} />
         <Route path="/admin/admin-code" element={<ProtectedRoute><AdminCode /></ProtectedRoute>} />
+        {/* any address that does not exist goes to the login page instead of a blank screen */}
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>
   )
