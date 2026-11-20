@@ -172,6 +172,11 @@ const mergeLines = (lines) => {
   return Object.values(map)
 }
 
+// IMPORTANT: when a bill is printed, the Dashboard writes the FULL bill totals
+// (subtotal, service charge, discount, final amount, split payment and open items)
+// onto EVERY order row of that table. So several rows with the same table + paid_at
+// are copies of ONE bill. Their money must NOT be added up, or a table that ordered
+// 6 times is counted 6 times. Items are different on each row, so those are added.
 const normalizeBills = (orders = []) => {
   const map = {}
   orders.forEach(o => {
@@ -195,12 +200,13 @@ const normalizeBills = (orders = []) => {
             isOpen: false,
           }
         }),
-      ...(o.open_items_json || []).map(oi => ({
-        foodItemId: null, name: oi.name || 'Open item', qty: oi.qty || 0, rate: oi.price || 0,
-        amount: (oi.price || 0) * (oi.qty || 0), dept: openItemDept(oi),
-        categoryId: null, subcategoryId: null, isOpen: true,
-      })),
     ]
+    // open items are copied onto every row, so take them from ONE row only
+    const openLines = (o.open_items_json || []).map(oi => ({
+      foodItemId: null, name: oi.name || 'Open item', qty: oi.qty || 0, rate: oi.price || 0,
+      amount: (oi.price || 0) * (oi.qty || 0), dept: openItemDept(oi),
+      categoryId: null, subcategoryId: null, isOpen: true,
+    }))
 
     if (!map[key]) {
       map[key] = {
@@ -217,20 +223,21 @@ const normalizeBills = (orders = []) => {
     }
     const b = map[key]
     b.ids.push(o.id)
-    b.subtotal += rowSub
-    b.service_charge_amt += rowSc
-    b.final_amount += o.final_amount || 0
-    b.rawDiscount += o.discount_amt || 0
+    b.subtotal = Math.max(b.subtotal, rowSub)
+    b.service_charge_amt = Math.max(b.service_charge_amt, rowSc)
+    b.final_amount = Math.max(b.final_amount, o.final_amount || 0)
+    b.rawDiscount = Math.max(b.rawDiscount, o.discount_amt || 0)
     b.items.push(...lines)
+    if (!b.openTaken && openLines.length) { b.items.push(...openLines); b.openTaken = true }
 
     if (rowIsComp) {
       b.isComp = true
-      b.compValue += rowSub + rowSc      // everything waived
-      b.compSub   += rowSub
+      b.compValue = Math.max(b.compValue, rowSub + rowSc)      // everything waived (same on every row)
+      b.compSub   = Math.max(b.compSub, rowSub)
       b.comp_reason = compReasonOf(o.discount_reason) || b.comp_reason
     } else {
-      b.discount_amt += o.discount_amt || 0   // REAL discount only
-      b.discount_value += o.discount_value || 0
+      b.discount_amt = Math.max(b.discount_amt, o.discount_amt || 0)   // REAL discount only
+      b.discount_value = Math.max(b.discount_value, o.discount_value || 0)
       if (o.discount_reason) b.discount_reason = o.discount_reason
     }
     if (o.settlement_status === 'pending' || o.payment_type === 'pending') b.anyPending = true
@@ -239,9 +246,9 @@ const normalizeBills = (orders = []) => {
     if (o.split_payment) {
       const s = b.split_payment || { cash: 0, upi: 0, card: 0 }
       b.split_payment = {
-        cash: s.cash + (o.split_payment.cash || 0),
-        upi:  s.upi  + (o.split_payment.upi  || 0),
-        card: s.card + (o.split_payment.card || 0),
+        cash: Math.max(s.cash, o.split_payment.cash || 0),
+        upi:  Math.max(s.upi,  o.split_payment.upi  || 0),
+        card: Math.max(s.card, o.split_payment.card || 0),
       }
     }
   })
