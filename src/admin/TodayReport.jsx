@@ -65,10 +65,13 @@ const groupOrdersIntoBills = (orders) => {
           .filter(i => (i.quantity || 0) > 0)
           .map(i => ({ ...i, order_id: order.id }))
       ]
-      map[key].subtotal += order.subtotal || 0
-      map[key].service_charge_amt += order.service_charge_amt || 0
-      map[key].discount_amt += order.discount_amt || 0
-      map[key].final_amount += order.final_amount || 0
+      // Every row of a printed bill carries the SAME full totals (the Dashboard writes the
+      // whole bill onto each order row), so take the value once. Adding them up would count
+      // a table that ordered 6 times as 6 bills.
+      map[key].subtotal = Math.max(map[key].subtotal, order.subtotal || 0)
+      map[key].service_charge_amt = Math.max(map[key].service_charge_amt, order.service_charge_amt || 0)
+      map[key].discount_amt = Math.max(map[key].discount_amt, order.discount_amt || 0)
+      map[key].final_amount = Math.max(map[key].final_amount, order.final_amount || 0)
       // If any row of the bill is complimentary, treat the whole bill as such
       if (order.payment_type === 'complimentary') map[key].payment_type = 'complimentary'
       if (order.settlement_status === 'pending') map[key].settlement_status = 'pending'
@@ -94,20 +97,6 @@ const mergeOrderItemsForDisplay = (orderItems = []) => {
     map[groupKey]._rowRefs.push({ id: item.id, quantity: item.quantity })
   })
   return Object.values(map)
-}
-
-// If the lines we can show do not add up to the bill's subtotal (for example because
-// a menu item was removed from the database), show the gap as its own line so the
-// bill on screen always adds up to the amount the customer has to pay.
-const displayLinesFor = (bill) => {
-  const lines = mergeOrderItemsForDisplay(bill.order_items)
-  const shown = lines.reduce((s, l) => s + (l.price_at_order || 0) * l.quantity, 0)
-    + (bill.open_items || []).reduce((s, oi) => s + (oi.price || 0) * (oi.qty || 0), 0)
-  const missing = Math.round((bill.subtotal || 0) - shown)
-  if (missing > 0) {
-    lines.push({ name: '⚠️ Items no longer on record', price_at_order: missing, quantity: 1 })
-  }
-  return lines
 }
 
 const LIQUOR_KEYWORDS = [
@@ -778,7 +767,7 @@ export default function TodayReport() {
 
   // Shared renderer for a settled / complimentary bill card
   const renderSettledCard = (bill, isComp) => {
-    const displayLines = displayLinesFor(bill)
+    const displayLines = mergeOrderItemsForDisplay(bill.order_items)
     return (
       <div key={bill._key}
         className={`rounded-2xl p-4 shadow-sm ${isComp ? 'bg-pink-50 border-2 border-pink-200' : 'bg-white border border-gray-100 opacity-90'}`}>
@@ -1075,7 +1064,7 @@ export default function TodayReport() {
             <div className="space-y-4">
               {pendingBills.map(bill => {
                 const isModifying  = modifyingBillKey === bill._key
-                const displayLines = displayLinesFor(bill)
+                const displayLines = mergeOrderItemsForDisplay(bill.order_items)
                 const liveModTotals = isModifying
                   ? computeModifyTotals(bill, modDiscountType, modDiscountValue)
                   : null
