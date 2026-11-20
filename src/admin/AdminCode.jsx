@@ -34,6 +34,7 @@ const toRange = (from, to) => ({
   startISO: new Date(from + 'T00:00:00+05:30').toISOString(),
   endISO: new Date(to + 'T23:59:59+05:30').toISOString(),
 })
+const daysAgoIST = (n) => new Date(Date.now() - n * 86400000).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
 const localDate = (isoStr) => new Date(isoStr).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
 const localTime = (isoStr) => {
   const d = new Date(isoStr)
@@ -42,6 +43,134 @@ const localTime = (isoStr) => {
   // Actually we want IST hours
   const ist = new Date(isoStr).toLocaleString('en-CA', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false })
   return ist.replace(',', '').trim()
+}
+
+// ── Change history helpers ───────────────────────────────────────────
+const money = (n) => '₹' + (Math.round((Number(n) || 0) * 100) / 100)
+const stampMin = (iso) => (iso ? `${localDate(iso)} ${localTime(iso)}` : '')
+const stampText = (iso) => (iso ? `${formatDate(iso)} ${toIST(iso)}` : '-')
+
+// A plain copy of a bill: what it looks like at one moment.
+const billSummary = (bill) => ({
+  table: bill.table_name_snapshot || '',
+  paid_at: bill.paid_at || null,
+  payment_type: bill.payment_type || '',
+  settlement_status: bill.settlement_status || '',
+  service_pct: Number(bill.service_charge_pct) || 0,
+  service_amt: Number(bill.service_charge_amt) || 0,
+  discount_type: bill.discount_type || 'percent',
+  discount_value: Number(bill.discount_value) || 0,
+  discount_amt: Number(bill.discount_amt) || 0,
+  discount_reason: bill.discount_reason || '',
+  subtotal: Number(bill.subtotal) || 0,
+  final_amount: Number(bill.final_amount) || 0,
+  items: [
+    ...(bill.order_items || [])
+      .filter(oi => (oi.quantity || 0) > 0)
+      .map(oi => ({ name: oi.food_items?.name || 'Unknown', qty: oi.quantity, price: oi.price_at_order, open: false })),
+    ...(bill.open_items || [])
+      .filter(oi => (oi.qty || 0) > 0)
+      .map(oi => ({ name: oi.name, qty: oi.qty, price: oi.price, open: true })),
+  ],
+})
+
+// Older log entries only kept the raw order rows. Build the same copy from those.
+const summaryFromRaw = (snap) => {
+  const orders = snap?.orders || []
+  const o = orders[0]
+  if (!o) return null
+  return billSummary({
+    table_name_snapshot: o.table_name_snapshot, paid_at: o.paid_at, payment_type: o.payment_type,
+    settlement_status: o.settlement_status, service_charge_pct: o.service_charge_pct,
+    service_charge_amt: o.service_charge_amt, discount_type: o.discount_type, discount_value: o.discount_value,
+    discount_amt: o.discount_amt, discount_reason: o.discount_reason, subtotal: o.subtotal,
+    final_amount: o.final_amount,
+    order_items: orders.flatMap(r => r.order_items || []),
+    open_items: snap.open_items || o.open_items_json || [],
+  })
+}
+
+const groupItems = (items = []) => {
+  const m = {}
+  items.forEach(i => {
+    const k = (i.open ? 'open:' : '') + String(i.name || '').trim().toLowerCase()
+    if (!m[k]) m[k] = { name: i.name, open: !!i.open, qty: 0, price: Number(i.price) || 0 }
+    m[k].qty += Number(i.qty) || 0
+  })
+  return m
+}
+
+const discountText = (b) => (b.discount_amt > 0
+  ? `${money(b.discount_amt)} (${b.discount_type === 'percent' ? b.discount_value + '%' : 'flat'})`
+  : 'none')
+
+// The difference between two copies of a bill, as a list a person can read.
+const describeChanges = (b, a) => {
+  const out = []
+  const diff = (label, from, to) => { if (String(from) !== String(to)) out.push({ label, from: String(from), to: String(to) }) }
+  diff('Table', b.table || '-', a.table || '-')
+  if (stampMin(b.paid_at) !== stampMin(a.paid_at)) out.push({ label: 'Date and time', from: stampText(b.paid_at), to: stampText(a.paid_at) })
+  diff('Payment method', b.payment_type || '-', a.payment_type || '-')
+  diff('Settlement status', b.settlement_status || '-', a.settlement_status || '-')
+  diff('Service charge %', b.service_pct + '%', a.service_pct + '%')
+  diff('Discount', discountText(b), discountText(a))
+  diff('Discount reason', b.discount_reason || '-', a.discount_reason || '-')
+
+  const gb = groupItems(b.items), ga = groupItems(a.items)
+  Object.keys(ga).forEach(k => {
+    if (!gb[k]) out.push({ label: 'Item added', from: '-', to: `${ga[k].name} ×${ga[k].qty} at ${money(ga[k].price)}` })
+  })
+  Object.keys(gb).forEach(k => {
+    if (!ga[k]) { out.push({ label: 'Item removed', from: `${gb[k].name} ×${gb[k].qty} at ${money(gb[k].price)}`, to: '-' }); return }
+    if (gb[k].qty !== ga[k].qty) out.push({ label: `${gb[k].name}: quantity`, from: String(gb[k].qty), to: String(ga[k].qty) })
+    if (gb[k].price !== ga[k].price) out.push({ label: `${gb[k].name}: price`, from: money(gb[k].price), to: money(ga[k].price) })
+  })
+
+  diff('Subtotal', money(b.subtotal), money(a.subtotal))
+  diff('Service charge', money(b.service_amt), money(a.service_amt))
+  diff('Bill total', money(b.final_amount), money(a.final_amount))
+  return out
+}
+
+const changesOf = (e) => {
+  if (Array.isArray(e.details?.changes)) return e.details.changes
+  const b = e.details?.before_summary || summaryFromRaw(e.snapshot)
+  if (e.details?.after && b) return describeChanges(b, e.details.after)
+  if (e.action === 'edit' && b && e.details?.new_final_amount != null) {
+    return [{ label: 'Bill total', from: money(b.final_amount), to: money(e.details.new_final_amount) }]
+  }
+  return []
+}
+
+// One card per bill: all the log entries that belong to the same bill, oldest first.
+const buildGroups = (entries) => {
+  const map = {}
+  entries.forEach(e => {
+    const key = Array.isArray(e.order_ids) ? [...e.order_ids].sort().join(',') : String(e.id)
+    if (!map[key]) map[key] = { key, entries: [] }
+    map[key].entries.push(e)
+  })
+  const beforeOf = (e) => e.details?.before_summary || summaryFromRaw(e.snapshot)
+  return Object.values(map).map(g => {
+    g.entries.sort((a, b) => new Date(a.performed_at) - new Date(b.performed_at))
+    const first = g.entries[0]
+    const last = g.entries[g.entries.length - 1]
+    g.original = beforeOf(first)
+    g.deleted = last.action === 'delete'
+    g.table = g.original?.table || last.table_name || '-'
+    g.editCount = g.entries.filter(e => e.action === 'edit').length
+    g.complimentary = g.entries.some(e => e.action === 'complimentary')
+    g.lastAt = last.performed_at
+    g.lastBy = last.performed_by
+    if (g.deleted) g.current = null
+    else if (last.action === 'edit') g.current = last.details?.after || null
+    else if (last.action === 'complimentary') {
+      const b = beforeOf(last)
+      g.current = b ? { ...b, payment_type: 'complimentary', final_amount: 0, discount_amt: (b.subtotal || 0) + (b.service_amt || 0) } : null
+    } else g.current = null
+    g.legacyTotal = (!g.deleted && last.action === 'edit' && !last.details?.after) ? last.details?.new_final_amount : null
+    return g
+  }).sort((a, b) => new Date(b.lastAt) - new Date(a.lastAt))
 }
 
 // ── Password Gate ────────────────────────────────────────
@@ -102,10 +231,188 @@ function PasswordGate({ onUnlock }) {
   )
 }
 
+
+// ── Change history ───────────────────────────────────────
+// Every edit, delete and complimentary change made from this page is kept in the
+// bill_audit_log table. Reports show the CURRENT bill. This tab keeps the story:
+// the bill as it was printed, the bill as it is now, and what changed in between.
+function BillColumn({ title, note, bill, tone }) {
+  if (!bill) {
+    return (
+      <div className="rounded-xl p-3 border border-gray-700 bg-gray-800">
+        <p className="text-xs font-bold uppercase text-gray-400 mb-1">{title}</p>
+        <p className="text-xs text-gray-500">{note || 'Not recorded.'}</p>
+      </div>
+    )
+  }
+  return (
+    <div className={`rounded-xl p-3 border ${tone}`}>
+      <p className="text-xs font-bold uppercase text-gray-300 mb-1">{title}</p>
+      <p className="text-sm font-bold text-white">
+        {bill.table || '-'} <span className="text-xs font-normal text-gray-400">· {bill.payment_type || '-'} · {bill.settlement_status || '-'}</span>
+      </p>
+      {bill.paid_at && <p className="text-xs text-gray-400 mb-2">{stampText(bill.paid_at)}</p>}
+      <div className="space-y-0.5 mb-2">
+        {(bill.items || []).map((i, k) => (
+          <div key={k} className="flex justify-between text-xs text-gray-300">
+            <span>{i.name} ×{i.qty}{i.open ? ' (open)' : ''}</span>
+            <span>{money((Number(i.price) || 0) * (Number(i.qty) || 0))}</span>
+          </div>
+        ))}
+        {(bill.items || []).length === 0 && <p className="text-xs text-gray-500">Item list was not recorded.</p>}
+      </div>
+      <div className="border-t border-gray-700 pt-1 space-y-0.5 text-xs">
+        <div className="flex justify-between text-gray-400"><span>Subtotal</span><span>{money(bill.subtotal)}</span></div>
+        {bill.service_amt > 0 && <div className="flex justify-between text-gray-400"><span>Service charge</span><span>+{money(bill.service_amt)}</span></div>}
+        {bill.discount_amt > 0 && <div className="flex justify-between text-green-400"><span>Discount{bill.discount_reason ? ` (${bill.discount_reason})` : ''}</span><span>-{money(bill.discount_amt)}</span></div>}
+        <div className="flex justify-between font-bold text-sm text-orange-400"><span>Total</span><span>{money(bill.final_amount)}</span></div>
+      </div>
+    </div>
+  )
+}
+
+function ChangeHistory() {
+  const [from, setFrom] = useState(() => daysAgoIST(29))
+  const [to, setTo] = useState(todayIST())
+  const [filterTable, setFilterTable] = useState('')
+  const [filterAction, setFilterAction] = useState('all')
+  const [entries, setEntries] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [open, setOpen] = useState({})
+
+  const load = async () => {
+    setLoading(true); setError('')
+    const { startISO, endISO } = toRange(from, to)
+    const { data, error: err } = await supabase
+      .from('bill_audit_log').select('*')
+      .gte('performed_at', startISO).lte('performed_at', endISO)
+      .order('performed_at', { ascending: false }).limit(1000)
+    if (err) setError(err.message); else setEntries(data || [])
+    setLoading(false)
+  }
+  useEffect(() => {
+    const first = setTimeout(load, 0) // load once when the tab opens
+    return () => clearTimeout(first)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const wanted = entries.filter(e => filterAction === 'all' || e.action === filterAction)
+  let groups = buildGroups(wanted)
+  if (filterTable.trim()) groups = groups.filter(g => String(g.table).toLowerCase().includes(filterTable.trim().toLowerCase()))
+
+  const badge = (cls, text) => <span className={`text-xs px-2 py-0.5 rounded-full font-bold ${cls}`}>{text}</span>
+
+  return (
+    <div>
+      <div className="bg-gray-900 border border-gray-700 rounded-2xl p-4 mb-5">
+        <p className="text-xs font-bold text-gray-400 uppercase mb-1">📜 Change history</p>
+        <p className="text-xs text-gray-500 mb-3">
+          Every bill that was edited, deleted or made complimentary from this page. Reports show the current bill only.
+          Here you can see the bill as it was printed, the bill as it is now, and exactly what changed.
+        </p>
+        <div className="flex flex-wrap gap-3 items-end">
+          <div>
+            <label className="text-xs text-gray-500 block mb-1">Changed from</label>
+            <input type="date" value={from} onChange={e => setFrom(e.target.value)} className="bg-gray-800 border border-gray-600 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-orange-500" />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500 block mb-1">to</label>
+            <input type="date" value={to} onChange={e => setTo(e.target.value)} className="bg-gray-800 border border-gray-600 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-orange-500" />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500 block mb-1">Table</label>
+            <input type="text" value={filterTable} onChange={e => setFilterTable(e.target.value)} placeholder="Any table" className="bg-gray-800 border border-gray-600 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-orange-500 w-32" />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500 block mb-1">What happened</label>
+            <select value={filterAction} onChange={e => setFilterAction(e.target.value)} className="bg-gray-800 border border-gray-600 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-orange-500">
+              <option value="all">All</option>
+              <option value="edit">Edited</option>
+              <option value="delete">Deleted</option>
+              <option value="complimentary">Complimentary</option>
+            </select>
+          </div>
+          <button onClick={load} className="bg-orange-500 hover:bg-orange-600 text-white px-5 py-2 rounded-lg text-sm font-bold transition">Load history</button>
+        </div>
+      </div>
+
+      {loading && <div className="text-center py-12 text-gray-500">Loading history...</div>}
+      {error && <div className="bg-red-950 border border-red-800 text-red-300 rounded-xl p-3 text-sm mb-4">Could not load the history: {error}. Has the bill_audit_log table been created in Supabase (STEP 9 of complete_db_setup.sql)?</div>}
+      {!loading && !error && groups.length === 0 && (
+        <div className="text-center py-16 text-gray-600"><div className="text-5xl mb-3">📭</div><p>No changed bills in this period.</p></div>
+      )}
+
+      <div className="space-y-3">
+        {groups.map(g => {
+          const isOpen = !!open[g.key]
+          const originalTotal = g.original?.final_amount
+          const currentTotal = g.deleted ? null : (g.current ? g.current.final_amount : g.legacyTotal)
+          return (
+            <div key={g.key} className="bg-gray-900 border border-gray-700 rounded-2xl p-4">
+              <button onClick={() => setOpen(p => ({ ...p, [g.key]: !p[g.key] }))} className="w-full text-left flex justify-between items-start gap-3 flex-wrap">
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap mb-1">
+                    <span className="font-black text-white text-base">{g.table}</span>
+                    {g.editCount > 0 && badge('bg-orange-900 text-orange-300', `Edited ×${g.editCount}`)}
+                    {g.complimentary && badge('bg-pink-900 text-pink-300', 'Complimentary')}
+                    {g.deleted && badge('bg-red-900 text-red-300', 'Deleted')}
+                  </div>
+                  <p className="text-xs text-gray-400">Last change {stampText(g.lastAt)} by {g.lastBy || 'unknown'}</p>
+                </div>
+                <div className="text-right">
+                  <p className="text-xs text-gray-500">{originalTotal != null ? money(originalTotal) : '-'} → {g.deleted ? 'deleted' : (currentTotal != null ? money(currentTotal) : '?')}</p>
+                  <p className="text-xs text-gray-600">{isOpen ? '▲ hide' : '▼ show details'}</p>
+                </div>
+              </button>
+
+              {isOpen && (
+                <div className="mt-4 space-y-4">
+                  <div className="grid md:grid-cols-2 gap-3">
+                    <BillColumn title="Original bill (as printed)" bill={g.original} tone="border-gray-600 bg-gray-800" note="The original bill was not recorded for this entry." />
+                    {g.deleted
+                      ? <div className="rounded-xl p-3 border border-red-800 bg-red-950"><p className="text-xs font-bold uppercase text-red-300 mb-1">Current bill</p><p className="text-xs text-red-200">This bill was deleted. The original is kept on the left.</p></div>
+                      : <BillColumn title="Current bill (Reports use this)" bill={g.current} tone="border-orange-600 bg-gray-800" note={g.legacyTotal != null ? `This older entry only recorded the new total: ${money(g.legacyTotal)}.` : 'The current version was not recorded for this entry.'} />}
+                  </div>
+
+                  <div className="bg-gray-800 rounded-xl p-3">
+                    <p className="text-xs font-bold text-gray-400 uppercase mb-2">What changed</p>
+                    <div className="space-y-3">
+                      {g.entries.map(e => {
+                        const list = changesOf(e)
+                        return (
+                          <div key={e.id} className="border-l-2 border-orange-600 pl-3">
+                            <p className="text-xs text-gray-300">
+                              <span className="font-bold">{e.action === 'edit' ? 'Edited' : e.action === 'delete' ? 'Deleted' : 'Made complimentary'}</span>
+                              {' '}· {stampText(e.performed_at)} · {e.performed_by || 'unknown'}
+                            </p>
+                            {e.action === 'complimentary' && e.details?.reason && <p className="text-xs text-pink-300">Reason: {e.details.reason}</p>}
+                            {e.action === 'delete' && <p className="text-xs text-red-300">The whole bill was removed.</p>}
+                            {list.map((c, k) => (
+                              <p key={k} className="text-xs text-gray-400">
+                                {c.label}: <span className="text-red-300">{c.from}</span> → <span className="text-green-300">{c.to}</span>
+                              </p>
+                            ))}
+                            {e.action === 'edit' && list.length === 0 && <p className="text-xs text-gray-500">Detailed changes were not recorded for this older entry.</p>}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 // ── Main AdminCode Component ─────────────────────────────
 export default function AdminCode() {
   const navigate = useNavigate()
   const [unlocked, setUnlocked] = useState(false)
+  const [view, setView] = useState('bills') // 'bills' | 'history'
 
   // Filters
   const [filterFrom, setFilterFrom] = useState(todayIST())
@@ -177,10 +484,11 @@ export default function AdminCode() {
       .lte('paid_at', endISO)
       .order('paid_at', { ascending: false })
 
-    // Group by table+minute
+    // One bill = same table + EXACT paid_at (never a minute bucket). Every order row of a
+    // printed bill carries the same full totals, so the totals are taken from one row.
     const map = {}
     orders?.forEach(o => {
-      const key = `${o.table_name_snapshot}__${o.paid_at?.substring(0, 16)}`
+      const key = `${o.table_name_snapshot}__${o.paid_at}`
       if (!map[key]) {
         map[key] = {
           _key: key,
@@ -315,9 +623,22 @@ export default function AdminCode() {
       const { subtotal, svcAmt, discAmt, finalAmount } = computeTotals()
       const dv = sanitizeDiscountValue(editDiscType, editDiscValue)
 
-      // ST_06: record who changed this bill, and what it looked like before.
-      // If the log cannot be written, the bill is NOT changed.
+      // Change history: the bill as it is now (before), as it will be (after), and the difference.
+      const before = billSummary(editingBill)
+      const after = {
+        table: editTable, paid_at: newPaidAt, payment_type: editPayment, settlement_status: editSettlement,
+        service_pct: parseFloat(editServicePct) || 0, service_amt: svcAmt,
+        discount_type: editDiscType, discount_value: dv, discount_amt: discAmt, discount_reason: editDiscReason.trim(),
+        subtotal, final_amount: finalAmount,
+        items: editItems.map(i => ({ name: i.name, qty: i.qty, price: i.price, open: !!i.isOpen })),
+      }
+      const changes = describeChanges(before, after)
+      if (changes.length === 0) { alert('Nothing was changed, so nothing was saved.'); return }
+
+      // ST_06: record who changed this bill, what it looked like before, what it became and
+      // what changed. If the log cannot be written, the bill is NOT changed.
       const editAuditErr = await writeAuditLog('edit', editingBill, {
+        before_summary: before, after, changes,
         new_subtotal: subtotal, new_discount_amt: discAmt, new_final_amount: finalAmount,
       })
       if (editAuditErr) throw new Error('Audit log could not be saved, so the bill was not changed. ' + editAuditErr.message)
@@ -383,7 +704,7 @@ export default function AdminCode() {
         })))
       }
 
-      alert('✅ Bill updated successfully! Changes will reflect in all Reports,yes.')
+      alert('✅ Bill updated. Reports now show the new bill. The original and the changes are kept in Change history.')
       closeEdit()
       fetchBills()
     } catch (err) {
@@ -397,7 +718,7 @@ export default function AdminCode() {
     if (!window.confirm(`⚠️ PERMANENTLY DELETE this bill for ${bill.table_name_snapshot}?\n\nThis CANNOT be undone!`)) return
     try {
       // ST_06: save a full copy of the bill in the audit log BEFORE deleting it.
-      const delAuditErr = await writeAuditLog('delete', bill)
+      const delAuditErr = await writeAuditLog('delete', bill, { before_summary: billSummary(bill) })
       if (delAuditErr) {
         alert('Audit log could not be saved, so the bill was NOT deleted: ' + delAuditErr.message)
         return
@@ -437,6 +758,21 @@ export default function AdminCode() {
         </div>
       </div>
 
+      {/* Tabs */}
+      <div className="bg-gray-900 border-b border-gray-800 px-4 flex gap-1">
+        {[['bills', '🧾 Bills'], ['history', '📜 Change history']].map(([id, label]) => (
+          <button key={id} onClick={() => setView(id)}
+            className={`px-4 py-2.5 text-xs font-bold border-b-2 transition ${view === id ? 'border-orange-500 text-orange-400' : 'border-transparent text-gray-500 hover:text-gray-300'}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {view === 'history' && (
+        <div className="max-w-4xl mx-auto p-4 md:p-6"><ChangeHistory /></div>
+      )}
+
+      {view === 'bills' && (
       <div className="max-w-4xl mx-auto p-4 md:p-6">
 
         {/* ── EDIT PANEL ── */}
@@ -777,6 +1113,7 @@ export default function AdminCode() {
           </div>
         )}
       </div>
+      )}
     </div>
   )
 }
