@@ -49,6 +49,17 @@ const formatDuration = (mins) => {
   const h = Math.floor(mins / 60); const m = mins % 60
   return m > 0 ? `${h}h ${m}m` : `${h}h`
 }
+// A stay longer than this almost always means old, unpaid orders were still on the table
+// and got billed together with today's. The report flags it instead of just showing "108h".
+const LONG_STAY_MIN = 24 * 60
+const longStayHint = 'This bill includes orders from earlier days. Check the table for old unpaid orders.'
+// "9:15 am → 1:40 pm" on one day, "17 Nov 12:53 am → 21 Nov 1:25 pm" when it crosses days
+const spanText = (start, end) => {
+  if (!start || !end) return `${start ? toIST(start) : '—'} → ${end ? toIST(end) : '—'}`
+  const sameDay = new Date(start).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }) ===
+                  new Date(end).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
+  return sameDay ? `${toIST(start)} → ${toIST(end)}` : `${formatDate(start)} ${toIST(start)} → ${formatDate(end)} ${toIST(end)}`
+}
 const r2  = (n) => Math.round((Number(n) || 0) * 100) / 100
 const inr = (n) => r2(n).toLocaleString('en-IN')
 const pctOf = (part, whole) => (whole > 0 ? ((part / whole) * 100).toFixed(1) : '0.0')
@@ -346,9 +357,13 @@ const buildTableGroups = (bills) => {
     const sorted = [...list].sort((a, b) => new Date(a.paid_at) - new Date(b.paid_at))
     const activatedAt = sorted.reduce((min, b) => (!min || new Date(b.created_at) < new Date(min) ? b.created_at : min), null)
     const paidAt = sorted.reduce((max, b) => (!max || new Date(b.paid_at) > new Date(max) ? b.paid_at : max), null)
-    const bills2 = sorted.map((b, idx) => ({ ...b, billSerial: idx + 1, billId: b.ids[0] }))
+    // Time at the table = the time of EACH bill added up (first order of that bill to its payment),
+    // not first-to-last across several bills or several days.
+    const bills2 = sorted.map((b, idx) => ({ ...b, billSerial: idx + 1, billId: b.ids[0], duration: diffMinutes(b.created_at, b.paid_at) }))
+    const known = bills2.map(b => b.duration).filter(d => d !== null)
+    const stay = known.length ? known.reduce((s, d) => s + d, 0) : null
     return {
-      name, activatedAt, paidAt, duration: diffMinutes(activatedAt, paidAt), bills: bills2,
+      name, activatedAt, paidAt, duration: stay, bills: bills2,
       tableRevenue:  bills2.reduce((s, b) => s + b.final_amount, 0),
       tableSubtotal: bills2.reduce((s, b) => s + b.subtotal, 0),
       tableDiscount: bills2.reduce((s, b) => s + b.discount_amt, 0),
@@ -876,7 +891,7 @@ export default function Reports() {
       ['DETAILED BILL DATA'],
     ]
     tblData.forEach(tbl => {
-      rows.push([]); rows.push([`TABLE: ${tbl.name}`, `Total: Rs.${r2(tbl.tableRevenue)}`, `${tbl.bills.length} bill(s)`, `Duration: ${formatDuration(tbl.duration)}`])
+      rows.push([]); rows.push([`TABLE: ${tbl.name}`, `Total: Rs.${r2(tbl.tableRevenue)}`, `${tbl.bills.length} bill(s)`, `Duration: ${formatDuration(tbl.duration)}${tbl.duration > LONG_STAY_MIN ? ' (over 24h: check for old unpaid orders)' : ''}`])
       tbl.bills.forEach(bill => {
         rows.push([`Bill #${bill.billSerial}`, payText(bill), toIST(bill.paid_at), `Rs.${r2(bill.final_amount)}`])
         rows.push(['Sr', 'Item', 'Dept', 'Qty', 'Rate', 'Amount'])
@@ -1474,7 +1489,7 @@ export default function Reports() {
               {tblData.map(tbl => (
                 <div key={tbl.name} className="mb-4 border rounded-xl p-3">
                   <p className="font-bold mb-1">{tbl.name} — Rs.{inr(tbl.tableRevenue)}</p>
-                  <p className="text-xs text-gray-500 mb-2">🟢 {tbl.activatedAt ? toIST(tbl.activatedAt) : '—'} → 🔴 {tbl.paidAt ? toIST(tbl.paidAt) : '—'} · ⏱ {formatDuration(tbl.duration)}</p>
+                  <p className="text-xs text-gray-500 mb-2">🟢 {spanText(tbl.activatedAt, tbl.paidAt)} · ⏱ {formatDuration(tbl.duration)}{tbl.duration > LONG_STAY_MIN ? ' ⚠️ ' + longStayHint : ''}</p>
                   {tbl.bills.map(bill => (
                     <div key={bill.key} className="text-xs border-b pb-2 mb-2">
                       <div className="flex justify-between font-medium"><span>Bill #{bill.billSerial} · {bill.isComp ? '🎁 Complimentary' : bill.isPending ? '⏳ Pending' : bill.split_payment ? '🔀 Split' : (PAY_LABEL[bill.payment_type] || bill.payment_type)}</span><span>Rs.{inr(bill.final_amount)}</span></div>
@@ -1517,8 +1532,11 @@ export default function Reports() {
                             <div>
                               <p className="font-bold text-gray-800 text-base">{tbl.name}</p>
                               <div className="flex flex-wrap gap-2 mt-1">
-                                <span className="text-xs text-gray-400">🟢 {tbl.activatedAt ? toIST(tbl.activatedAt) : '—'} → 🔴 {tbl.paidAt ? toIST(tbl.paidAt) : '—'}</span>
-                                <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-medium">⏱ {formatDuration(tbl.duration)}</span>
+                                <span className="text-xs text-gray-400">🟢 {spanText(tbl.activatedAt, tbl.paidAt)}</span>
+                                <span title={tbl.duration > LONG_STAY_MIN ? longStayHint : undefined}
+                                  className={`text-xs px-2 py-0.5 rounded-full font-medium ${tbl.duration > LONG_STAY_MIN ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>
+                                  {tbl.duration > LONG_STAY_MIN ? '⚠️ ' : '⏱ '}{formatDuration(tbl.duration)}
+                                </span>
                               </div>
                             </div>
                           </div>
