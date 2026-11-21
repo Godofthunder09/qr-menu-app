@@ -284,11 +284,17 @@ function ChangeHistory() {
   const load = async () => {
     setLoading(true); setError('')
     const { startISO, endISO } = toRange(from, to)
-    const { data, error: err } = await supabase
-      .from('bill_audit_log').select('*')
-      .gte('performed_at', startISO).lte('performed_at', endISO)
-      .order('performed_at', { ascending: false }).limit(1000)
-    if (err) setError(err.message); else setEntries(data || [])
+    // Read the log without asking the database to filter or sort by a time column, so this
+    // still works if the table was created by an older version with different column names.
+    // The date range and the order are applied here instead.
+    const { data, error: err } = await supabase.from('bill_audit_log').select('*').limit(3000)
+    if (err) { setError(err.message); setLoading(false); return }
+    const startMs = new Date(startISO).getTime(), endMs = new Date(endISO).getTime()
+    const rows = (data || [])
+      .map(e => ({ ...e, performed_at: e.performed_at || e.created_at || e.changed_at || null, performed_by: e.performed_by || e.user_email || null }))
+      .filter(e => { if (!e.performed_at) return true; const t = new Date(e.performed_at).getTime(); return t >= startMs && t <= endMs })
+      .sort((a, b) => new Date(b.performed_at || 0) - new Date(a.performed_at || 0))
+    setEntries(rows)
     setLoading(false)
   }
   useEffect(() => {
@@ -337,7 +343,7 @@ function ChangeHistory() {
       </div>
 
       {loading && <div className="text-center py-12 text-gray-500">Loading history...</div>}
-      {error && <div className="bg-red-950 border border-red-800 text-red-300 rounded-xl p-3 text-sm mb-4">Could not load the history: {error}. Has the bill_audit_log table been created in Supabase (STEP 9 of complete_db_setup.sql)?</div>}
+      {error && <div className="bg-red-950 border border-red-800 text-red-300 rounded-xl p-3 text-sm mb-4">Could not load the history: {error}. Run STEP 9 of complete_db_setup.sql in Supabase to create or repair the bill_audit_log table, then try again.</div>}
       {!loading && !error && groups.length === 0 && (
         <div className="text-center py-16 text-gray-600"><div className="text-5xl mb-3">📭</div><p>No changed bills in this period.</p></div>
       )}
