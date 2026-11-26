@@ -13,6 +13,8 @@
 // Keep in sync with DEPARTMENTS in MenuManager.jsx / food_items_department_check
 export const DEPARTMENTS = ['Kitchen', 'Beverage', 'Liquor', 'Tandoor', 'Billing']
 
+import { supabase } from '../supabase/client'
+
 const CFG_KEY = 'qr_dept_printers_v1'
 const PRINTED_KEY = 'qr_printed_item_ids_v1'
 const QZ_SRC = 'https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.js'
@@ -62,8 +64,55 @@ const loadQz = () => {
   return qzPromise
 }
 
+
+// ── Signed printing (removes the QZ Tray "Allow" popup) ───────────────
+// The certificate is public. The matching private key stays on the server
+// (/api/qz-sign), which only signs for a logged-in admin.
+const QZ_CERT = `-----BEGIN CERTIFICATE-----
+MIIDVzCCAj+gAwIBAgIUCDqTBEi1sI+J+62CzUWixvqvjwkwDQYJKoZIhvcNAQEN
+BQAwOzEVMBMGA1UEAwwMWWFzaCBRUiBNZW51MRUwEwYDVQQKDAxZYXNoIFFSIE1l
+bnUxCzAJBgNVBAYTAklOMB4XDTI2MTEyNjA3NTIwNVoXDTM2MTEyMzA3NTIwNVow
+OzEVMBMGA1UEAwwMWWFzaCBRUiBNZW51MRUwEwYDVQQKDAxZYXNoIFFSIE1lbnUx
+CzAJBgNVBAYTAklOMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqvee
+HHUT2rbY25eE/77mlmcIfZkp0VH687VTLjN+tGqrRrem7v8398m4n1xfndVsC4gF
+7+FZgchIFstEqTBZPfaitZmCGzSZmVMg3HantPleCnhMG/TyzUZuf54gdi5PdWCb
+MnjVGOSTyBE1n90rsI19fIDoLzlZCIAIaxKbco6JUlsvTvH3PhCM+/3d7d+xUKC7
+3OLUOrzQIFwrJ3VoAlK3I4mBT3HNwmye+U4LbOIe8xQkieDe4E3tcc0gYoZvKNFf
+HW8Au1K76iFqyCUS+BIUzSMyrPsL+1EWnUfAhCjjq1igsPxHFsMuXVoh7hNERIXf
+f/Z09AXG0qIGlSkkxQIDAQABo1MwUTAdBgNVHQ4EFgQU/xTCjjsTK6GjwNmj/FoD
+ps/9llwwHwYDVR0jBBgwFoAU/xTCjjsTK6GjwNmj/FoDps/9llwwDwYDVR0TAQH/
+BAUwAwEB/zANBgkqhkiG9w0BAQ0FAAOCAQEAhwxidiBO10fFZ9SQKDdSF/U0lDGY
+VQoEZ3YIm9J0i3rXe0rSnp98BW5TRsRLHaFBn5mcjkiqwtXIZqm02xjhs84k91nK
+YASHGno3hU7/FmwqAhP9oKcsdXPB008HCPM0vT1NForkH1ca8wnBLiB4NgvuSEVX
+HNy3x6Q/q1zYbbNLxSxqIYVC7ddBfhhQYb9C7rurKEExiHvKpcY9jCqTx5Jy+pgu
+BXeYbzo+y/fHaQQvFp4oF0ZDEZ0rh12wkOVBFMRmYrtqCiK3MHm+H25lpNQEHTs2
+SUj1H2kTgHMdYj9+rLQM1XFdfll0q1tOh9Ffku96CYDDRxdqMa2f1F4UAw==
+-----END CERTIFICATE-----`
+
+let securityReady = false
+const setupQzSecurity = (qz) => {
+  if (securityReady) return
+  qz.security.setCertificatePromise((resolve) => resolve(QZ_CERT))
+  qz.security.setSignatureAlgorithm('SHA512')
+  qz.security.setSignaturePromise((toSign) => (resolve, reject) => {
+    supabase.auth.getSession()
+      .then(({ data }) => fetch('/api/qz-sign', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain',
+          Authorization: `Bearer ${data?.session?.access_token || ''}`,
+        },
+        body: toSign,
+      }))
+      .then(r => r.ok ? r.text() : r.text().then(t => { throw new Error(t || 'sign failed') }))
+      .then(resolve, reject)
+  })
+  securityReady = true
+}
+
 const connectQz = async () => {
   const qz = await loadQz()
+  setupQzSecurity(qz)
   if (!qz.websocket.isActive()) {
     try { await qz.websocket.connect({ retries: 1, delay: 1 }) }
     catch (e) { throw new Error('QZ Tray is not running on this computer.') }
