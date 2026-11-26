@@ -5,7 +5,8 @@ import { calcDiscountAmount } from '../utils/billing'
 import { validateDiscount, isSoleItemRemoval } from '../utils/discountValidation'
 import {
   DEPARTMENTS, loadPrinterConfig, savePrinterConfig,
-  loadPrintedItemIds, savePrintedItemIds, printDepartmentTickets
+  loadPrintedItemIds, savePrintedItemIds, printDepartmentTickets,
+  printBill, BILLING_NOTE, CATCHUP_HOURS, fetchPrintedIds, claimItems, markItemsPrinted, releaseClaims
 } from '../utils/departmentPrint'
 
 const toIST = (d) => new Date(d).toLocaleTimeString('en-IN', {
@@ -172,52 +173,88 @@ export default function Dashboard() {
   }, [])
 
   // ── Auto-print department tickets for every NEW order item ─────────
-  // Each order_items row is printed exactly once (its id is remembered in
-  // localStorage). Items are grouped by food_items.department and each
-  // group goes to that department's printer: name + quantity only.
+  // - Catch-up: orders placed while the Dashboard was closed are printed
+  //   when it opens (last CATCHUP_HOURS hours, unpaid orders only).
+  // - No duplicates across devices: each order_items row is claimed in the
+  //   database (kot_printed_items) before printing, so only one device prints.
+  // - Customer notes are printed under each item.
   const autoPrintNewItems = useCallback(async (ordersData) => {
     const cfg = printerConfigRef.current
     if (!cfg.enabled || printingRef.current) return
     const printed = printedItemIdsRef.current
-    const batches = [] // one per order, so each ticket shows its table
+    const since = new Date(Date.now() - CATCHUP_HOURS * 3600 * 1000).toISOString()
+
+    // 1. candidates: not printed on this browser, not added at billing
+    let candidates = []
     ordersData.forEach(o => {
-      if (!(o.created_at > sessionStart)) return // only orders placed this session
-      const fresh = (o.order_items || []).filter(i => i.quantity > 0 && !printed.has(i.id))
-      if (fresh.length === 0) return
-      batches.push({ order: o, items: fresh })
+      if (!(o.created_at > since)) return
+      ;(o.order_items || []).forEach(i => {
+        if (i.quantity > 0 && !printed.has(i.id) && i.note !== BILLING_NOTE) candidates.push({ order: o, item: i })
+      })
     })
-    if (batches.length === 0) return
+    if (candidates.length === 0) return
 
     printingRef.current = true
     try {
-      for (const { order, items } of batches) {
-        const result = await printDepartmentTickets({
-          tableName: order.tables?.table_name || order.table_name_snapshot || 'Table',
-          time: toIST(order.created_at),
-          items: items.map(i => ({
-            name: i.food_items?.name || 'Unknown',
-            qty: i.quantity,
-            department: i.food_items?.department || null,
-          })),
-          config: cfg,
-        })
-        // Mark as printed only the departments that really printed,
-        // so a failed printer is retried on the next poll.
+      // 2. drop items that ANY device already printed / is printing
+      const done = await fetchPrintedIds(candidates.map(c => c.item.id))
+      done.forEach(id => printed.add(id))
+      candidates = candidates.filter(c => !done.has(c.item.id))
+      if (candidates.length === 0) { savePrintedItemIds(printed); return }
+
+      // 3. claim the rest - the claims this device wins are the ones it prints
+      const won = await claimItems(candidates.map(c => c.item.id))
+      candidates = candidates.filter(c => won.has(c.item.id))
+      if (candidates.length === 0) return
+
+      // 4. one batch per order so each ticket shows its table
+      const byOrder = new Map()
+      candidates.forEach(({ order, item }) => {
+        if (!byOrder.has(order.id)) byOrder.set(order.id, { order, items: [] })
+        byOrder.get(order.id).items.push(item)
+      })
+
+      for (const { order, items } of byOrder.values()) {
+        const ageMin = (Date.now() - new Date(order.created_at).getTime()) / 60000
+        const tableLabel = order.tables?.table_name || order.table_name_snapshot || 'Table'
+        let result
+        try {
+          result = await printDepartmentTickets({
+            tableName: tableLabel,
+            time: toIST(order.created_at),
+            items: items.map(i => ({
+              name: i.food_items?.name || 'Unknown',
+              qty: i.quantity,
+              note: i.note,
+              department: i.food_items?.department || null,
+            })),
+            config: cfg,
+            late: ageMin > 5,
+          })
+        } catch (e) {
+          result = { printed: [], failed: ['all'], error: e.message }
+        }
+        const okIds = [], failIds = []
         items.forEach(i => {
           const dep = i.food_items?.department || cfg.defaultDepartment
-          if (!result.failed.includes(dep)) printed.add(i.id)
+          if (result.failed.includes(dep) || result.failed.includes('all')) failIds.push(i.id)
+          else okIds.push(i.id)
         })
+        if (okIds.length) { okIds.forEach(id => printed.add(id)); await markItemsPrinted(okIds) }
+        if (failIds.length) await releaseClaims(failIds)   // retried on the next poll
         savePrintedItemIds(printed)
         if (result.failed.length > 0) {
-          setPrintStatus({ ok: false, text: `⚠️ Could not print to: ${result.failed.join(', ')} (${order.tables?.table_name || ''}). ${result.error || ''}` })
+          setPrintStatus({ ok: false, text: `⚠️ Could not print to: ${result.failed.join(', ')} (${tableLabel}). ${result.error || ''}` })
         } else {
-          setPrintStatus({ ok: true, text: `🖨️ Sent to ${result.printed.join(', ')} — ${order.tables?.table_name || ''}` })
+          setPrintStatus({ ok: true, text: `🖨️ Sent to ${result.printed.join(', ')} — ${tableLabel}${ageMin > 5 ? ' (late ticket)' : ''}` })
         }
       }
+    } catch (e) {
+      setPrintStatus({ ok: false, text: `⚠️ Print record problem: ${e.message}. Run the kot_printed_items SQL in Supabase.` })
     } finally {
       printingRef.current = false
     }
-  }, [sessionStart])
+  }, [])
 
   const reprintOrder = async (order) => {
     const cfg = printerConfigRef.current
@@ -225,7 +262,7 @@ export default function Dashboard() {
       tableName: order.tables?.table_name || 'Table',
       time: toIST(order.created_at),
       items: (order.order_items || []).filter(i => i.quantity > 0).map(i => ({
-        name: i.food_items?.name || 'Unknown', qty: i.quantity,
+        name: i.food_items?.name || 'Unknown', qty: i.quantity, note: i.note,
         department: i.food_items?.department || null,
       })),
       config: cfg, reprint: true,
@@ -734,9 +771,18 @@ export default function Dashboard() {
       discountReason: discountReason.trim(), finalAmount,
     }
 
-    const w = window.open('', '_blank', 'width=400,height=600')
-    w.document.write(buildHtmlReceipt(lines))
-    w.document.close(); w.focus(); w.print(); w.close()
+    // Send the bill silently to the Billing printer (QZ Tray). If no Billing
+    // printer is set, or QZ fails, fall back to the browser print window.
+    const billResult = await printBill({ bill: lines, config: printerConfigRef.current })
+    if (billResult.ok) {
+      setPrintStatus({ ok: true, text: `🖨️ Bill sent to Billing printer — ${tblData?.table_name || ''}` })
+    } else {
+      if (!billResult.notConfigured) {
+        setPrintStatus({ ok: false, text: `⚠️ Billing printer failed: ${billResult.error}. Opened the browser print window instead.` })
+      }
+      const w = window.open('', '_blank', 'width=400,height=600')
+      if (w) { w.document.write(buildHtmlReceipt(lines)); w.document.close(); w.focus(); w.print(); w.close() }
+    }
 
     const nowIST = now.toISOString()
 
