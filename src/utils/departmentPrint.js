@@ -125,12 +125,38 @@ const ESC = '\x1B', GS = '\x1D'
 const COLS = 32
 const clip = (s, n) => (s.length > n ? s.slice(0, n) : s)
 
-const buildTicket = ({ department, tableName, time, items, reprint }) => {
+// Clean a customer note for a thermal printer and wrap it to the paper width.
+const cleanNote = (n) => String(n || '').replace(/[\u0000-\u001F\u007F]+/g, ' ').replace(/\s+/g, ' ').trim()
+const wrap = (text, width) => {
+  const out = []
+  let cur = ''
+  text.split(' ').forEach(word => {
+    while (word.length > width) {            // very long word: hard split
+      if (cur) { out.push(cur); cur = '' }
+      out.push(word.slice(0, width)); word = word.slice(width)
+    }
+    if (!cur) cur = word
+    else if ((cur + ' ' + word).length <= width) cur += ' ' + word
+    else { out.push(cur); cur = word }
+  })
+  if (cur) out.push(cur)
+  return out
+}
+
+const buildTicket = ({ department, tableName, time, items, reprint, late }) => {
   const line = '-'.repeat(COLS)
-  const rows = items.map(i => {
+  const itemBlocks = items.flatMap(i => {
     const qty = `x${i.qty}`
     const name = clip(i.name, COLS - qty.length - 1)
-    return name + ' '.repeat(Math.max(1, COLS - name.length - qty.length)) + qty
+    const row = name + ' '.repeat(Math.max(1, COLS - name.length - qty.length))  + qty
+    const note = cleanNote(i.note)
+    const parts = [ESC + '!' + '\x10', row + '\n', ESC + '!' + '\x00']
+    if (note) {
+      parts.push(ESC + 'E' + '\x01')      // bold on
+      wrap(note, COLS - 3).forEach((l, idx) => parts.push((idx === 0 ? '>> ' : '   ') + l + '\n'))
+      parts.push(ESC + 'E' + '\x00')      // bold off
+    }
+    return parts
   })
   return [
     ESC + '@',                         // init
@@ -139,15 +165,14 @@ const buildTicket = ({ department, tableName, time, items, reprint }) => {
     department.toUpperCase() + '\n',
     ESC + '!' + '\x00',
     (reprint ? '** REPRINT **\n' : ''),
+    (late ? '** LATE TICKET - placed earlier **\n' : ''),
     ESC + '!' + '\x10',                // double height
     `TABLE: ${tableName}\n`,
     ESC + '!' + '\x00',
     time + '\n',
     ESC + 'a' + '\x00',                // left
     line + '\n',
-    ESC + '!' + '\x10',
-    rows.join('\n') + '\n',
-    ESC + '!' + '\x00',
+    ...itemBlocks,
     line + '\n',
     '\n\n\n',
     GS + 'V' + '\x41' + '\x03',        // partial cut
@@ -156,7 +181,7 @@ const buildTicket = ({ department, tableName, time, items, reprint }) => {
 
 // Group items by department and print one small ticket per department.
 // Returns { printed: [dept...], failed: [dept...], error }
-export const printDepartmentTickets = async ({ tableName, time, items, config, reprint = false }) => {
+export const printDepartmentTickets = async ({ tableName, time, items, config, reprint = false, late = false }) => {
   const groups = {}
   items.forEach(i => {
     const dep = DEPARTMENTS.includes(i.department) ? i.department : config.defaultDepartment
@@ -180,7 +205,7 @@ export const printDepartmentTickets = async ({ tableName, time, items, config, r
     }
     try {
       const cfg = qz.configs.create(printerName, { encoding: 'UTF-8' })
-      await qz.print(cfg, buildTicket({ department, tableName, time, items: deptItems, reprint })
+      await qz.print(cfg, buildTicket({ department, tableName, time, items: deptItems, reprint, late })
         .map(d => ({ type: 'raw', format: 'plain', data: d })))
       printed.push(department)
     } catch (e) {
@@ -189,4 +214,132 @@ export const printDepartmentTickets = async ({ tableName, time, items, config, r
     }
   }
   return { printed, failed, error }
+}
+
+
+// ── Shared "already printed" record (table kot_printed_items) ─────────
+// Every order_items row is CLAIMED in the database before it is printed.
+// The insert is atomic, so if two devices see the same new item only one
+// wins the claim and prints. A failed print releases the claim for retry.
+export const BILLING_NOTE = 'Added at billing'   // items added while billing are not sent to the kitchen
+export const CATCHUP_HOURS = 24                  // orders older than this are never auto-printed
+const STALE_CLAIM_MS = 60 * 1000                 // a claim that never finished is retried after 60s
+const chunk = (arr, n = 150) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n))
+
+const DEVICE_KEY = 'qr_kot_device_id'
+export const getDeviceId = () => {
+  try {
+    let id = localStorage.getItem(DEVICE_KEY)
+    if (!id) { id = 'dev-' + Math.random().toString(36).slice(2, 10); localStorage.setItem(DEVICE_KEY, id) }
+    return id
+  } catch (e) { return 'dev-unknown' }
+}
+
+// Returns the ids from `ids` that are already claimed/printed by ANY device.
+export const fetchPrintedIds = async (ids) => {
+  const done = new Set()
+  const cutoff = new Date(Date.now() - STALE_CLAIM_MS).toISOString()
+  for (const part of chunk(ids)) {
+    // free claims that were never finished (device crashed / closed mid-print)
+    await supabase.from('kot_printed_items').delete()
+      .in('order_item_id', part).eq('status', 'claiming').lt('claimed_at', cutoff)
+    const { data, error } = await supabase.from('kot_printed_items')
+      .select('order_item_id').in('order_item_id', part)
+    if (error) throw new Error(error.message)
+    ;(data || []).forEach(r => done.add(r.order_item_id))
+  }
+  return done
+}
+
+// Atomically claims items. Returns the set of ids THIS device won.
+export const claimItems = async (ids) => {
+  const won = new Set()
+  const device = getDeviceId()
+  for (const part of chunk(ids)) {
+    const rows = part.map(id => ({ order_item_id: id, status: 'claiming', claimed_by: device }))
+    const { data, error } = await supabase.from('kot_printed_items')
+      .upsert(rows, { onConflict: 'order_item_id', ignoreDuplicates: true })
+      .select('order_item_id')
+    if (error) throw new Error(error.message)
+    ;(data || []).forEach(r => won.add(r.order_item_id))
+  }
+  return won
+}
+
+export const markItemsPrinted = async (ids) => {
+  for (const part of chunk(ids)) {
+    await supabase.from('kot_printed_items')
+      .update({ status: 'printed', printed_at: new Date().toISOString() })
+      .in('order_item_id', part)
+  }
+}
+
+export const releaseClaims = async (ids) => {
+  for (const part of chunk(ids)) {
+    await supabase.from('kot_printed_items').delete().in('order_item_id', part).eq('status', 'claiming')
+  }
+}
+
+
+// ── Customer bill -> Billing printer (ESC/POS, silent) ────────────────
+// Used by "Print Bill & Clear". Returns { ok, notConfigured, error }.
+// If no Billing printer name is set, or QZ Tray is unavailable, the caller
+// falls back to the normal browser print window.
+const money = (n) => {
+  const v = Number(n) || 0
+  return 'Rs.' + (Number.isInteger(v) ? String(v) : v.toFixed(2))
+}
+const lr = (left, right) => {
+  const l = clip(left, Math.max(1, COLS - right.length - 1))
+  return l + ' '.repeat(Math.max(1, COLS - l.length - right.length)) + right
+}
+const center = (t) => {
+  const s = clip(String(t || ''), COLS)
+  return ' '.repeat(Math.floor((COLS - s.length) / 2)) + s
+}
+
+const buildBill = (b) => {
+  const line = '-'.repeat(COLS)
+  const out = [ESC + '@', ESC + 'a' + '\x01', ESC + '!' + '\x30']
+  wrap(cleanNote(b.restaurantName || ''), 16).forEach(l => out.push(l + '\n'))   // double width = 16 cols
+  out.push(ESC + '!' + '\x00')
+  if (b.address) wrap(cleanNote(b.address), COLS).forEach(l => out.push(l + '\n'))
+  if (b.phone) out.push(cleanNote(b.phone) + '\n')
+  if (b.gstNumber) out.push('GST: ' + cleanNote(b.gstNumber) + '\n')
+  out.push(ESC + 'a' + '\x00', line + '\n')
+  out.push(lr('Table: ' + b.tableName, b.date) + '\n', 'Time: ' + b.time + '\n', line + '\n')
+
+  const section = (title, items, subLabel, subValue) => {
+    if (!items || items.length === 0) return
+    out.push(ESC + 'E' + '\x01', title + '\n', ESC + 'E' + '\x00')
+    items.forEach(i => out.push(lr(`${i.name} x${i.qty}`, money(i.total)) + '\n'))
+    out.push(ESC + 'E' + '\x01', lr(subLabel, money(subValue)) + '\n', ESC + 'E' + '\x00', line + '\n')
+  }
+  section('FOOD', b.foodItems, 'Food Subtotal', b.foodSubtotal)
+  section('LIQUOR', b.liquorItems, 'Liquor Subtotal', b.liquorSubtotal)
+
+  out.push(lr('Subtotal', money(b.subtotal)) + '\n')
+  if (b.serviceChargeAmt > 0) out.push(lr(`Service (${b.serviceChargePct}%)`, money(b.serviceChargeAmt)) + '\n')
+  if (b.discountAmt > 0) {
+    out.push(lr(`Discount${b.discountType === 'percent' ? ` (${b.discountValue}%)` : ' (Flat)'}`, '-' + money(b.discountAmt)) + '\n')
+    if (b.discountReason) wrap('Reason: ' + cleanNote(b.discountReason), COLS).forEach(l => out.push(l + '\n'))
+  }
+  out.push(line + '\n', ESC + '!' + '\x10', lr('TOTAL', money(b.finalAmount)) + '\n', ESC + '!' + '\x00', line + '\n')
+  out.push(ESC + 'a' + '\x01')
+  wrap(cleanNote(b.footerNote || 'Thank you! Visit again!'), COLS).forEach(l => out.push(l + '\n'))
+  out.push('\n\n\n', GS + 'V' + '\x41' + '\x03')
+  return out
+}
+
+export const printBill = async ({ bill, config }) => {
+  const printerName = ((config && config.printers && config.printers.Billing) || '').trim()
+  if (!printerName) return { ok: false, notConfigured: true, error: 'No Billing printer name set.' }
+  try {
+    const qz = await connectQz()
+    const cfg = qz.configs.create(printerName, { encoding: 'UTF-8' })
+    await qz.print(cfg, buildBill(bill).map(d => ({ type: 'raw', format: 'plain', data: d })))
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) }
+  }
 }
