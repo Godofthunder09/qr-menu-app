@@ -11,6 +11,19 @@ const getPrivateKey = () => {
 }
 
 export default async function handler(req, res) {
+  // TEMPORARY DIAGNOSTIC: open /api/qz-sign in the browser. Shows yes/no only, never secrets.
+  if (req.method === 'GET') {
+    return res.status(200).json({
+      vercel_env: process.env.VERCEL_ENV || null,          // production / preview / development
+      deployment_url: process.env.VERCEL_URL || null,
+      commit: (process.env.VERCEL_GIT_COMMIT_SHA || '').slice(0, 7) || null,
+      has_QZ_PRIVATE_KEY: !!(process.env.QZ_PRIVATE_KEY || '').trim(),
+      key_length: (process.env.QZ_PRIVATE_KEY || '').trim().length,
+      has_supabase_url: !!(process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL),
+      has_supabase_anon: !!(process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY),
+      qz_like_names: Object.keys(process.env).filter(k => /QZ|PRIVATE|KEY/i.test(k)),
+    })
+  }
   if (req.method !== 'POST') return res.status(405).send('POST only')
 
   const key = getPrivateKey()
