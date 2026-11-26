@@ -16,8 +16,8 @@ export default async function handler(req, res) {
   const key = getPrivateKey()
   const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
   const anon = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY
-  if (!key || !url || !anon) return res.status(500).send('Server not configured')
-
+  const missing = [!key && 'QZ_PRIVATE_KEY', !url && 'SUPABASE_URL', !anon && 'SUPABASE_ANON_KEY'].filter(Boolean)
+  if (missing.length) return res.status(500).send('Missing: ' + missing.join(', '))
   // 1. Caller must be a logged-in admin (valid Supabase session token).
   const auth = req.headers.authorization || ''
   if (!auth.startsWith('Bearer ')) return res.status(401).send('Login required')
