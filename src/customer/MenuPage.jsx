@@ -208,7 +208,7 @@ export default function MenuPage() {
   }
 
   // ── Kitchen-ticket confirmation helpers ───────────────────
-  const KOT_WAIT_MS = 30000
+  const KOT_WAIT_MS = 15000
   const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 
   // Can a kitchen ticket be printed right now? (laptop Dashboard open + printer reachable)
