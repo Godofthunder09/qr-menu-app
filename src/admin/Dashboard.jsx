@@ -6,7 +6,7 @@ import { validateDiscount, isSoleItemRemoval } from '../utils/discountValidation
 import {
   DEPARTMENTS, loadPrinterConfig, savePrinterConfig,
   loadPrintedItemIds, savePrintedItemIds, printDepartmentTickets,
-  printBill, BILLING_NOTE, CATCHUP_HOURS, fetchPrintedIds, claimItems, markItemsPrinted, releaseClaims
+  printBill, sendHeartbeat, BILLING_NOTE, CATCHUP_HOURS, fetchPrintedIds, claimItems, markItemsPrinted, releaseClaims
 } from '../utils/departmentPrint'
 
 const toIST = (d) => new Date(d).toLocaleTimeString('en-IN', {
@@ -303,6 +303,28 @@ export default function Dashboard() {
     }
     setLoading(false)
   }, [sessionStart, playTingTing, autoPrintNewItems])
+
+  // ── Heartbeat so customer orders are only accepted when a ticket can print ──
+  const hbOkRef = useRef(true)
+  useEffect(() => {
+    let stop = false
+    const beat = async () => {
+      if (stop) return
+      try {
+        const r = await sendHeartbeat(printerConfigRef.current)
+        const healthy = !r.enabled || r.ok
+        if (!healthy && hbOkRef.current) {
+          setPrintStatus({ ok: false, text: `⚠️ Kitchen printer NOT reachable: ${r.detail} Customer orders are being rejected until this is fixed.` })
+        } else if (healthy && !hbOkRef.current) {
+          setPrintStatus({ ok: true, text: '✅ Kitchen printer connection restored.' })
+        }
+        hbOkRef.current = healthy
+      } catch (e) { /* no internet: the customer page sees the missing heartbeat */ }
+    }
+    beat()
+    const id = setInterval(beat, 8000)
+    return () => { stop = true; clearInterval(id) }
+  }, [])
 
   useEffect(() => {
     fetchAll()
