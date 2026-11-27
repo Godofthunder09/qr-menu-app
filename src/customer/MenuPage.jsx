@@ -61,6 +61,8 @@ export default function MenuPage() {
   const [showOrders, setShowOrders]         = useState(false)
   const [loading, setLoading]               = useState(true)
   const [placing, setPlacing]               = useState(false)
+  const [placeStage, setPlaceStage]         = useState('')      // '' | 'sending'
+  const [kotError, setKotError]             = useState(null)    // dark-red 'ORDER UNSUCCESSFUL' box
   const [searchQuery, setSearchQuery]       = useState('')
   const [suggestions, setSuggestions]       = useState([])
   const [zoomedImage, setZoomedImage]       = useState(null)
@@ -205,6 +207,38 @@ export default function MenuPage() {
     }
   }
 
+  // ── Kitchen-ticket confirmation helpers ───────────────────
+  const KOT_WAIT_MS = 30000
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+
+  // Can a kitchen ticket be printed right now? (laptop Dashboard open + printer reachable)
+  const checkKitchenReady = async () => {
+    const { data, error } = await supabase.rpc('kot_printer_ready')
+    if (error) return { ok: false, reason: 'We could not check the kitchen printer.' }
+    if (data === 'ready') return { ok: true, required: true }
+    if (data === 'not_required') return { ok: true, required: false }
+    if (data === 'printer_error') return { ok: false, reason: 'The kitchen printer is not responding.' }
+    return { ok: false, reason: 'The kitchen system is offline.' }
+  }
+
+  // Wait until every item of the order is printed. On timeout, cancel the order
+  // if NOTHING was printed. Returns: printed | rolled_back | partial | unknown
+  const waitForKot = async (orderId) => {
+    const end = Date.now() + KOT_WAIT_MS
+    while (Date.now() < end) {
+      const { data } = await supabase.rpc('kot_order_status', { p_order_id: orderId })
+      if (data && data.total > 0 && data.printed >= data.total) return 'printed'
+      await sleep(1500)
+    }
+    for (let k = 0; k < 6; k++) {
+      const { data, error } = await supabase.rpc('kot_rollback_order', { p_order_id: orderId })
+      if (error) return 'unknown'
+      if (data === 'printed' || data === 'rolled_back' || data === 'partial') return data
+      await sleep(2000)                      // 'busy': a ticket is printing right now
+    }
+    return 'unknown'
+  }
+
   // ── Place order ────────────────────────────────────────────
   const placeOrder = async () => {
     if (placingRef.current) return            // OR_09: ignore taps while an order is in progress
@@ -229,6 +263,13 @@ export default function MenuPage() {
       }
       const ver = tbl.session_version
       setSessionVersion(ver)
+
+      // 0. Only accept the order if a kitchen ticket can actually be printed
+      const kitchen = await checkKitchenReady()
+      if (!kitchen.ok) {
+        setKotError({ title: 'ORDER UNSUCCESSFUL', text: `${kitchen.reason} Your order was NOT placed. Please call the waiter.` })
+        return
+      }
 
       // 1. Create order
       const { data: order, error: orderErr } = await supabase
@@ -255,6 +296,25 @@ export default function MenuPage() {
         return
       }
 
+      // 2b. "Order successful" only when the kitchen ticket really printed
+      if (kitchen.required) {
+        setPlaceStage('sending')
+        const kot = await waitForKot(order.id)
+        if (kot === 'rolled_back') {
+          setKotError({ title: 'ORDER UNSUCCESSFUL', text: 'Your order did NOT reach the kitchen and was cancelled. Nothing has been ordered. Please try again or call the waiter.' })
+          return                                  // cart is kept so the customer can retry
+        }
+        if (kot === 'partial' || kot === 'unknown') {
+          await saveCartToSummary(tableId, ver, cart)
+          await loadOrderSummary(tableId, ver)
+          setCart([]); setShowCart(false)
+          setKotError({ title: 'ORDER UNSUCCESSFUL', text: kot === 'partial'
+            ? 'Only PART of your order reached the kitchen. Please call the waiter now. Do not order again.'
+            : 'We could not confirm that your order reached the kitchen. Please call the waiter now. Do not order again.' })
+          return
+        }
+      }
+
       // 3. Save to table_order_summary (powers the Orders drawer)
       await saveCartToSummary(tableId, ver, cart)
 
@@ -267,6 +327,7 @@ export default function MenuPage() {
     } finally {
       placingRef.current = false
       setPlacing(false)
+      setPlaceStage('')
     }
   }
 
@@ -607,9 +668,24 @@ export default function MenuPage() {
             {cart.length > 0 && (
               <button onClick={placeOrder} disabled={placing}
                 className="w-full bg-orange-500 text-white py-4 rounded-2xl font-bold text-lg disabled:opacity-50">
-                {placing ? 'Placing order...' : '🍽️ Place Order'}
+                {placing ? (placeStage === 'sending' ? 'Sending to kitchen...' : 'Placing order...') : '🍽️ Place Order'}
               </button>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* ── ORDER UNSUCCESSFUL (dark red, impossible to miss) ───── */}
+      {kotError && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black bg-opacity-60 px-4">
+          <div className="w-full max-w-sm rounded-3xl border-4 border-red-900 bg-red-100 p-6 text-center shadow-2xl">
+            <div className="text-5xl mb-2">❌</div>
+            <h2 className="text-2xl font-extrabold tracking-wide text-red-900 mb-3">{kotError.title}</h2>
+            <p className="text-base font-bold leading-relaxed text-red-900 mb-5">{kotError.text}</p>
+            <button onClick={() => setKotError(null)}
+              className="w-full rounded-2xl bg-red-900 py-3 text-lg font-bold text-white">
+              OK
+            </button>
           </div>
         </div>
       )}
