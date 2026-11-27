@@ -26,12 +26,12 @@ export default function OrderConfirmation() {
     <div className="min-h-screen bg-orange-50 flex items-center justify-center px-4">
       <div className="bg-white rounded-3xl shadow-lg p-8 w-full max-w-sm text-center">
         <div className="text-7xl mb-4">🎉</div>
-        <h1 className="text-2xl font-bold text-gray-800 mb-2">Order Placed!</h1>
+        <h1 className="text-2xl font-bold text-gray-800 mb-2">Order Successful!</h1>
         <p className="text-gray-500 mb-1">Your order for</p>
         <p className="text-orange-500 font-bold text-lg mb-4">{tableName || 'Your Table'}</p>
         <div className="bg-orange-50 rounded-2xl p-4 mb-6">
           <p className="text-gray-600 text-sm leading-relaxed">
-            ✅ Your order has been sent!<br />
+            ✅ Your order has reached the kitchen!<br />
             Please wait while we prepare your food! 🍴
           </p>
         </div>
