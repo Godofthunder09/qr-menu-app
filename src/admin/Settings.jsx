@@ -2,6 +2,16 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../supabase/client'
 
+// GSTIN: 15 characters, e.g. 27ABCDE1234F1Z5 (state code, PAN, entity, Z, check digit)
+const GST_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/
+// Phone: optional +, then 7 to 15 digits. Spaces, dashes and brackets are allowed.
+const isValidPhone = (v) => {
+  const t = v.trim()
+  if (!/^\+?[0-9\s\-()]+$/.test(t)) return false
+  const digits = t.replace(/\D/g, '')
+  return digits.length >= 7 && digits.length <= 15
+}
+
 export default function Settings() {
   const navigate = useNavigate()
   const [loading, setLoading] = useState(true)
@@ -35,6 +45,15 @@ export default function Settings() {
 
   const saveSettings = async () => {
     if (!restaurantName.trim()) { alert('Restaurant name is required!'); return }
+    if (phone.trim() && !isValidPhone(phone)) {
+      alert('Enter a valid phone number: digits only (7 to 15), with an optional + at the start.')
+      return
+    }
+    const gst = gstNumber.trim().toUpperCase()
+    if (gst && !GST_REGEX.test(gst)) {
+      alert('Invalid GST number. It must be 15 characters, for example 27ABCDE1234F1Z5.')
+      return
+    }
     setSaving(true)
 
     const { error } = await supabase.from('settings').upsert({
@@ -42,7 +61,7 @@ export default function Settings() {
       restaurant_name: restaurantName.trim(),
       address: address.trim(),
       phone: phone.trim(),
-      gst_number: gstNumber.trim(),
+      gst_number: gst,
       footer_note: footerNote.trim(),
       updated_at: new Date().toISOString()
     })
@@ -140,7 +159,7 @@ export default function Settings() {
                   <input
                     type="text"
                     value={gstNumber}
-                    onChange={e => setGstNumber(e.target.value)}
+                    onChange={e => setGstNumber(e.target.value.toUpperCase())}
                     placeholder="e.g. 27ABCDE1234F1Z5"
                     className="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-orange-400"
                   />
