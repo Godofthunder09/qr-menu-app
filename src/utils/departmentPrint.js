@@ -343,3 +343,40 @@ export const printBill = async ({ bill, config }) => {
     return { ok: false, error: (e && e.message) || String(e) }
   }
 }
+
+
+// ── Heartbeat: tells the customer page whether a kitchen ticket can print ──
+// Every open Dashboard calls sendHeartbeat every ~8 seconds. If no Dashboard
+// has reported in the last 25 seconds (laptop off, tab closed, no internet),
+// the customer page refuses orders instead of saying "successful".
+let _qzCheck = { at: 0, ok: true, detail: '' }
+export const checkPrinters = async (config) => {
+  const names = DEPARTMENTS.filter(d => d !== 'Billing')
+    .map(d => ((config.printers && config.printers[d]) || '').trim()).filter(Boolean)
+  if (names.length === 0) return { ok: false, detail: 'No printer name is set in Printers.' }
+  try {
+    const qz = await connectQz()
+    for (const n of [...new Set(names)]) {
+      const found = await qz.printers.find(n)
+      if (!found || (Array.isArray(found) && found.length === 0)) throw new Error(`Printer "${n}" not found in Windows.`)
+    }
+    return { ok: true, detail: '' }
+  } catch (e) {
+    return { ok: false, detail: (e && e.message) || String(e) }
+  }
+}
+
+export const sendHeartbeat = async (config) => {
+  const enabled = !!config.enabled
+  let ok = true, detail = ''
+  if (enabled) {
+    // healthy -> re-check every 60s (saves signing calls); unhealthy -> re-check every beat
+    if (!_qzCheck.ok || Date.now() - _qzCheck.at > 60000) {
+      const r = await checkPrinters(config)
+      _qzCheck = { at: Date.now(), ok: r.ok, detail: r.detail }
+    }
+    ok = _qzCheck.ok; detail = _qzCheck.detail
+  }
+  await supabase.rpc('kot_beat', { p_device: getDeviceId(), p_enabled: enabled, p_qz_ok: ok, p_detail: detail })
+  return { enabled, ok, detail }
+}
