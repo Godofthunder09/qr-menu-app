@@ -9,6 +9,7 @@ export default function OrderConfirmation() {
   const [count, setCount] = useState(5)
 
   useEffect(() => {
+    if (!tableId) return            // no table in the address: do not start the redirect
     const timer = setInterval(() => {
       setCount(prev => {
         if (prev <= 1) {
@@ -21,6 +22,22 @@ export default function OrderConfirmation() {
     }, 1000)
     return () => clearInterval(timer)
   }, [])
+
+  // Opened directly (no ?table=): show a clear message instead of redirecting to /menu?table=null
+  if (!tableId) {
+    return (
+      <div className="min-h-screen bg-orange-50 flex items-center justify-center px-4">
+        <div className="bg-white rounded-3xl shadow-lg p-8 w-full max-w-sm text-center">
+          <div className="text-7xl mb-4">❌</div>
+          <h1 className="text-2xl font-bold text-gray-800 mb-2">Invalid QR Code.</h1>
+          <p className="text-gray-500 text-sm">
+            This page can only be opened after placing an order.
+            Please scan the QR code on your table.
+          </p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="min-h-screen bg-orange-50 flex items-center justify-center px-4">
