@@ -45,8 +45,9 @@ export default function Login() {
           </div>
         )}
 
-        {/* Form */}
-        <div className="space-y-4">
+        {/* Form (a real <form>, so pressing Enter submits it; noValidate keeps the
+            same "Invalid email or password!" message for empty fields) */}
+        <form onSubmit={handleLogin} noValidate className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
               Email
@@ -74,13 +75,13 @@ export default function Login() {
           </div>
 
           <button
-            onClick={handleLogin}
+            type="submit"
             disabled={loading}
             className="w-full bg-orange-500 hover:bg-orange-600 text-white font-semibold py-3 rounded-lg transition duration-200 mt-2"
           >
             {loading ? 'Logging in...' : 'Login →'}
           </button>
-        </div>
+        </form>
 
         <p className="text-center text-xs text-gray-400 mt-6">
           QR Menu Admin Panel • Only authorized access
